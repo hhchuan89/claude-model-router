@@ -19,6 +19,8 @@ import {
 const DURATIONS = 'durations'
 const KEEP_DURATIONS = 30
 const DEFAULT_TAU_MS = 60_000
+// A long task label is cut here rather than squeezed by the bar.
+const LABEL_MAX = 24
 
 const run = atom({ plugin: 'turn-progress', key: 'run' } as const, null)
 const now = atom({ plugin: 'turn-progress', key: 'now' } as const, 0)
@@ -210,6 +212,7 @@ export const register: Register = on => {
       ? `${stats.done}/${stats.total} · ${elapsed}${eta ? ` · ≈${fmtClock(eta)}` : ''}`
       : elapsed
     const label = r.active ?? fmtClock(r.startedAt)
+    const shortLabel = label.length > LABEL_MAX ? `${label.slice(0, LABEL_MAX - 1)}…` : label
     const p = isTaskMode ? (stats.done + 0.5 * stats.active) / stats.total : timeFraction(t - r.startedAt, await tauMs($))
 
     let bar
@@ -218,7 +221,7 @@ export const register: Register = on => {
       const source = isTaskMode ? taskSvg(r.order.map(id => r.tasks[id] ?? 'pending')) : estimateSvg(p)
       bar = <Svg source={source} alt={`${Math.round(p * 100)}%`} height={8} />
     } else {
-      const width = Math.max(10, e.props.bodyColumns - label.length - right.length - 16)
+      const width = Math.max(10, e.props.bodyColumns - shortLabel.length - right.length - 16)
       const { filled, rest } = blocks(p, width)
       bar = (
         <Text>
@@ -231,13 +234,16 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" gap={1} alignItems="center">
-          <Text dimColor wrap="truncate-end">
-            {label}
-          </Text>
-          <Box flexGrow={1} flexShrink={1}>
+          {/* The texts keep their width; the bar gets only what is left (an SVG would otherwise claim its own 1000px). */}
+          <Box flexShrink={0}>
+            <Text dimColor>{shortLabel}</Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1} width={0} minWidth={0}>
             {bar}
           </Box>
-          <Text dimColor>{right}</Text>
+          <Box flexShrink={0}>
+            <Text dimColor>{right}</Text>
+          </Box>
           {disable}
         </Box>
         {below}

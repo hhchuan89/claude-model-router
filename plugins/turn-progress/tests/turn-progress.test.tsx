@@ -132,3 +132,25 @@ test('Disable hides the bar until Enable', async ($, on) => {
   await $.prompt.submit({ text: 'third job' } as never)
   expect(await ui.find({ type: 'Svg' })).toBeDefined()
 })
+
+test('the start time and the elapsed time are drawn whole, outside the bar', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on, { now: new Date(2026, 9, 13, 22, 31).getTime() })
+  bottom(on)
+  await $.prompt.submit({ text: 'job' } as never)
+  await clock.advance(11_000)
+  const ui = await $.ui.mount({ plugin: 'turn-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect((await ui.find({ text: /^22:31$/ }))?.text).toBe('22:31')
+  expect(await ui.find({ text: /^0:11$/ })).toBeDefined()
+})
+
+test('a long task label is cut short instead of squeezed', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  bottom(on)
+  await $.prompt.submit({ text: 'job' } as never)
+  await $.tool.call({ tool: 'TaskCreate', subject: 'x', description: 'x' } as never)
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'in_progress', activeForm: 'Refactoring the entire authentication layer' } as never)
+  const ui = await $.ui.mount({ plugin: 'turn-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /^Refactoring the entire …$/ })).toBeDefined()
+})
