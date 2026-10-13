@@ -57,3 +57,7 @@ in Claude Code Desktop sessions.
 claude plugin validate .
 claude plugin test .
 ```
+
+## License
+
+MIT
