@@ -26,6 +26,7 @@ const STR = {
   zh: {
     analyzing: '分析中…',
     checking: '发送前检查中…',
+    unchecked: '未检查，已直接发送',
     held: 'prompt-coach：先看一下建议，改好后按 Enter 发送（不会再检查）',
     hint: '原文已放回输入框，可直接修改，按 Enter 发送',
     off: 'Prompt Coach 已关闭',
@@ -40,6 +41,7 @@ const STR = {
   en: {
     analyzing: 'Analyzing…',
     checking: 'Checking before sending…',
+    unchecked: 'Sent without checking',
     held: 'prompt-coach: review the advice, edit if you like, then press Enter to send (no second check)',
     hint: 'Your prompt is back in the box: edit it, then press Enter to send',
     off: 'Prompt Coach is off',
@@ -129,6 +131,9 @@ async function analyze(
     }, { signal })
     if (r.isAnswered) {
       result = { status: 'done', ...parseAdvice(r.text) }
+    } else if (r.reason === 'aborted') {
+      // "Send now" or the gate's time limit: the prompt went through unchecked, which is no failure.
+      result = { status: 'error', grade: null, verdict: STR[lang].unchecked, tips: [], rewrite: null }
     } else {
       const why = `${r.reason}${r.reason === 'api-error' ? ` (${r.status})` : ''}`
       result = { status: 'error', grade: null, verdict: STR[lang].failed + why, tips: [], rewrite: null }
