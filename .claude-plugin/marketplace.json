@@ -1,0 +1,13 @@
+{
+  "name": "prompt-coach",
+  "description": "prompt-coach: grades every Claude Code prompt and coaches you on writing better ones",
+  "owner": {
+    "name": "hhchuan89"
+  },
+  "plugins": [
+    {
+      "name": "prompt-coach",
+      "source": "./"
+    }
+  ]
+}
