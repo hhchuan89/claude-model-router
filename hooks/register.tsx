@@ -231,9 +231,11 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // Stacks its row under whatever other mods draw in the band, so both stay visible.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const below = await next(e)
     const latest = ((await read($, entries)) ?? [])[0]
-    if (e.props.hasSurvey || latest === undefined || latest.id === (await read($, hidden))) return next(e)
+    if (e.props.hasSurvey || latest === undefined || latest.id === (await read($, hidden))) return below
 
     const { Box, Text, Button, Markdown } = $.ui.resolve(e)
     const x = latest
@@ -241,17 +243,20 @@ export const register: Register = (on, options) => {
     // Pending and A get one dim line: visible enough to show the coach is alive, quiet enough to ignore.
     if (x.status === 'pending' || x.grade === 'A') {
       return (
-        <Box flexDirection="row" gap={1}>
-          <Text dimColor>💡</Text>
-          {x.grade === 'A' && (
-            <Text dimColor bold color={GRADE_COLOR.A}>
-              A
-            </Text>
-          )}
-          <Box flexGrow={1} flexShrink={1}>
-            <Text dimColor wrap="truncate-end">
-              {x.status === 'pending' ? str.analyzing : x.verdict}
-            </Text>
+        <Box flexDirection="column">
+          {below}
+          <Box flexDirection="row" gap={1}>
+            <Text dimColor>💡</Text>
+            {x.grade === 'A' && (
+              <Text dimColor bold color={GRADE_COLOR.A}>
+                A
+              </Text>
+            )}
+            <Box flexGrow={1} flexShrink={1}>
+              <Text dimColor wrap="truncate-end">
+                {x.status === 'pending' ? str.analyzing : x.verdict}
+              </Text>
+            </Box>
           </Box>
         </Box>
       )
@@ -262,6 +267,7 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
+        {below}
         <Box flexDirection="row" gap={1} alignItems="center">
           <Text>💡</Text>
           {gradeChip(Text, x.grade)}

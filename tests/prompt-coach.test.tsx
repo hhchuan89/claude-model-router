@@ -132,6 +132,7 @@ test('band shows a B with its chip, expands, and closes', async ($, on) => {
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'prompt-coach', surface, component: 'AbovePrompt', props: BAND_PROPS })
     expect(await ui.find({ text: /没说做完怎么判断/ })).toBeDefined()
+    expect(await ui.find({ text: /engine band/ })).toBeDefined()
     expect(await ui.find({ text: / B / })).toBeDefined()
     expect(await ui.find({ key: 'rewrite' })).toBeDefined()
     expect(await ui.find({ text: /补上验收标准/ })).toBeUndefined()
