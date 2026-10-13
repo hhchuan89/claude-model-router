@@ -11,7 +11,8 @@ A progress bar above the prompt box for every turn you start.
 - **Finish** — the bar collapses to one dim line, `✓ 4m12s · 21:46 → 21:50` (`■` if you interrupted it), and stays
   until your next prompt, so you can see when a long turn finished after stepping away.
 
-Desktop draws the bar as SVG; the terminal uses eighth-block characters. It redraws once a second while a turn runs.
+Desktop draws an "aurora" bar in SVG: a clay-to-coral gradient with a light sweeping across it and a soft glow at
+the front; the running task pulses. The terminal uses eighth-block characters. It redraws once a second while a turn runs.
 
 **Disable / Enable** in the band (or `/turn-progress off|on`) pauses it; the choice is kept across sessions.
 A prompt that another mod holds back (prompt-coach) starts no bar.

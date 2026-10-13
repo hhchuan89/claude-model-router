@@ -11,6 +11,7 @@ import {
   fmtDuration,
   fmtElapsed,
   median,
+  SVG_H,
   taskStats,
   taskSvg,
   timeFraction,
@@ -219,7 +220,8 @@ export const register: Register = on => {
     if (e.surface === 'desktop') {
       const { Svg } = $.ui.resolve(e)
       const source = isTaskMode ? taskSvg(r.order.map(id => r.tasks[id] ?? 'pending')) : estimateSvg(p)
-      bar = <Svg source={source} alt={`${Math.round(p * 100)}%`} height={8} />
+      // Interactive, so the sweep and the pulse animate rather than show as a still image.
+      bar = <Svg source={source} alt={`${Math.round(p * 100)}%`} height={SVG_H} isInteractive />
     } else {
       const width = Math.max(10, e.props.bodyColumns - shortLabel.length - right.length - 16)
       const { filled, rest } = blocks(p, width)

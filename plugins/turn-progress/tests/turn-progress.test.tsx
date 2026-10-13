@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { blocks, etaMs, fmtDuration, fmtElapsed, median, timeFraction } from '../hooks/progress'
+import { blocks, estimateSvg, etaMs, fmtDuration, fmtElapsed, median, taskSvg, timeFraction } from '../hooks/progress'
 
 describe('progress math', () => {
   test('the estimate eases up and never reaches 90%', async () => {
@@ -153,4 +153,23 @@ test('a long task label is cut short instead of squeezed', async ($, on) => {
   await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'in_progress', activeForm: 'Refactoring the entire authentication layer' } as never)
   const ui = await $.ui.mount({ plugin: 'turn-progress', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /^Refactoring the entire …$/ })).toBeDefined()
+})
+
+describe('aurora drawings', () => {
+  test('estimate: gradient, stripes and a sweep, drawn to the quantized width', async () => {
+    const svg = estimateSvg(0.561)
+    expect(svg).toContain('url(#g)')
+    expect(svg).toContain('url(#st)')
+    expect(svg).toContain('<animate attributeName="x"')
+    expect(svg).toContain('width="560"')
+    expect(estimateSvg(0.561)).toBe(estimateSvg(0.569))
+  })
+
+  test('task: done in the gradient, the running one pulses, pending stays a track', async () => {
+    const svg = taskSvg(['completed', 'completed', 'in_progress', 'pending', 'pending'])
+    expect(svg.match(/fill="url\(#g\)"/g)?.length).toBe(2)
+    expect(svg).toContain('values=".3;.7;.3"')
+    expect(svg.match(/fill="#888888"/g)?.length).toBe(2)
+    expect(taskSvg(['pending', 'pending'])).not.toContain('clip-path="url(#d)"')
+  })
 })
