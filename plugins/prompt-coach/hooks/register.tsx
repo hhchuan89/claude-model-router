@@ -310,7 +310,7 @@ export const register: Register = (on, options) => {
     const x = latest
     const hold = await read($, held)
     const isHeld = hold !== null && hold.id === x.id
-    const disable = <Button key="disable" label="Disable" onPress={() => setEnabled($, false)} />
+    const disable = <Button key="disable" label="Disable coach" onPress={() => setEnabled($, false)} />
 
     if (x.status === 'pending') {
       return (

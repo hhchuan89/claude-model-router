@@ -183,7 +183,7 @@ export const register: Register = on => {
 
     const r = await read($, run)
     if (!r) return below
-    const disable = <Button key="progress-disable" label="Disable" onPress={() => setEnabled($, false)} />
+    const disable = <Button key="progress-disable" label="Disable bar" onPress={() => setEnabled($, false)} />
     const t = Math.max((await read($, now)) ?? r.startedAt, r.startedAt)
 
     if (r.endedAt !== null) {
@@ -220,8 +220,9 @@ export const register: Register = on => {
     if (e.surface === 'desktop') {
       const { Svg } = $.ui.resolve(e)
       const source = isTaskMode ? taskSvg(r.order.map(id => r.tasks[id] ?? 'pending')) : estimateSvg(p)
-      // Interactive, so the sweep and the pulse animate rather than show as a still image.
-      bar = <Svg source={source} alt={`${Math.round(p * 100)}%`} height={SVG_H} isInteractive />
+      // Drawn as an image: it fills the slot, and Chromium still runs the SVG's own animation.
+      // (isInteractive puts it in a 300px frame that does not stretch.)
+      bar = <Svg source={source} alt={`${Math.round(p * 100)}%`} height={SVG_H} />
     } else {
       const width = Math.max(10, e.props.bodyColumns - shortLabel.length - right.length - 16)
       const { filled, rest } = blocks(p, width)
