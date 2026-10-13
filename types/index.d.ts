@@ -15,8 +15,9 @@ declare module 'claude-code' {
   interface PluginState {
     'prompt-coach': {
       entries: Advice[]
-      // id of the entry the person closed in the band
-      hidden: string
+      // the prompt sent back to the composer for review; the next send goes straight through
+      held: { id: string; original: string } | null
+      enabled: boolean
       isExpanded: boolean
     }
   }

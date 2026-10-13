@@ -12,9 +12,12 @@ const TITLE = 'Prompt Coach'
 const KEEP = 50
 const RETAIN_DAYS = 90
 const REVIEW_DAYS = 7
+// How long a prompt is held for grading before it goes through unchecked.
+const GATE_MS = 8000
 
 const entries = atom({ plugin: 'prompt-coach', key: 'entries' } as const, [])
-const hidden = atom({ plugin: 'prompt-coach', key: 'hidden' } as const, '')
+const held = atom({ plugin: 'prompt-coach', key: 'held' } as const, null)
+const enabled = atom({ plugin: 'prompt-coach', key: 'enabled' } as const, true)
 const isExpanded = atom({ plugin: 'prompt-coach', key: 'isExpanded' } as const, false)
 
 const GRADE_COLOR: Record<Grade, string> = { A: 'success', B: 'warning', C: 'error' }
@@ -22,6 +25,10 @@ const GRADE_COLOR: Record<Grade, string> = { A: 'success', B: 'warning', C: 'err
 const STR = {
   zh: {
     analyzing: '分析中…',
+    checking: '发送前检查中…',
+    held: 'prompt-coach：先看一下建议，改好后按 Enter 发送（不会再检查）',
+    hint: '原文已放回输入框，可直接修改，按 Enter 发送',
+    off: 'Prompt Coach 已关闭',
     skipped: '短确认，跳过分析',
     failed: '分析失败：',
     empty: '还没有 prompt。发一条，这里会出现对它的建议。',
@@ -32,6 +39,10 @@ const STR = {
   },
   en: {
     analyzing: 'Analyzing…',
+    checking: 'Checking before sending…',
+    held: 'prompt-coach: review the advice, edit if you like, then press Enter to send (no second check)',
+    hint: 'Your prompt is back in the box: edit it, then press Enter to send',
+    off: 'Prompt Coach is off',
     skipped: 'Short confirmation, not analyzed',
     failed: 'Analysis failed: ',
     empty: 'No prompts yet. Send one and its advice shows up here.',
@@ -95,8 +106,18 @@ async function recentContext($: EngineInterface): Promise<string> {
     .join('\n\n')
 }
 
-async function analyze($: EngineInterface, lang: Lang, model: string, id: string, prompt: string, logPath: string) {
-  let result: Pick<Advice, 'status' | 'grade' | 'verdict' | 'tips' | 'rewrite'>
+type Result = Pick<Advice, 'status' | 'grade' | 'verdict' | 'tips' | 'rewrite'>
+
+async function analyze(
+  $: EngineInterface,
+  lang: Lang,
+  model: string,
+  id: string,
+  prompt: string,
+  logPath: string,
+  signal: AbortSignal,
+): Promise<Result> {
+  let result: Result
   try {
     const context = await recentContext($)
     const r = await $.model.complete({
@@ -104,8 +125,8 @@ async function analyze($: EngineInterface, lang: Lang, model: string, id: string
       system: systemFor(lang),
       prompt: `<context>\n${context || '(new session)'}\n</context>\n\n<prompt>\n${prompt}\n</prompt>`,
       maxTokens: 1000,
-      timeoutMs: 60000,
-    })
+      timeoutMs: GATE_MS,
+    }, { signal })
     if (r.isAnswered) {
       result = { status: 'done', ...parseAdvice(r.text) }
     } else {
@@ -117,7 +138,11 @@ async function analyze($: EngineInterface, lang: Lang, model: string, id: string
   }
   await update($, entries, list => (list ?? []).map(x => (x.id === id ? { ...x, ...result } : x)))
   await appendLog($, logPath, { type: 'advice', id, model, ...result })
+  return result
 }
+
+// Lets "Send now" cut the grading short; the held hook then lets the prompt through.
+let release: (() => void) | null = null
 
 async function weeklyReview($: EngineInterface, lang: Lang, model: string): Promise<string> {
   const dir = await logDir($)
@@ -151,20 +176,19 @@ async function weeklyReview($: EngineInterface, lang: Lang, model: string): Prom
   return r.isAnswered ? r.text.trim() : STR[lang].reviewFailed + r.reason
 }
 
-// Fills the composer when it is empty, appends below a draft, and falls back to the clipboard.
-async function useRewrite($: EngineInterface, lang: Lang, text: string, surface: RenderSurface) {
-  let draft = ''
-  try {
-    draft = (await $.prompt.read()).text
-  } catch {
-    // no composer to read
-  }
-  const filled = await $.prompt.fill(
-    draft.trim() === '' ? { text, mode: 'replace' } : { text: `\n\n${text}`, mode: 'append' },
-  )
+// Puts a version of the held prompt in the composer; falls back to the clipboard.
+async function fillBox($: EngineInterface, lang: Lang, text: string, surface: RenderSurface) {
+  const filled = await $.prompt.fill({ text, mode: 'replace' })
   if (filled.isFilled) return
   const copied = await $.ui.copy({ text, surface })
   $.ui.toast(copied.isCopied ? STR[lang].copied : STR[lang].copyFailed)
+}
+
+// Kept across sessions, so a pause lasts until the person turns it back on.
+async function setEnabled($: EngineInterface, isOn: boolean) {
+  await update($, enabled, () => isOn)
+  await $.store.set('enabled', isOn)
+  if (!isOn) await update($, held, () => null)
 }
 
 type TextTag = ReturnType<EngineInterface['ui']['resolve']>['Text']
@@ -189,9 +213,11 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'prompt-coach',
-      description: 'Prompt Coach: no argument opens the history pane; "review" summarizes your last 7 days',
-      argumentHint: '[review]',
+      description: 'Prompt Coach: no argument opens the history pane; "review" summarizes your last 7 days; "on"/"off" toggles it',
+      argumentHint: '[review|on|off]',
     })
+    const stored = await $.store.get('enabled')
+    await update($, enabled, () => stored !== false)
     void pruneLogs($, new Date(await $.clock.now())).catch(err =>
       $.ui.log(`prompt-coach: log cleanup failed: ${String(err)}`),
     )
@@ -199,14 +225,27 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'prompt-coach' }, async ($, e) => {
-    if (e.args.trim() === 'review') return { text: await weeklyReview($, lang, model) }
+    const arg = e.args.trim()
+    if (arg === 'review') return { text: await weeklyReview($, lang, model) }
+    if (arg === 'on' || arg === 'off') {
+      await setEnabled($, arg === 'on')
+      return { text: `Prompt Coach ${arg === 'on' ? 'enabled' : 'disabled'}.` }
+    }
     const { isPlaced } = await $.ui.open({ id: PANE, title: TITLE })
     return { text: isPlaced ? 'Prompt Coach history opened.' : 'Prompt Coach history opened (not visible on this surface).' }
   })
 
+  // The gate: hold the prompt while it is graded; A goes through, B/C come back to the composer.
   on('prompt.submit', async ($, e, next) => {
     const origin = e.origin as typeof e.origin | undefined
-    if (!isPersonOrigin(origin) || e.text.trim() === '') return next(e)
+    if (!isPersonOrigin(origin) || e.text.trim() === '' || !(await read($, enabled))) return next(e)
+
+    // The send after a hold goes straight through: the person has seen the advice.
+    const wasHeld = await read($, held)
+    if (wasHeld) {
+      await update($, held, () => null)
+      return next(e)
+    }
 
     const now = new Date(await $.clock.now())
     const at = `${pad(now.getHours())}:${pad(now.getMinutes())}`
@@ -224,39 +263,84 @@ export const register: Register = (on, options) => {
 
     if (isSkipped) {
       void appendLog($, logPath, { type: 'advice', id, status: 'done', grade: 'A', skipped: true })
-    } else {
-      // Not awaited: the prompt goes to Claude right away, advice lands in the band later.
-      void analyze($, lang, model, id, prompt, logPath)
+      return next(e)
     }
-    return next(e)
+
+    const stop = new AbortController()
+    release = () => stop.abort()
+    const result = await analyze($, lang, model, id, prompt, logPath, stop.signal)
+    release = null
+
+    // Anything but a finished B/C (an A, a timeout, an error, "Send now") lets the prompt through.
+    if (result.status !== 'done' || (result.grade !== 'B' && result.grade !== 'C')) return next(e)
+
+    await update($, held, () => ({ id, original: e.text }))
+    // The composer was cleared by the submit; give the person's own words back.
+    $.clock.after(100, () => {
+      void $.prompt.fill({ text: e.text, mode: 'replace' })
+    })
+    return { drop: str.held }
   })
 
   // Stacks its row under whatever other mods draw in the band, so both stay visible.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const below = await next(e)
-    const latest = ((await read($, entries)) ?? [])[0]
-    if (e.props.hasSurvey || latest === undefined || latest.id === (await read($, hidden))) return below
-
+    if (e.props.hasSurvey) return below
     const { Box, Text, Button, Markdown } = $.ui.resolve(e)
-    const x = latest
 
-    // Pending and A get one dim line: visible enough to show the coach is alive, quiet enough to ignore.
-    if (x.status === 'pending' || x.grade === 'A') {
+    if (!(await read($, enabled))) {
       return (
         <Box flexDirection="column">
           {below}
-          <Box flexDirection="row" gap={1}>
+          <Box flexDirection="row" gap={1} alignItems="center">
+            <Text dimColor>💡 {str.off}</Text>
+            <Button key="enable" label="Enable" onPress={() => setEnabled($, true)} />
+          </Box>
+        </Box>
+      )
+    }
+
+    const latest = ((await read($, entries)) ?? [])[0]
+    if (latest === undefined) return below
+    const x = latest
+    const hold = await read($, held)
+    const isHeld = hold !== null && hold.id === x.id
+    const disable = <Button key="disable" label="Disable" onPress={() => setEnabled($, false)} />
+
+    if (x.status === 'pending') {
+      return (
+        <Box flexDirection="column">
+          {below}
+          <Box flexDirection="row" gap={1} alignItems="center">
             <Text dimColor>💡</Text>
-            {x.grade === 'A' && (
-              <Text dimColor bold color={GRADE_COLOR.A}>
-                A
+            <Box flexGrow={1} flexShrink={1}>
+              <Text dimColor>{str.checking}</Text>
+            </Box>
+            <Button key="send-now" label="Send now" onPress={() => release?.()} />
+            {disable}
+          </Box>
+        </Box>
+      )
+    }
+
+    // After the prompt went through: one dim line, whatever the grade.
+    if (!isHeld) {
+      return (
+        <Box flexDirection="column">
+          {below}
+          <Box flexDirection="row" gap={1} alignItems="center">
+            <Text dimColor>💡</Text>
+            {x.grade !== null && (
+              <Text dimColor bold color={GRADE_COLOR[x.grade]}>
+                {x.grade}
               </Text>
             )}
             <Box flexGrow={1} flexShrink={1}>
               <Text dimColor wrap="truncate-end">
-                {x.status === 'pending' ? str.analyzing : x.verdict}
+                {x.verdict}
               </Text>
             </Box>
+            {disable}
           </Box>
         </Box>
       )
@@ -264,6 +348,7 @@ export const register: Register = (on, options) => {
 
     const open = (await read($, isExpanded)) ?? false
     const hasMore = x.tips.length > 0 || x.rewrite !== null
+    const original = hold.original
 
     return (
       <Box flexDirection="column">
@@ -272,22 +357,24 @@ export const register: Register = (on, options) => {
           <Text>💡</Text>
           {gradeChip(Text, x.grade)}
           <Box flexGrow={1} flexShrink={1}>
-            <Text wrap={open ? 'wrap' : 'truncate-end'} dimColor={x.status === 'error'}>
-              {x.verdict}
-            </Text>
+            <Text wrap={open ? 'wrap' : 'truncate-end'}>{x.verdict}</Text>
           </Box>
           {hasMore && (
             <Button key="toggle" label={open ? 'Less' : 'More'} onPress={() => update($, isExpanded, v => !v)} />
           )}
+          <Button key="mine" label="Use mine" onPress={pe => fillBox($, lang, original, pe.surface)} />
           {x.rewrite !== null && (
             <Button
               key="rewrite"
               label="Use rewrite"
               variant="primary"
-              onPress={pe => useRewrite($, lang, x.rewrite!, pe.surface)}
+              onPress={pe => fillBox($, lang, x.rewrite!, pe.surface)}
             />
           )}
-          <Button key="close" label="×" role="dismiss" onPress={() => update($, hidden, () => x.id)} />
+          {disable}
+        </Box>
+        <Box paddingLeft={3}>
+          <Text dimColor>{str.hint}</Text>
         </Box>
         {open && (
           <Box flexDirection="column" paddingLeft={3} marginTop={1}>

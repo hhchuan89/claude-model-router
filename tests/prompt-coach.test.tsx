@@ -105,52 +105,95 @@ const BAND_PROPS = {
   view: {},
 } as never
 
-async function submitWith($: any, on: any, reply: object) {
+type Harness = { clock: { advance: (ms: number) => Promise<void> }; sent: string[]; filled: string[]; calls: () => number }
+
+function harness(on: any, reply: object): Harness {
   mock.env(on, { HOME: '/home/t' })
+  mock.store(on)
   const clock = mock.clock(on)
+  const sent: string[] = []
+  const filled: string[] = []
+  let n = 0
   on('fs.read', async () => ({ deny: 'ENOENT' }))
   on('fs.write', async () => ({ value: undefined }))
   on('session.messages', async () => ({ value: [] }))
-  on('model.complete', async () => ({
-    value: {
-      isAnswered: true as const,
-      text: JSON.stringify(reply),
-      usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-    },
-  }))
-  on('prompt.submit', async (_$: unknown, e: { text: string }) => ({ text: e.text }))
+  on('model.complete', async () => {
+    n += 1
+    return {
+      value: {
+        isAnswered: true as const,
+        text: JSON.stringify(reply),
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    }
+  })
+  on('prompt.fill', async (_$: unknown, e: { text: string }) => {
+    filled.push(e.text)
+    return { isFilled: true }
+  })
+  on('prompt.submit', async (_$: unknown, e: { text: string }) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
   on('ui.render', { component: 'AbovePrompt' }, async ($$: any, e: any) => {
     const { Text } = $$.ui.resolve(e)
     return <Text>engine band</Text>
   })
-  await $.prompt.submit({ text: 'make it better' } as never)
-  await clock.advance(0)
+  return { clock, sent, filled, calls: () => n }
 }
 
-test('band shows a B with its chip, expands, and closes', async ($, on) => {
-  await submitWith($, on, { grade: 'B', verdict: '没说做完怎么判断', tips: ['补上验收标准'], rewrite: '改好后跑测试确认' })
+test('a B is held: dropped, given back to the composer, then sent on the next Enter', async ($, on) => {
+  const h = harness(on, { grade: 'B', verdict: '没说做完怎么判断', tips: ['补上验收标准'], rewrite: '改好后跑测试确认' })
+  const first = (await $.prompt.submit({ text: 'make it better' } as never)) as { drop?: string }
+  expect(first.drop).toBeDefined()
+  expect(h.sent).toEqual([])
+  await h.clock.advance(200)
+  expect(h.filled).toEqual(['make it better'])
+
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'prompt-coach', surface, component: 'AbovePrompt', props: BAND_PROPS })
     expect(await ui.find({ text: /没说做完怎么判断/ })).toBeDefined()
     expect(await ui.find({ text: /engine band/ })).toBeDefined()
     expect(await ui.find({ text: / B / })).toBeDefined()
-    expect(await ui.find({ key: 'rewrite' })).toBeDefined()
+    expect(await ui.find({ key: 'close' })).toBeUndefined()
     expect(await ui.find({ text: /补上验收标准/ })).toBeUndefined()
     await ui.press({ key: 'toggle' })
     expect(await ui.find({ text: /补上验收标准/ })).toBeDefined()
     await ui.press({ key: 'toggle' })
   }
   const ui = await $.ui.mount({ plugin: 'prompt-coach', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  await ui.press({ key: 'close' })
-  expect(await ui.find({ text: /没说做完怎么判断/ })).toBeUndefined()
+  await ui.press({ key: 'rewrite' })
+  await ui.press({ key: 'mine' })
+  expect(h.filled).toEqual(['make it better', '改好后跑测试确认', 'make it better'])
+
+  await $.prompt.submit({ text: 'make it better, edited' } as never)
+  expect(h.sent).toEqual(['make it better, edited'])
+  expect(h.calls()).toBe(1)
 })
 
-test('band shows an A as one dim line with no buttons', async ($, on) => {
-  await submitWith($, on, { grade: 'A', verdict: '很清楚', tips: [], rewrite: null })
+test('an A goes straight through and leaves one dim line', async ($, on) => {
+  const h = harness(on, { grade: 'A', verdict: '很清楚', tips: [], rewrite: null })
+  await $.prompt.submit({ text: 'make it better' } as never)
+  expect(h.sent).toEqual(['make it better'])
   const ui = await $.ui.mount({ plugin: 'prompt-coach', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /很清楚/ })).toBeDefined()
-  expect(await ui.find({ key: 'toggle' })).toBeUndefined()
-  expect(await ui.find({ key: 'close' })).toBeUndefined()
+  expect(await ui.find({ key: 'mine' })).toBeUndefined()
+  expect(await ui.find({ key: 'disable' })).toBeDefined()
+})
+
+test('Disable turns the gate off and Enable turns it back on', async ($, on) => {
+  const h = harness(on, { grade: 'C', verdict: '看不懂', tips: [], rewrite: null })
+  await $.prompt.submit({ text: 'first prompt' } as never)
+  const ui = await $.ui.mount({ plugin: 'prompt-coach', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  await ui.press({ key: 'disable' })
+  expect(await ui.find({ key: 'enable' })).toBeDefined()
+  await $.prompt.submit({ text: 'second prompt' } as never)
+  expect(h.sent).toEqual(['second prompt'])
+  expect(h.calls()).toBe(1)
+  await ui.press({ key: 'enable' })
+  const third = (await $.prompt.submit({ text: 'third prompt' } as never)) as { drop?: string }
+  expect(third.drop).toBeDefined()
+  expect(h.calls()).toBe(2)
 })
 
 test('a short confirmation is logged but not sent to the model', async ($, on) => {
