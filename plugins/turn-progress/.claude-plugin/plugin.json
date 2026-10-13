@@ -1,0 +1,9 @@
+{
+  "name": "turn-progress",
+  "version": "0.2.0",
+  "description": "A progress bar above the prompt box for every turn: real progress from Claude's task list, an honest time estimate otherwise, then a one-line finish summary",
+  "author": {
+    "name": "hhchuan89"
+  },
+  "types": "./types/index.d.ts"
+}
