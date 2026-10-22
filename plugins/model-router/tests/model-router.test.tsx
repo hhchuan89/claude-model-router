@@ -58,14 +58,15 @@ const BAND_PROPS = {
   view: {},
 } as never
 
-type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[] }
+type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; prompts: string[] }
 
-function world(on: any, classifier: string | null, opts: { reviewer?: boolean } = {}): Seen {
+function world($: any, on: any, classifier: string | null, opts: { reviewer?: boolean; drop?: boolean } = {}): Seen {
   mock.store(on)
-  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [] }
+  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], prompts: [] }
   on('session.messages', async () => ({ value: [] }))
   on('model.complete', async (_$: unknown, e: { model: string; prompt: string }) => {
     seen.asked.push(e.model)
+    seen.prompts.push(e.prompt)
     const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     if (e.model === 'haiku') {
       return classifier === null
@@ -79,8 +80,12 @@ function world(on: any, classifier: string | null, opts: { reviewer?: boolean } 
     }
     return { deny: 'unexpected model' }
   })
+  // As the engine does: the turn starts before the submit resolves.
+  let turns = 0
   on('prompt.submit', async (_$: unknown, e: { text: string; context?: readonly string[] }) => {
     seen.submits.push(e)
+    if (opts.drop) return { drop: 'held' }
+    await $.turn.start({ text: e.text, turnId: `t${++turns}` })
     return { text: e.text, context: e.context }
   })
   on('turn.start', async (_$: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
@@ -104,10 +109,9 @@ async function step($: any, turnId: string, model = 'claude-opus-5-5[1m]', agent
 }
 
 test('a lookup turn runs on Haiku at low effort, with the assignment in context', async ($, on) => {
-  const seen = world(on, '{"tier":"lookup","reason":"找文件"}')
+  const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
   await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
   expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at low effort')
-  await $.turn.start({ text: 'find every TODO in the repo', turnId: 't1' } as never)
   await step($, 't1')
   expect(seen.steps[0]).toEqual({ model: 'claude-haiku-5-5[1m]', effort: 'low', agentId: undefined })
 
@@ -117,9 +121,8 @@ test('a lookup turn runs on Haiku at low effort, with the assignment in context'
 })
 
 test('the running model escalates itself, and the next step follows; downgrades are refused', async ($, on) => {
-  const seen = world(on, '{"tier":"lookup","reason":"找文件"}')
+  const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
   await $.prompt.submit({ text: 'look at the auth flow' } as never)
-  await $.turn.start({ text: 'look at the auth flow', turnId: 't1' } as never)
   await step($, 't1')
   const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: '要做设计决策' } as never)) as { result: string }
   expect(up.result).toContain('opus at high')
@@ -133,7 +136,7 @@ test('the running model escalates itself, and the next step follows; downgrades 
 })
 
 test('Fable 5.1 never runs, not even in a subagent; other subagent models are left alone', async ($, on) => {
-  const seen = world(on, '{"tier":"execute","reason":"实现"}')
+  const seen = world($, on, '{"tier":"execute","reason":"实现"}')
   await step($, 'other', 'claude-fable-5-1[1m]', 'agent-1')
   await step($, 'other', 'claude-sonnet-5-5', 'agent-2')
   expect(seen.steps[0]!.model).toBe('claude-opus-5-5[1m]')
@@ -141,15 +144,14 @@ test('Fable 5.1 never runs, not even in a subagent; other subagent models are le
 })
 
 test('a classifier failure falls back to Sonnet at medium', async ($, on) => {
-  const seen = world(on, null)
+  const seen = world($, on, null)
   await $.prompt.submit({ text: 'do the thing' } as never)
-  await $.turn.start({ text: 'do the thing', turnId: 't1' } as never)
   await step($, 't1')
   expect(seen.steps[0]).toEqual({ model: 'claude-sonnet-5-5[1m]', effort: 'medium', agentId: undefined })
 })
 
 test('#opus in the message skips the classifier', async ($, on) => {
-  const seen = world(on, '{"tier":"lookup","reason":"x"}')
+  const seen = world($, on, '{"tier":"lookup","reason":"x"}')
   await $.prompt.submit({ text: 'pick a database #opus' } as never)
   expect(seen.asked).toEqual([])
   expect(seen.submits[0]!.context?.[0]).toContain('assigned to opus')
@@ -157,9 +159,8 @@ test('#opus in the message skips the classifier', async ($, on) => {
 
 test('an Opus decision is reviewed by Fable 5.5 when it exists', async ($, on) => {
   const session = mock.session(on)
-  const seen = world(on, '{"tier":"decide","reason":"选方案"}', { reviewer: true })
+  const seen = world($, on, '{"tier":"decide","reason":"选方案"}', { reviewer: true })
   await $.prompt.submit({ text: 'which queue should we use' } as never)
-  await $.turn.start({ text: 'which queue should we use', turnId: 't1' } as never)
   await $.turn.complete({ answer: '用 SQS', durationMs: 1000, isAborted: false, turnId: 't1', text: '用 SQS', reason: 'completed' } as never)
   await seen.clock.advance(0)
   expect(seen.asked.filter(m => m === 'claude-fable-5-5').length).toBe(2)
@@ -168,9 +169,8 @@ test('an Opus decision is reviewed by Fable 5.5 when it exists', async ($, on) =
 
 test('no reviewer: no review notice', async ($, on) => {
   const session = mock.session(on)
-  const seen = world(on, '{"tier":"decide","reason":"选方案"}', { reviewer: false })
+  const seen = world($, on, '{"tier":"decide","reason":"选方案"}', { reviewer: false })
   await $.prompt.submit({ text: 'which queue should we use' } as never)
-  await $.turn.start({ text: 'which queue should we use', turnId: 't1' } as never)
   await $.turn.complete({ answer: '用 SQS', durationMs: 1000, isAborted: false, turnId: 't1', text: '用 SQS', reason: 'completed' } as never)
   await seen.clock.advance(0)
   expect(seen.asked.filter(m => m === 'claude-fable-5-5').length).toBe(1)
@@ -178,12 +178,26 @@ test('no reviewer: no review notice', async ($, on) => {
 })
 
 test('Disable router leaves every step alone', async ($, on) => {
-  const seen = world(on, '{"tier":"lookup","reason":"找文件"}')
+  const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   await $.prompt.submit({ text: 'find files' } as never)
-  await $.turn.start({ text: 'find files', turnId: 't1' } as never)
   await ui.press({ key: 'router-disable' })
   await step($, 't1', 'claude-fable-5-1')
   expect(seen.steps[0]!.model).toBe('claude-fable-5-1')
   expect(await ui.find({ key: 'router-enable' })).toBeDefined()
+})
+
+test('a prompt held back by another mod binds no route to the next turn', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","reason":"找文件"}', { drop: true })
+  await $.prompt.submit({ text: 'find files' } as never)
+  await $.turn.start({ text: 'a notification turn', turnId: 'tx' } as never)
+  await step($, 'tx')
+  expect(seen.steps[0]!.model).toBe('claude-opus-5-5[1m]')
+})
+
+test('the classifier sees the prompt with secrets masked', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","reason":"x"}')
+  await $.prompt.submit({ text: `deploy with key sk-ant-api03-${'q'.repeat(30)}` } as never)
+  expect(seen.prompts[0]).toContain('[REDACTED')
+  expect(seen.prompts[0]).not.toContain('qqqqqqqqqq')
 })

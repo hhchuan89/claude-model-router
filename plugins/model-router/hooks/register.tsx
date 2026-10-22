@@ -3,6 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { ModelKey, Route } from '../types'
 import { isPersonOrigin } from './origin'
+import { redact } from './redact'
 import type { Lang } from './route'
 import {
   applyEscalation,
@@ -158,11 +159,15 @@ export const register: Register = (on, options) => {
     if (!(await read($, enabled)) || !isPersonOrigin(origin) || e.turnId !== undefined || e.text.trim() === '') {
       return next(e)
     }
-    const r = await classify($, lang, e.text, await read($, route))
+    const r = await classify($, lang, redact(e.text), await read($, route))
+    // Set before next: next resolves only after the turn has started, and turn.start binds this route.
+    pending = r
+    pendingPrompt = e.text
     const entered = await next({ ...e, context: [...(e.context ?? []), assignmentContext(r)] })
-    if (entered.drop === undefined) {
-      pending = r
-      pendingPrompt = e.text
+    if (entered.drop !== undefined) {
+      // Held back (prompt-coach): no turn starts, so the route must not bind to the next one.
+      pending = null
+      pendingPrompt = ''
     }
     return entered
   })
