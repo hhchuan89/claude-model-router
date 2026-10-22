@@ -1,9 +1,21 @@
 {
   "name": "prompt-cockpit",
-  "description": "Instruments above the Claude Code prompt box: a prompt gatekeeper and a per-turn progress bar",
-  "owner": { "name": "hhchuan89" },
+  "description": "Instruments above the Claude Code prompt box: a prompt gatekeeper, a per-turn progress bar, and a model router",
+  "owner": {
+    "name": "hhchuan89"
+  },
   "plugins": [
-    { "name": "prompt-coach", "source": "./plugins/prompt-coach" },
-    { "name": "turn-progress", "source": "./plugins/turn-progress" }
+    {
+      "name": "prompt-coach",
+      "source": "./plugins/prompt-coach"
+    },
+    {
+      "name": "turn-progress",
+      "source": "./plugins/turn-progress"
+    },
+    {
+      "name": "model-router",
+      "source": "./plugins/model-router"
+    }
   ]
 }
