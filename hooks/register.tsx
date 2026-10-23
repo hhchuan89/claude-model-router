@@ -225,7 +225,7 @@ async function statsText($: EngineInterface): Promise<string> {
 }
 
 export const register: Register = (on, options) => {
-  const lang: Lang = options.language === 'en' ? 'en' : 'zh'
+  const lang: Lang = options.language === 'zh' ? 'zh' : 'en'
   const ids: Record<ModelKey, string> = {
     haiku: String(options.haikuModel ?? 'claude-haiku-5-5'),
     sonnet: String(options.sonnetModel ?? 'claude-sonnet-5-5'),

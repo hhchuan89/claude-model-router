@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Routes every Claude Code turn to the cheapest model that can do it well (Haiku lookups, Sonnet execution, Opus decisions), lets the model escalate itself, routes subagents too, keeps a warm cache when switching would cost more, and shows how much you saved vs all-Opus. Classification runs on your own Anthropic account; no third party sees your prompts.",
   "author": {
     "name": "hhchuan89"
@@ -10,11 +10,11 @@
     "language": {
       "type": "string",
       "title": "Reason language",
-      "description": "Language of the one-line routing reason in the band (zh or en)",
-      "default": "zh",
+      "description": "Language of the routing reason and the savings line in the band (en = English, zh = Simplified Chinese)",
+      "default": "en",
       "options": [
-        "zh",
-        "en"
+        "en",
+        "zh"
       ]
     },
     "haikuModel": {

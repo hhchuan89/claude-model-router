@@ -11,8 +11,8 @@ the same account Claude Code already uses. No proxy, no background service, no e
 This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 ```
-⚙ Sonnet · medium — 照方案实现                                        [Disable router]
-  本轮 21.2k · $0.04   今日 $1.20, 省 ≈$3.10 (72%) 对比全用 Opus
+⚙ Sonnet · medium — implement the agreed plan                         [Disable router]
+  turn 21.2k · $0.04   today $1.20, saved ≈$3.10 (72%) vs all on Opus
 ```
 
 ## How a turn is routed
@@ -33,7 +33,7 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 3. **Route every request.** Each model request of the turn runs on the route, keeping a context-window suffix such as `[1m]`.
 4. **Keep a warm cache when it is cheaper.** Switching to a smaller model makes it read the whole context uncached. When
    the context is large and the bigger model's cache is still warm, the router compares the two costs over the turn's
-   expected steps and stays on the warm model if switching would cost more (shown as `→ Opus (保缓存)`).
+   expected steps and stays on the warm model if switching would cost more (shown as `→ Opus (cache kept)`).
 5. **Route subagents.** A subagent spawned without a model gets one by its job: `Explore` on Haiku, `Plan` on Opus,
    others by the same classifier (lookup → Haiku, execute → Sonnet, decide → Opus). A model the caller names is kept.
 6. **No Fable 5.1.** Any request or subagent asking for Fable runs on Opus instead. If **Fable 5.5** exists on your
@@ -64,7 +64,7 @@ Answer `y` to add the marketplace and pick a scope. Installed at user scope it a
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `language` | `zh` | Language of the reason line (`zh` or `en`) |
+| `language` | `en` | Language of the reason line and the savings line (`en` or `zh`) |
 | `haikuModel` / `sonnetModel` / `opusModel` | `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` | Model ids per tier |
 | `reviewModel` | `claude-fable-5-5` | Reviews Opus decisions only if it exists on your account; Fable 5.1 is never used |
 

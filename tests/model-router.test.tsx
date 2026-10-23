@@ -245,7 +245,7 @@ describe('meter', () => {
   })
 })
 
-test('each step goes on the meter, shown in the band and in /model-router stats', async ($, on) => {
+test('each step goes on the meter, shown in the band and in /model-router stats', { options: { language: 'zh' } }, async ($, on) => {
   const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
   await $.prompt.submit({ text: 'find files' } as never)
   seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
@@ -258,7 +258,7 @@ test('each step goes on the meter, shown in the band and in /model-router stats'
   expect(r.text).toContain('saved')
 })
 
-test('a warm Opus cache on a long context keeps the next execute turn on Opus', async ($, on) => {
+test('a warm Opus cache on a long context keeps the next execute turn on Opus', { options: { language: 'zh' } }, async ($, on) => {
   const seen = world($, on, ['{"tier":"decide","reason":"选方案"}', '{"tier":"execute","reason":"照方案实现"}'])
   await $.prompt.submit({ text: 'which design' } as never)
   seen.usage.push(U(2000, 1000, 300_000, 0))
@@ -280,7 +280,7 @@ test('subagents without a model are routed; Fable becomes Opus; a named model is
   expect(seen.agents).toEqual(['haiku', 'opus', 'opus', 'sonnet'])
 })
 
-test('parallel subagent steps all land on the meter, and the turn includes the classifier call', async ($, on) => {
+test('parallel subagent steps all land on the meter, and the turn includes the classifier call', { options: { language: 'zh' } }, async ($, on) => {
   const seen = world($, on, '{"tier":"execute","reason":"实现"}')
   await $.prompt.submit({ text: 'build it' } as never)
   for (let i = 0; i < 5; i++) seen.usage.push(U(1000, 0, 0, 0, 'claude-sonnet-5-5'))
@@ -289,4 +289,30 @@ test('parallel subagent steps all land on the meter, and the turn includes the c
   expect(r.text).toContain('| sonnet | 5.0k |')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /本轮 5\.0k/ })).toBeDefined()
+})
+
+test('the band speaks English by default', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","reason":"find files"}')
+  await $.prompt.submit({ text: 'find files' } as never)
+  seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
+  await step($, 't1')
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /Haiku · low — find files/ })).toBeDefined()
+  expect(await ui.find({ text: /turn 21\.2k/ })).toBeDefined()
+  expect(await ui.find({ text: /saved ≈/ })).toBeDefined()
+  expect(await ui.find({ text: /vs all on Opus/ })).toBeDefined()
+})
+
+test('a classifier failure reads in English by default and in Chinese on request', async ($, on) => {
+  world($, on, null)
+  await $.prompt.submit({ text: 'do the thing' } as never)
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /classifier failed, defaulted to Sonnet/ })).toBeDefined()
+})
+
+test('language zh gives the Chinese band', { options: { language: 'zh' } }, async ($, on) => {
+  world($, on, null)
+  await $.prompt.submit({ text: 'do the thing' } as never)
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /分类失败，默认 Sonnet/ })).toBeDefined()
 })
