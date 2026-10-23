@@ -251,7 +251,7 @@ test('each step goes on the meter, shown in the band and in /model-router stats'
   seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /本轮 21\.2k/ })).toBeDefined()
+  expect(await ui.find({ text: /本轮 21\.2k token · / })).toBeDefined()
   expect(await ui.find({ text: /省 ≈/ })).toBeDefined()
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('haiku')
@@ -288,7 +288,7 @@ test('parallel subagent steps all land on the meter, and the turn includes the c
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('| sonnet | 5.0k |')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /本轮 5\.0k/ })).toBeDefined()
+  expect(await ui.find({ text: /本轮 5\.0k token/ })).toBeDefined()
 })
 
 test('the band speaks English by default', async ($, on) => {
@@ -298,7 +298,8 @@ test('the band speaks English by default', async ($, on) => {
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /Haiku · low — find files/ })).toBeDefined()
-  expect(await ui.find({ text: /turn 21\.2k/ })).toBeDefined()
+  expect(await ui.find({ text: /turn 21\.2k token · / })).toBeDefined()
+  expect(await ui.find({ text: /today 21\.2k token · / })).toBeDefined()
   expect(await ui.find({ text: /saved ≈/ })).toBeDefined()
   expect(await ui.find({ text: /vs all on Opus/ })).toBeDefined()
 })

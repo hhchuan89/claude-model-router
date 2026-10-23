@@ -12,7 +12,7 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 ```
 ⚙ Sonnet · medium — implement the agreed plan                         [Disable router]
-  turn 21.2k · $0.04   today $1.20, saved ≈$3.10 (72%) vs all on Opus
+  turn 21.2k token · $0.04   today 310k token · $1.20, saved ≈$3.10 (72%) vs all on Opus
 ```
 
 ## How a turn is routed

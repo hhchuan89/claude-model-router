@@ -414,8 +414,8 @@ export const register: Register = (on, options) => {
       : ''
     const s = saved(m.today)
     const meterText =
-      `${str.turn} ${fmtTokens(m.turn.tokens)} · ${fmtUsd(m.turn.cost)}   ` +
-      `${str.today} ${fmtUsd(m.today.cost)}, ${str.save} ≈${fmtUsd(s.usd)} (${s.pct}%) ${str.vs}`
+      `${str.turn} ${fmtTokens(m.turn.tokens)} token · ${fmtUsd(m.turn.cost)}   ` +
+      `${str.today} ${fmtTokens(m.today.tokens)} token · ${fmtUsd(m.today.cost)}, ${str.save} ≈${fmtUsd(s.usd)} (${s.pct}%) ${str.vs}`
 
     return (
       <Box flexDirection="column">
