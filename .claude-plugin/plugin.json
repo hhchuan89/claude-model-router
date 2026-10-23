@@ -1,0 +1,45 @@
+{
+  "name": "model-router",
+  "version": "0.2.0",
+  "description": "Routes every Claude Code turn to the cheapest model that can do it well (Haiku lookups, Sonnet execution, Opus decisions), lets the model escalate itself, routes subagents too, keeps a warm cache when switching would cost more, and shows how much you saved vs all-Opus. Classification runs on your own Anthropic account; no third party sees your prompts.",
+  "author": {
+    "name": "hhchuan89"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Reason language",
+      "description": "Language of the one-line routing reason in the band (zh or en)",
+      "default": "zh",
+      "options": [
+        "zh",
+        "en"
+      ]
+    },
+    "haikuModel": {
+      "type": "string",
+      "title": "Lookup model",
+      "description": "Model id for lookups",
+      "default": "claude-haiku-5-5"
+    },
+    "sonnetModel": {
+      "type": "string",
+      "title": "Execution model",
+      "description": "Model id for execution",
+      "default": "claude-sonnet-5-5"
+    },
+    "opusModel": {
+      "type": "string",
+      "title": "Decision model",
+      "description": "Model id for decisions",
+      "default": "claude-opus-5-5"
+    },
+    "reviewModel": {
+      "type": "string",
+      "title": "Decision reviewer",
+      "description": "Reviews Opus's decisions, only if this model exists on your account (checked daily). Fable 5.1 is never used.",
+      "default": "claude-fable-5-5"
+    }
+  }
+}

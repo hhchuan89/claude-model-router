@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
+import { add, costOf, EMPTY, keepWarm, saved, subagentModel } from '../hooks/meter'
 import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, withSuffixOf } from '../hooks/route'
 
 describe('route rules', () => {
@@ -58,20 +59,21 @@ const BAND_PROPS = {
   view: {},
 } as never
 
-type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; prompts: string[] }
+type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; prompts: string[]; usage: any[]; agents: (string | undefined)[] }
 
-function world($: any, on: any, classifier: string | null, opts: { reviewer?: boolean; drop?: boolean } = {}): Seen {
+function world($: any, on: any, classifier: string | null | (string | null)[], opts: { reviewer?: boolean; drop?: boolean } = {}): Seen {
   mock.store(on)
-  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], prompts: [] }
+  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], prompts: [], usage: [], agents: [] }
   on('session.messages', async () => ({ value: [] }))
   on('model.complete', async (_$: unknown, e: { model: string; prompt: string }) => {
     seen.asked.push(e.model)
     seen.prompts.push(e.prompt)
     const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     if (e.model === 'haiku') {
-      return classifier === null
+      const reply = Array.isArray(classifier) ? (classifier.shift() ?? null) : classifier
+      return reply === null
         ? { value: { isAnswered: false as const, reason: 'aborted' as const, usage } }
-        : { value: { isAnswered: true as const, text: classifier, usage } }
+        : { value: { isAnswered: true as const, text: reply, usage } }
     }
     if (e.model === 'claude-fable-5-5') {
       return opts.reviewer
@@ -92,7 +94,11 @@ function world($: any, on: any, classifier: string | null, opts: { reviewer?: bo
   on('turn.complete', async () => ({ text: 'ok' }))
   on('turn.step', async function* (_$: unknown, e: { model: string; effort?: unknown; agentId?: string; turnId: string; index: number }) {
     seen.steps.push({ model: e.model, effort: e.effort, agentId: e.agentId })
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: seen.usage.shift() ?? null }
+  })
+  on('tool.call', { tool: 'Agent' }, async (_$: unknown, e: { model?: string }) => {
+    seen.agents.push(e.model)
+    return { result: 'done' }
   })
   on('ui.render', { component: 'AbovePrompt' }, async ($$: any, e: any) => {
     const { Text } = $$.ui.resolve(e)
@@ -200,4 +206,76 @@ test('the classifier sees the prompt with secrets masked', async ($, on) => {
   await $.prompt.submit({ text: `deploy with key sk-ant-api03-${'q'.repeat(30)}` } as never)
   expect(seen.prompts[0]).toContain('[REDACTED')
   expect(seen.prompts[0]).not.toContain('qqqqqqqqqq')
+})
+
+const U = (input: number, output: number, read = 0, write = 0, model = 'claude-opus-5-5') => ({
+  input_tokens: input,
+  output_tokens: output,
+  cache_read_input_tokens: read,
+  cache_creation_input_tokens: write,
+  model,
+})
+
+describe('meter', () => {
+  test('prices tokens per model and the Opus baseline', async () => {
+    expect(Math.round(costOf(U(1e6, 0), 'opus') * 1000) / 1000).toBe(4)
+    expect(Math.round((costOf(U(0, 1e6), 'haiku')) * 1000) / 1000).toBe(0.5)
+    const t = add(add(EMPTY, 'claude-haiku-5-5', U(1e6, 0)), 'claude-opus-5-5', U(1e6, 0))
+    expect(Math.round((t.cost) * 1000) / 1000).toBe(4.1)
+    expect(Math.round((t.baseline) * 1000) / 1000).toBe(8)
+    expect(saved(t).pct).toBe(49)
+  })
+
+  test('a downgrade keeps the warm model only when the cold read costs more', async () => {
+    const shape = { steps: 5, output: 1000 }
+    const warm = { model: 'opus' as const, at: 0, context: 200_000 }
+    expect(keepWarm('sonnet', warm, 60_000, shape)).toBe('opus')
+    expect(keepWarm('haiku', warm, 60_000, shape)).toBe('haiku')
+    expect(keepWarm('sonnet', { ...warm, context: 5_000 }, 60_000, shape)).toBe('sonnet')
+    expect(keepWarm('sonnet', warm, 2 * 3600_000, shape)).toBe('sonnet')
+    expect(keepWarm('opus', { ...warm, model: 'sonnet' }, 60_000, shape)).toBe('opus')
+  })
+
+  test('subagents: Explore on Haiku, Plan on Opus, the rest by tier', async () => {
+    expect(subagentModel('Explore', null)).toBe('haiku')
+    expect(subagentModel('Plan', null)).toBe('opus')
+    expect(subagentModel('general-purpose', 'lookup')).toBe('haiku')
+    expect(subagentModel(undefined, 'decide')).toBe('opus')
+    expect(subagentModel(undefined, null)).toBe('sonnet')
+  })
+})
+
+test('each step goes on the meter, shown in the band and in /model-router stats', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
+  await $.prompt.submit({ text: 'find files' } as never)
+  seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
+  await step($, 't1')
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /本轮 21\.2k/ })).toBeDefined()
+  expect(await ui.find({ text: /省 ≈/ })).toBeDefined()
+  const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+  expect(r.text).toContain('haiku')
+  expect(r.text).toContain('saved')
+})
+
+test('a warm Opus cache on a long context keeps the next execute turn on Opus', async ($, on) => {
+  const seen = world($, on, ['{"tier":"decide","reason":"选方案"}', '{"tier":"execute","reason":"照方案实现"}'])
+  await $.prompt.submit({ text: 'which design' } as never)
+  seen.usage.push(U(2000, 1000, 300_000, 0))
+  await step($, 't1')
+  await $.prompt.submit({ text: 'implement it' } as never)
+  expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus')
+  await step($, 't2')
+  expect(seen.steps[1]!.model).toBe('claude-opus-5-5[1m]')
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /Sonnet · medium → Opus \(保缓存\)/ })).toBeDefined()
+})
+
+test('subagents without a model are routed; Fable becomes Opus; a named model is kept', async ($, on) => {
+  const seen = world($, on, '{"tier":"decide","reason":"审计"}')
+  await $.tool.call({ tool: 'Agent', description: 'find', prompt: 'grep for TODO', subagent_type: 'Explore' } as never)
+  await $.tool.call({ tool: 'Agent', description: 'audit', prompt: 'audit the save system for exploits' } as never)
+  await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', model: 'fable' } as never)
+  await $.tool.call({ tool: 'Agent', description: 'y', prompt: 'y', model: 'sonnet' } as never)
+  expect(seen.agents).toEqual(['haiku', 'opus', 'opus', 'sonnet'])
 })

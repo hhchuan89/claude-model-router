@@ -11,6 +11,15 @@ export type Route = {
   reason: string
   // escalations made during the turn, oldest first
   trail: string[]
+  // the tier's own model, when a warm cache made it cheaper to stay on a bigger one
+  keptFrom?: ModelKey
+}
+
+export type Tally = {
+  tokens: number
+  cost: number
+  baseline: number
+  byModel: Record<string, { tokens: number; cost: number }>
 }
 
 declare module 'claude-code' {
@@ -18,6 +27,7 @@ declare module 'claude-code' {
     'model-router': {
       route: Route | null
       enabled: boolean
+      meter: { turn: Tally; today: Tally }
     }
   }
 }

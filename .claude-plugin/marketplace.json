@@ -1,21 +1,6 @@
 {
-  "name": "prompt-cockpit",
-  "description": "Instruments above the Claude Code prompt box: a prompt gatekeeper, a per-turn progress bar, and a model router",
-  "owner": {
-    "name": "hhchuan89"
-  },
-  "plugins": [
-    {
-      "name": "prompt-coach",
-      "source": "./plugins/prompt-coach"
-    },
-    {
-      "name": "turn-progress",
-      "source": "./plugins/turn-progress"
-    },
-    {
-      "name": "model-router",
-      "source": "./plugins/model-router"
-    }
-  ]
+  "name": "claude-model-router",
+  "description": "A local, private model router for Claude Code: Haiku for lookups, Sonnet for execution, Opus for decisions, with a savings meter. An alternative to Jev / jev-router that never sends your prompts to a third party.",
+  "owner": { "name": "hhchuan89" },
+  "plugins": [{ "name": "model-router", "source": "./" }]
 }
