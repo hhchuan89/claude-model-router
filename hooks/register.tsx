@@ -92,19 +92,31 @@ async function setEnabled($: EngineInterface, isOn: boolean) {
   await $.store.set('enabled', isOn)
 }
 
-async function count($: EngineInterface, change: (c: Counts) => Counts) {
-  const c = ((await $.store.get('counts')) as Counts | undefined) ?? NO_COUNTS
-  await $.store.set('counts', change(c))
+// $.store has no compare-and-set, and steps of parallel subagents land at once: every read-modify-write
+// goes through one chain so no increment is lost.
+let writes: Promise<void> = Promise.resolve()
+
+function serial($: EngineInterface, job: () => Promise<void>): Promise<void> {
+  writes = writes.then(job).catch(err => $.ui.log(`model-router: store write failed: ${String(err)}`))
+  return writes
+}
+
+function count($: EngineInterface, change: (c: Counts) => Counts): Promise<void> {
+  return serial($, async () => {
+    const c = ((await $.store.get('counts')) as Counts | undefined) ?? NO_COUNTS
+    await $.store.set('counts', change(c))
+  })
 }
 
 // Every model call this session pays for, the router's own included, goes on the turn, the day and the total.
-async function record($: EngineInterface, modelId: string, u: Usage) {
-  const now = await $.clock.now()
-  const day = `meter:${dayKey(now)}`
-  const today = add(((await $.store.get(day)) as Tally | undefined) ?? EMPTY, modelId, u)
-  await $.store.set(day, today)
-  await $.store.set('meter:all', add(((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY, modelId, u))
-  await update($, meter, m => ({ turn: add((m ?? { turn: EMPTY }).turn, modelId, u), today }))
+function record($: EngineInterface, modelId: string, u: Usage): Promise<void> {
+  return serial($, async () => {
+    const day = `meter:${dayKey(await $.clock.now())}`
+    const today = add(((await $.store.get(day)) as Tally | undefined) ?? EMPTY, modelId, u)
+    await $.store.set(day, today)
+    await $.store.set('meter:all', add(((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY, modelId, u))
+    await update($, meter, m => ({ turn: add((m ?? { turn: EMPTY }).turn, modelId, u), today }))
+  })
 }
 
 async function recentContext($: EngineInterface): Promise<string> {
@@ -266,6 +278,8 @@ export const register: Register = (on, options) => {
     if (!(await read($, enabled)) || !isPersonOrigin(origin) || e.turnId !== undefined || e.text.trim() === '') {
       return next(e)
     }
+    // The turn's tally starts here, so it includes the classifier's own call.
+    await update($, meter, m => ({ turn: EMPTY, today: (m ?? { today: EMPTY }).today }))
     let r = await classify($, lang, e.text, await read($, route))
     const shape = ((await $.store.get('shape')) as Shape | undefined) ?? { steps: 3, output: 800 }
     const model = keepWarm(r.model, last, await $.clock.now(), shape)
@@ -292,7 +306,6 @@ export const register: Register = (on, options) => {
       turnSteps = 0
       turnOutput = 0
       await update($, route, () => r)
-      await update($, meter, m => ({ turn: EMPTY, today: (m ?? { today: EMPTY }).today }))
       await count($, c => ({ ...c, turns: { ...c.turns, [r.tier]: c.turns[r.tier] + 1 } }))
     }
     return next(e)

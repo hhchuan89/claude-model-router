@@ -279,3 +279,14 @@ test('subagents without a model are routed; Fable becomes Opus; a named model is
   await $.tool.call({ tool: 'Agent', description: 'y', prompt: 'y', model: 'sonnet' } as never)
   expect(seen.agents).toEqual(['haiku', 'opus', 'opus', 'sonnet'])
 })
+
+test('parallel subagent steps all land on the meter, and the turn includes the classifier call', async ($, on) => {
+  const seen = world($, on, '{"tier":"execute","reason":"实现"}')
+  await $.prompt.submit({ text: 'build it' } as never)
+  for (let i = 0; i < 5; i++) seen.usage.push(U(1000, 0, 0, 0, 'claude-sonnet-5-5'))
+  await Promise.all([0, 1, 2, 3, 4].map(i => step($, 'sub', 'claude-sonnet-5-5', `agent-${i}`)))
+  const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+  expect(r.text).toContain('| sonnet | 5.0k |')
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /本轮 5\.0k/ })).toBeDefined()
+})
