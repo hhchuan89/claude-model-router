@@ -77,10 +77,15 @@ type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text
 
 const IDS: Record<string, string> = { haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' }
 
-function world($: any, on: any, classifier: string | null | (string | null)[], opts: { reviewer?: boolean; drop?: boolean } = {}): Seen {
+function world(
+  $: any,
+  on: any,
+  classifier: string | null | (string | null)[],
+  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[] } = {},
+): Seen {
   mock.store(on)
   const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], prompts: [], usage: [], agents: [], files: {} }
-  on('session.messages', async () => ({ value: [] }))
+  on('session.messages', async () => ({ value: (opts.messages ?? []).map(m => ({ ...m, toolUses: [] })) }))
   on('model.complete', async (_$: unknown, e: { model: string; prompt: string }) => {
     seen.asked.push(e.model)
     seen.prompts.push(e.prompt)
@@ -219,6 +224,20 @@ test('an Opus decision is reviewed by Fable 5.5 when it is configured and exists
   await seen.clock.advance(0)
   expect(seen.asked.filter(m => m === 'claude-fable-5-5').length).toBe(2)
   expect(JSON.stringify(session.appended())).toContain('少考虑了回滚方案')
+  // The notice names the configured reviewer rather than assuming one model.
+  expect(JSON.stringify(session.appended())).toContain('Decision review (claude-fable-5-5)')
+})
+
+test('the classifier context is masked too: earlier messages can hold secrets the new one does not', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","reason":"x"}', {
+    messages: [
+      { role: 'user', text: `here is the key sk-ant-api03-${'z'.repeat(30)} for staging` },
+      { role: 'assistant', text: 'noted' },
+    ],
+  })
+  await $.prompt.submit({ text: 'and now list the files' } as never)
+  expect(seen.prompts[0]).toContain('[REDACTED')
+  expect(seen.prompts[0]).not.toContain('zzzzzzzzzz')
 })
 
 test('a configured reviewer that does not exist leaves no review notice', { options: { reviewModel: 'claude-fable-5-5' } }, async ($, on) => {
@@ -465,9 +484,9 @@ describe('subagent rules', () => {
     expect(stepUp(first, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', model: IDS_BY_KEY.sonnet, effort: 'medium', retriedAtTier: false })
   })
 
-  test('the events log lands in ~/.claude/model-tiering wherever the plugin is installed under ~/.claude', async () => {
-    expect(logDir('C:\\Users\\me\\.claude\\plugins\\cache\\model-router')).toBe('C:/Users/me/.claude/model-tiering')
-    expect(logDir('/home/me/.claude/plugins/x/model-router/0.3.0')).toBe('/home/me/.claude/model-tiering')
+  test('the events log lands in ~/.claude/model-router wherever the plugin is installed under ~/.claude', async () => {
+    expect(logDir('C:\\Users\\me\\.claude\\plugins\\cache\\model-router')).toBe('C:/Users/me/.claude/model-router')
+    expect(logDir('/home/me/.claude/plugins/x/model-router/0.3.0')).toBe('/home/me/.claude/model-router')
   })
 })
 
@@ -581,7 +600,7 @@ test('the second run of three errors raises the model; the log says which stage 
   await step($, 'sub', OPUS, id)
   expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
   expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
-  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-tiering/events-sess-1.json'))
+  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-router/events-sess-1.json'))
   const log = JSON.parse(seen.files[file!]!) as { events: { event: string; to: string; reason: string }[] }
   expect(log.events.filter(ev => ev.event === 'auto-escalated')).toMatchObject([
     { to: 'haiku/high', reason: '3 tool errors in a row: more effort on the same model' },
@@ -653,14 +672,14 @@ test('a model the router asked for that is not the one answering is counted as a
   expect(r.text).toContain('the one that answered: 1')
 })
 
-test('main routes and subagent changes land in the events file the weekly report reads', async ($, on) => {
+test('main routes and subagent changes land in the events file in ~/.claude/model-router', async ($, on) => {
   const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
   await $.prompt.submit({ text: 'find files' } as never)
   const id = await spawnAgent($, { subagentType: 'Explore' })
   seen.usage.push(U(10, 1, 0, 0, 'claude-haiku-5-5'))
   await step($, 'sub', OPUS, id)
   await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'sonnet', reason: 'contradiction' } as never)
-  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-tiering/events-sess-1.json'))
+  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-router/events-sess-1.json'))
   const log = JSON.parse(seen.files[file!]!) as { sessionId: string; events: { agentId: string; event: string; to: string; reason: string }[]; stats: Record<string, unknown> }
   expect(log.sessionId).toBe('sess-1')
   expect(log.events).toMatchObject([

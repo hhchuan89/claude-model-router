@@ -56,7 +56,7 @@ let turnOutput = 0
 // What each tiered subagent is on now, by agent id.
 const agents = new Map<string, AgentTier>()
 // Per session: what changed and what each tiered subagent cost per model and effort. Written to
-// ~/.claude/model-tiering/, one file per session, for the weekly report (tiering_report.py).
+// ~/.claude/model-router/, one file per session, for your own analysis.
 const log: EventLog = { sessionId: '', events: [], stats: {} }
 
 const STR = {
@@ -64,7 +64,7 @@ const STR = {
     fallback: '分类失败，默认 Sonnet',
     forced: '你在消息里指定了模型',
     off: 'Model router 已关闭',
-    review: 'Fable 5.5 审查',
+    review: '决策审查',
     kept: '保缓存',
     turn: '本轮',
     today: '今日',
@@ -75,7 +75,7 @@ const STR = {
     fallback: 'classifier failed, defaulted to Sonnet',
     forced: 'model pinned in your message',
     off: 'Model router is off',
-    review: 'Fable 5.5 review',
+    review: 'Decision review',
     kept: 'cache kept',
     turn: 'turn',
     today: 'today',
@@ -182,7 +182,11 @@ async function logEvent($: EngineInterface, agentId: string, event: string, to: 
 
 async function recentContext($: EngineInterface): Promise<string> {
   const rows = (await $.session.messages()).filter(m => m.text.trim() !== '').slice(-2)
-  return rows.map(m => `[${m.role}] ${m.text.length > 1200 ? `${m.text.slice(0, 200)}\n…\n${m.text.slice(-1000)}` : m.text}`).join('\n\n')
+  // Masked before trimming, so a secret cut by the trim is still caught whole.
+  return rows
+    .map(m => redact(m.text))
+    .map((text, i) => `[${rows[i]!.role}] ${text.length > 1200 ? `${text.slice(0, 200)}\n…\n${text.slice(-1000)}` : text}`)
+    .join('\n\n')
 }
 
 // Haiku sorts a text into a tier; null when it cannot say. withContext adds the last two messages.
@@ -243,7 +247,7 @@ async function reviewDecision($: EngineInterface, lang: Lang, reviewModel: strin
   })
   await record($, reviewModel, r.usage)
   if (!r.isAnswered) return
-  await $.session.append({ message: { type: 'system', content: [{ type: 'text', text: `${STR[lang].review}：\n${r.text.trim()}` }] } })
+  await $.session.append({ message: { type: 'system', content: [{ type: 'text', text: `${STR[lang].review} (${reviewModel})：\n${r.text.trim()}` }] } })
 }
 
 // Runs after the turn, unawaited: an Opus decision goes to the reviewer only when one is set and exists.

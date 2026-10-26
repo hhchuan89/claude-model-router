@@ -137,7 +137,7 @@ export function describeTier(s: AgentTier): string {
   return `${s.tier}${s.effort ? `/${s.effort}` : ''}`
 }
 
-// The events log for the weekly report (tiering_report.py): one file per session in ~/.claude/model-tiering.
+// The events log, for your own analysis: one file per session in ~/.claude/model-router.
 export type UsageStats = { steps: number; input: number; output: number; cacheRead: number; cacheWrite: number }
 export type AgentStats = { byModel: Record<string, UsageStats>; byEffort: Record<string, number> }
 export type EventLog = {
@@ -146,11 +146,11 @@ export type EventLog = {
   stats: Record<string, AgentStats>
 }
 
-// ~/.claude/model-tiering, found from where the plugin lives under ~/.claude.
+// ~/.claude/model-router, found from where the plugin lives under ~/.claude.
 export function logDir(pluginRoot: string): string {
   const root = pluginRoot.split('\\').join('/')
   const at = root.toLowerCase().lastIndexOf('/.claude/')
-  return `${at < 0 ? root : root.slice(0, at + '/.claude'.length)}/model-tiering`
+  return `${at < 0 ? root : root.slice(0, at + '/.claude'.length)}/model-router`
 }
 
 export function addUsage(
