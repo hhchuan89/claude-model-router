@@ -15,12 +15,11 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 > writing. Tested on Claude Code 2.1.295–2.1.308 on Windows. If your Claude Code does not support function hooks, the
 > plugin installs but does nothing.
 
-```
-⚙ Sonnet · medium — implement the agreed plan                         [Disable router]
-  turn 21.2k token · $0.04   today 310k token · $1.20, saved ≈$3.10 (72%) vs all on Opus
-```
+![The router's band above the Claude Code prompt](docs/band.png)
 
-<!-- screenshot: docs/band.png -->
+The band above the prompt, from a real session: the route for this turn and why (here an ambiguous follow-up, so the
+router would not start it on Haiku), then this turn's and today's tokens with an estimated saving against running
+everything on Opus. The numbers are one person's working day, not a typical result.
 
 ## How a turn is routed
 
