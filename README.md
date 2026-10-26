@@ -25,11 +25,15 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 1. **Classify.** When you send a prompt, Haiku (low effort, 4 s cap) sorts it with the last two messages as context.
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
-   picks the higher tier. Likely secrets are masked before classification. If classification fails, the turn runs on
+   picks the higher tier. The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
+   higher-tier turn the previous tier stays (shown as "unsure: not downgrading"), a first turn never starts on lookup
+   (it runs on Sonnet), and an unsure `general-purpose` subagent lookup runs on Sonnet instead of Haiku. Likely secrets
+   are masked before classification. If classification fails, the turn runs on
    Sonnet · medium. `#haiku`, `#sonnet` or `#opus` in a message pins the model.
 2. **Decide before working.** The model reads its assignment beside your prompt and must judge whether the task fits
    *before* doing any work. If not, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
    effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. Escalation only goes up within a turn.
+   Effort-only escalation (same model, more effort) exists for the main thread and for subagents alike.
 3. **Route every request.** Each model request of the turn runs on the route, keeping a context-window suffix such as `[1m]`.
 4. **Keep a warm cache when it is cheaper.** Switching to a smaller model makes it read the whole context uncached. When
    the context is large and the bigger model's cache is still warm, the router compares the two costs over the turn's
@@ -42,8 +46,11 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
    capped at the parent's tier.
 6. **Subagents can escalate, and are escalated.** The same `escalate` tool works inside a subagent: it may raise its own
    model or effort from its next step, up to the parent's tier (a raised tier runs at least at that tier's starting
-   effort). After three tool errors in a row the router raises a subagent one step by itself: the next tier while below
-   the parent's tier, otherwise the next effort. Escalation only goes up.
+   effort). The router also escalates a failing subagent by itself, in two stages. After three tool errors in a row it
+   first raises the effort one step on the same model (cheaper than a model switch, and often enough). If three more
+   errors follow at that tier, it moves to the next model, at least at that model's starting effort, and the new model
+   gets its own same-model retry. At the parent's tier only effort rises, up to max. An agent that inherits the
+   session's effort counts as `high`. A manual `escalate` from the subagent works as before. Escalation only goes up.
 7. **No Fable 5.1.** Any request or subagent asking for Fable runs on Opus instead, and a Fable parent never passes
    Fable down. Optionally, set `reviewModel` (for example `claude-fable-5-5`) and, if that model exists on your account
    (checked once a day), each Opus decision is reviewed by it and the review is added as a notice. The reviewer is off

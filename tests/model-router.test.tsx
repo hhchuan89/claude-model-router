@@ -1,15 +1,28 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { add, costOf, EMPTY, keepWarm, saved } from '../hooks/meter'
-import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, withSuffixOf } from '../hooks/route'
+import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, withSuffixOf } from '../hooks/route'
 import { decideSpawn, escalateAgent, logDir, startOf, stepUp } from '../hooks/subagent'
 
 describe('route rules', () => {
   test('parses the classifier reply and rejects junk', async () => {
-    expect(parseDecision('{"tier":"decide","reason":"架构取舍"}')).toEqual({ tier: 'decide', reason: '架构取舍' })
+    expect(parseDecision('{"tier":"decide","reason":"架构取舍"}')).toEqual({ tier: 'decide', reason: '架构取舍', sure: true })
     expect(parseDecision('```json\n{"tier":"lookup","reason":"x"}\n```')?.tier).toBe('lookup')
     expect(parseDecision('{"tier":"huge"}')).toBe(null)
     expect(parseDecision('no json')).toBe(null)
+  })
+
+  test('parseDecision reads sure, and a reply without it counts as sure so old-format replies still route', async () => {
+    expect(parseDecision('{"tier":"lookup","sure":false,"reason":"maybe"}')).toEqual({ tier: 'lookup', reason: 'maybe', sure: false })
+    expect(parseDecision('{"tier":"lookup","sure":true,"reason":"x"}')?.sure).toBe(true)
+    expect(parseDecision('{"tier":"lookup","reason":"x"}')?.sure).toBe(true)
+  })
+
+  test('settleTier: only an unsure verdict is changed, and only upward', async () => {
+    expect(settleTier({ tier: 'lookup', reason: 'r', sure: true }, 'decide')).toEqual({ tier: 'lookup', reason: 'r' })
+    expect(settleTier({ tier: 'execute', reason: 'r', sure: false }, 'decide')).toEqual({ tier: 'decide', reason: 'r (unsure: not downgrading)' })
+    expect(settleTier({ tier: 'decide', reason: 'r', sure: false }, 'lookup').tier).toBe('decide')
+    expect(settleTier({ tier: 'lookup', reason: 'r', sure: false }, null).tier).toBe('execute')
   })
 
   test('#model pins the turn', async () => {
@@ -338,6 +351,16 @@ describe('subagent rules', () => {
     expect(decideSpawn(spawnInput({ parentModel, subagentType: 'Explore' }), null)?.model).toBe('haiku')
   })
 
+  test('an unsure lookup goes to sonnet, a sure one to haiku; Explore, pins and decisions are unaffected', async () => {
+    expect(decideSpawn(spawnInput(), 'lookup', false)).toMatchObject({ model: 'sonnet', reason: 'unsure lookup: sonnet' })
+    expect(decideSpawn(spawnInput(), 'lookup', true)?.model).toBe('haiku')
+    expect(decideSpawn(spawnInput(), 'execute', false)?.model).toBe('sonnet')
+    expect(decideSpawn(spawnInput(), 'decide', false)?.model).toBeUndefined()
+    expect(decideSpawn(spawnInput({ subagentType: 'Explore' }), null, false)?.model).toBe('haiku')
+    // a model the caller named wins over everything, sure or not
+    expect(decideSpawn(spawnInput({ model: 'haiku' }), 'decide', false)).toBeUndefined()
+  })
+
   test('a haiku parent never gets a sonnet subagent: tiers are capped at the parent', async () => {
     expect(decideSpawn(spawnInput({ parentModel: 'claude-haiku-5-5' }), 'execute')?.model).toBe('haiku')
   })
@@ -353,12 +376,44 @@ describe('subagent rules', () => {
     expect(escalateAgent(startOf('haiku', 'claude-fable-5-1', true, IDS_BY_KEY), { model: 'fable' }, IDS_BY_KEY)?.tier).toBe('opus')
   })
 
-  test('a step up raises the tier first, then the effort at the ceiling, then stops', async () => {
-    const atTop = escalateAgent(startOf('haiku', OPUS, true, IDS_BY_KEY), { model: 'opus' }, IDS_BY_KEY)!
-    const maxed = escalateAgent(atTop, { effort: 'max' }, IDS_BY_KEY)!
-    expect(stepUp(startOf('haiku', OPUS, true, IDS_BY_KEY), IDS_BY_KEY)?.tier).toBe('sonnet')
-    expect(stepUp(atTop, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'xhigh' })
-    expect(stepUp(maxed, IDS_BY_KEY)).toBeUndefined()
+  // Changed from v0.3 ("tier first, then effort"): the first step is now more effort on the same model.
+  test('the first step up is more effort on the same model: cheaper than a switch, and often enough', async () => {
+    const haiku = startOf('haiku', OPUS, true, IDS_BY_KEY)
+    expect(stepUp(haiku, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'medium', retriedAtTier: true })
+  })
+
+  test('the second step up raises the model at the new tier starting effort, and the new tier gets its own retry', async () => {
+    const retried = stepUp(startOf('haiku', OPUS, true, IDS_BY_KEY), IDS_BY_KEY)!
+    const sonnet = stepUp(retried, IDS_BY_KEY)!
+    expect(sonnet).toMatchObject({ tier: 'sonnet', model: IDS_BY_KEY.sonnet, effort: 'medium', retriedAtTier: false })
+    expect(stepUp(sonnet, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high', retriedAtTier: true })
+    // opus starts at high: a sonnet agent already on medium lands there, not on medium
+    const sonnetRetried = { ...sonnet, retriedAtTier: true }
+    expect(stepUp(sonnetRetried, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'high', retriedAtTier: false })
+  })
+
+  test('at the ceiling only effort rises, one step each time, and max stops it', async () => {
+    const top = startOf('opus', OPUS, true, IDS_BY_KEY)
+    const xhigh = stepUp(top, IDS_BY_KEY)!
+    const max = stepUp(xhigh, IDS_BY_KEY)!
+    expect(xhigh).toMatchObject({ tier: 'opus', effort: 'xhigh' })
+    expect(max).toMatchObject({ tier: 'opus', effort: 'max' })
+    expect(stepUp(max, IDS_BY_KEY)).toBeUndefined()
+    // a sonnet parent caps a sonnet agent the same way: no opus, effort only
+    const capped = startOf('sonnet', 'claude-sonnet-5-5', true, IDS_BY_KEY)
+    expect(stepUp({ ...capped, retriedAtTier: true }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+  })
+
+  test('an agent that inherits the session effort counts as high, so its first step is xhigh on the same model', async () => {
+    const inheriting = startOf(OPUS, OPUS, false, IDS_BY_KEY)
+    expect(inheriting.effort).toBeUndefined()
+    expect(stepUp(inheriting, IDS_BY_KEY)).toMatchObject({ tier: 'opus', model: undefined, effort: 'xhigh', retriedAtTier: true })
+  })
+
+  test('a manual effort-only escalate keeps the model and the retry flag; a model change resets the flag', async () => {
+    const retried = stepUp(startOf('haiku', OPUS, true, IDS_BY_KEY), IDS_BY_KEY)!
+    expect(escalateAgent(retried, { effort: 'high' }, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'high', retriedAtTier: true })
+    expect(escalateAgent(retried, { model: 'sonnet' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', retriedAtTier: false })
   })
 
   test('the events log lands in ~/.claude/model-tiering wherever the plugin is installed under ~/.claude', async () => {
@@ -447,6 +502,8 @@ test('an unknown subagent cannot move the main route when it escalates', async (
   expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'low' })
 })
 
+// Changed from v0.3: the first auto-escalation is now effort on the same model (haiku/low -> haiku/medium);
+// the model switch comes with the second run of three errors.
 test('three tool errors in a row raise a subagent one step; a success in between starts the count over', async ($, on) => {
   const seen = world($, on, null)
   on('tool.call', async (_$: unknown, e: any) => ({ result: 'out', isError: e.file_path === 'bad' }) as never)
@@ -461,7 +518,77 @@ test('three tool errors in a row raise a subagent one step; a success in between
   expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low' })
   await read('bad')
   await step($, 'sub', OPUS, id)
+  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+})
+
+test('the second run of three errors raises the model; the log says which stage fired', async ($, on) => {
+  const seen = world($, on, null)
+  on('tool.call', async (_$: unknown, e: any) => ({ result: 'out', isError: e.file_path === 'bad' }) as never)
+  const id = await spawnAgent($, { subagentType: 'Explore' })
+  const bad = () => $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
+  for (let i = 0; i < 3; i++) await bad()
+  await step($, 'sub', OPUS, id)
+  for (let i = 0; i < 3; i++) await bad()
+  await step($, 'sub', OPUS, id)
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
   expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-tiering/events-sess-1.json'))
+  const log = JSON.parse(seen.files[file!]!) as { events: { event: string; to: string; reason: string }[] }
+  expect(log.events.filter(ev => ev.event === 'auto-escalated')).toMatchObject([
+    { to: 'haiku/medium', reason: '3 tool errors in a row: more effort on the same model' },
+    { to: 'sonnet/medium', reason: '3 tool errors in a row again: next model' },
+  ])
+})
+
+test('a subagent can raise only its effort by hand: the model stays', async ($, on) => {
+  const seen = world($, on, null)
+  const id = await spawnAgent($, { subagentType: 'Explore' })
+  const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'high', reason: 'needs more thought' } as never)) as { result: string }
+  expect(r.result).toBe('Escalated to haiku/high from your next step.')
+  await step($, 'sub', OPUS, id)
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+})
+
+test('an unsure turn after a decide turn stays on opus: low confidence never downgrades', async ($, on) => {
+  const seen = world($, on, ['{"tier":"decide","sure":true,"reason":"选方案"}', '{"tier":"execute","sure":false,"reason":"不确定"}'])
+  await $.prompt.submit({ text: 'which design' } as never)
+  await $.prompt.submit({ text: 'ok, and the rest?' } as never)
+  expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at high')
+  await step($, 't2')
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /unsure: not downgrading/ })).toBeDefined()
+})
+
+test('a sure downgrade still happens', async ($, on) => {
+  const seen = world($, on, ['{"tier":"decide","sure":true,"reason":"a"}', '{"tier":"execute","sure":true,"reason":"b"}'])
+  await $.prompt.submit({ text: 'which design' } as never)
+  await $.prompt.submit({ text: 'implement it' } as never)
+  expect(seen.submits[1]!.context?.[0]).toContain('assigned to sonnet at medium')
+})
+
+test('an unsure first turn never starts on lookup', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","sure":false,"reason":"maybe a search"}')
+  await $.prompt.submit({ text: 'look into the auth thing' } as never)
+  expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet at medium')
+})
+
+test('an unsure general-purpose lookup subagent runs on sonnet, a sure one on haiku', async ($, on) => {
+  const seen = world($, on, ['{"tier":"lookup","sure":false,"reason":"maybe"}', '{"tier":"lookup","sure":true,"reason":"grep"}'])
+  const unsure = await spawnAgent($, { prompt: 'look into the config' })
+  const sure = await spawnAgent($, { prompt: 'grep for TODO' })
+  await step($, 'sub', OPUS, unsure)
+  await step($, 'sub', OPUS, sure)
+  expect(seen.agents).toEqual(['sonnet', 'haiku'])
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low' })
+})
+
+test('#haiku still wins when the classifier would have been unsure, and the classifier is not asked', async ($, on) => {
+  const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe"}')
+  await $.prompt.submit({ text: 'list the files #haiku' } as never)
+  expect(seen.asked).toEqual([])
+  expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at low')
 })
 
 test('a model the router asked for that is not the one answering is counted as a mismatch', async ($, on) => {

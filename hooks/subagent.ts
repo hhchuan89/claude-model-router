@@ -42,7 +42,9 @@ export function needsClassifier(e: SpawnFacts): boolean {
 
 // undefined: leave the spawn exactly as the caller made it. tier: the classifier's verdict on a
 // general-purpose task, null when it failed (or was not asked).
-export function decideSpawn(e: SpawnFacts, tier: Tier | null): Decision | undefined {
+// sure: the classifier's confidence. An unsure lookup never goes to Haiku: the verdict was a guess, and
+// a wrong guess on the cheapest model costs a failed run, a wrong guess one tier up costs a few cents.
+export function decideSpawn(e: SpawnFacts, tier: Tier | null, sure = true): Decision | undefined {
   if (e.fork || e.workflow !== undefined) return undefined
   const ceiling = ceilingOf(e.parentModel)
   const parentIsFable = familyOf(e.parentModel) === 'fable'
@@ -62,6 +64,7 @@ export function decideSpawn(e: SpawnFacts, tier: Tier | null): Decision | undefi
   // Plan and named/custom agents declare their own model or inherit.
   if (e.subagentType !== 'general-purpose') return inherit('agent keeps its own model')
   if (tier === 'decide') return inherit('decision work, inherits')
+  if (tier === 'lookup' && !sure) return { model: clamp('sonnet', ceiling), reason: 'unsure lookup: sonnet' }
   const target: ModelKey = tier === 'lookup' ? 'haiku' : 'sonnet'
   return { model: clamp(target, ceiling), reason: tier === null ? 'classifier failed, sonnet' : `${tier} work` }
 }
@@ -75,6 +78,8 @@ export type AgentTier = {
   ceiling: ModelKey
   parentModel: string
   errorsInARow: number
+  // Whether the automatic ladder has already spent its same-model retry (more effort) at this tier.
+  retriedAtTier: boolean
 }
 
 // The tier a started agent is on: what the engine resolved it to, and whether this router pinned it.
@@ -88,6 +93,7 @@ export function startOf(resolved: string | undefined, parentModel: string, isPin
     ceiling,
     parentModel,
     errorsInARow: 0,
+    retriedAtTier: false,
   }
 }
 
@@ -103,15 +109,22 @@ export function escalateAgent(s: AgentTier, req: SubEscalateRequest, ids: Record
   const nowEffort = s.effort === undefined ? -1 : EFFORTS.indexOf(s.effort)
   const effort = askedEffort > nowEffort ? EFFORTS[askedEffort] : s.effort
   if (tier === s.tier && effort === s.effort) return undefined
-  return { ...s, tier, model: tier === s.tier ? s.model : ids[tier], effort }
+  // A tier change is a fresh start for the automatic ladder; an effort-only change is not.
+  return { ...s, tier, model: tier === s.tier ? s.model : ids[tier], effort, retriedAtTier: tier === s.tier ? s.retriedAtTier : false }
 }
 
-// One step up: the next tier while below the ceiling, else the next effort.
+// The automatic ladder, one step per call. First more effort on the same model (cheaper than a model
+// switch, and often enough), then the next tier at its starting effort; at the ceiling effort only,
+// until max. undefined: nothing left to raise.
 export function stepUp(s: AgentTier, ids: Record<ModelKey, string>): AgentTier | undefined {
+  const nextEffort = EFFORTS[(s.effort === undefined ? EFFORTS.indexOf('high') : EFFORTS.indexOf(s.effort)) + 1]
+  if (!s.retriedAtTier && nextEffort !== undefined) {
+    const up = escalateAgent(s, { effort: nextEffort }, ids)
+    return up && { ...up, retriedAtTier: true }
+  }
   const next = (['haiku', 'sonnet', 'opus'] as const)[RANK[s.tier] + 1]
   if (next !== undefined && RANK[next] <= RANK[s.ceiling]) return escalateAgent(s, { model: next }, ids)
-  const effort = EFFORTS[(s.effort === undefined ? EFFORTS.indexOf('high') : EFFORTS.indexOf(s.effort)) + 1]
-  return effort === undefined ? undefined : escalateAgent(s, { effort }, ids)
+  return nextEffort === undefined ? undefined : escalateAgent(s, { effort: nextEffort }, ids)
 }
 
 export function describeTier(s: AgentTier): string {

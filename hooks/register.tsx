@@ -16,6 +16,7 @@ import {
   isFable,
   MODELS,
   parseDecision,
+  settleTier,
   reviewSystem,
   routeFor,
   TIER_ROUTE,
@@ -209,7 +210,9 @@ async function classify($: EngineInterface, lang: Lang, text: string, previous: 
   const forced = forcedModel(text)
   if (forced) return routeFor(TIER_OF[forced], STR[lang].forced)
   const d = await classifyTier($, lang, text, previous?.tier ?? null, true)
-  return d ? routeFor(d.tier, d.reason) : routeFor('execute', STR[lang].fallback)
+  if (!d) return routeFor('execute', STR[lang].fallback)
+  const s = settleTier(d, previous?.tier ?? null)
+  return routeFor(s.tier, s.reason)
 }
 
 // Whether the reviewer model exists on this account; asked at most once a day.
@@ -454,7 +457,7 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // Automatic fallback: a subagent that keeps failing is raised one step.
+  // Automatic fallback: a subagent that keeps failing is raised one step: effort first, then the next model.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     const s = e.agentId === undefined ? undefined : agents.get(e.agentId)
@@ -468,7 +471,9 @@ export const register: Register = (on, options) => {
       return ran
     }
     agents.set(e.agentId, { ...up, errorsInARow: 0 })
-    await logEvent($, e.agentId, 'auto-escalated', describeTier(up), `${AUTO_ESCALATE_AFTER} tool errors in a row`)
+    const why = up.tier === s.tier ? 'more effort on the same model' : 'next model'
+    const again = up.tier === s.tier ? '' : ' again'
+    await logEvent($, e.agentId, 'auto-escalated', describeTier(up), `${AUTO_ESCALATE_AFTER} tool errors in a row${again}: ${why}`)
     return ran
   })
 
@@ -476,8 +481,8 @@ export const register: Register = (on, options) => {
   // inherits the parent. Never above the parent, never Fable; forks and workflow agents are left alone.
   on('agent.spawn', async ($, e, next) => {
     if (!(await read($, enabled)) || e.fork || e.workflow !== undefined) return next(e)
-    const tier = needsClassifier(e) ? ((await classifyTier($, lang, e.prompt, null, false))?.tier ?? null) : null
-    const d = decideSpawn(e, tier)
+    const verdict = needsClassifier(e) ? await classifyTier($, lang, e.prompt, null, false) : null
+    const d = decideSpawn(e, verdict?.tier ?? null, verdict?.sure ?? true)
     const ran = await next(d?.model === undefined ? e : { ...e, model: d.model })
     try {
       if (ran.deny === undefined && ran.agentId !== undefined) {
