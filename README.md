@@ -19,7 +19,7 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 | Tier | Model · effort | What lands here |
 |------|----------------|-----------------|
-| lookup | Haiku · low | Retrieval and mechanical work with nothing to judge: find/grep/list, read a value or status, run a named command, rename, typo, format, short translation |
+| lookup | Haiku · medium | Retrieval and mechanical work with nothing to judge: find/grep/list, read a value or status, run a named command, rename, typo, format, short translation |
 | execute | Sonnet · medium | Work whose "what" is settled: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan |
 | decide | Opus · high | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, anything irreversible or outward-facing |
 
@@ -32,24 +32,27 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
    Sonnet · medium. `#haiku`, `#sonnet` or `#opus` in a message pins the model.
 2. **Decide before working.** The model reads its assignment beside your prompt and must judge whether the task fits
    *before* doing any work. If not, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
-   effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. Escalation only goes up within a turn.
+   effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. A move to a higher model lands at that
+   tier's effort in the table (Sonnet medium, Opus high) unless a higher effort is asked. Escalation only goes up within a turn.
    Effort-only escalation (same model, more effort) exists for the main thread and for subagents alike.
 3. **Route every request.** Each model request of the turn runs on the route, keeping a context-window suffix such as `[1m]`.
 4. **Keep a warm cache when it is cheaper.** Switching to a smaller model makes it read the whole context uncached. When
    the context is large and the bigger model's cache is still warm, the router compares the two costs over the turn's
    expected steps and stays on the warm model if switching would cost more (shown as `→ Opus (cache kept)`).
 5. **Route subagents.** A subagent spawned without a model gets one by its job, decided when it starts:
-   `Explore` runs on Haiku · low; `general-purpose` is sorted by the same classifier (lookup → Haiku · low,
+   `Explore` runs on Haiku · medium; `general-purpose` is sorted by the same classifier (lookup → Haiku · medium,
    execute → Sonnet · medium, decide → inherits the parent's model, never a pinned Opus; if classification fails,
-   Sonnet). `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
+   Sonnet). Pinned subagents start at medium on every model, because effort can be raised later, by the agent or by
+   the automatic ladder below. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
    workflow agents. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
    capped at the parent's tier.
 6. **Subagents can escalate, and are escalated.** The same `escalate` tool works inside a subagent: it may raise its own
-   model or effort from its next step, up to the parent's tier (a raised tier runs at least at that tier's starting
-   effort). The router also escalates a failing subagent by itself, in two stages. After three tool errors in a row it
-   first raises the effort one step on the same model (cheaper than a model switch, and often enough). If three more
-   errors follow at that tier, it moves to the next model, at least at that model's starting effort, and the new model
-   gets its own same-model retry. At the parent's tier only effort rises, up to max. An agent that inherits the
+   model or effort from its next step, up to the parent's tier. A model change starts the new tier at medium, or at the asked effort if higher,
+   whatever effort the old model had (a Haiku at xhigh raised to Sonnet runs Sonnet · medium: a bigger model at medium
+   beats a smaller one at max). Effort-only escalation on the same model only goes up. The router also escalates a failing subagent by itself, in two stages. After three tool errors in a row it
+   first raises the effort one step on the same model (Haiku · medium → Haiku · high; cheaper than a model switch, and
+   often enough). If three more errors follow at that tier, it moves to the next model at medium (Haiku · high →
+   Sonnet · medium), and the new model gets its own same-model retry. At the parent's tier only effort rises, up to max. An agent that inherits the
    session's effort counts as `high`. A manual `escalate` from the subagent works as before. Escalation only goes up.
 7. **No Fable 5.1.** Any request or subagent asking for Fable runs on Opus instead, and a Fable parent never passes
    Fable down. Optionally, set `reviewModel` (for example `claude-fable-5-5`) and, if that model exists on your account
