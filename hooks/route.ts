@@ -38,6 +38,17 @@ Rules:
 - reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.`
 }
 
+// A reason longer than max is cut at a word boundary and marked with an ellipsis, so the band never shows a word
+// sliced in half. A single word longer than max is cut where it stands.
+export function shorten(text: string, max: number): string {
+  const t = text.trim()
+  if (t.length <= max) return t
+  const room = t.slice(0, max - 1)
+  const space = room.lastIndexOf(' ')
+  const cut = space >= max / 2 ? room.slice(0, space) : room
+  return `${cut.replace(/[\s,;:.\-—]+$/, '')}…`
+}
+
 function isTier(x: unknown): x is Tier {
   return x === 'lookup' || x === 'execute' || x === 'decide'
 }
@@ -51,7 +62,7 @@ export function parseDecision(text: string): { tier: Tier; reason: string; sure:
   try {
     const o = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
     if (!isTier(o.tier)) return null
-    return { tier: o.tier, reason: typeof o.reason === 'string' ? o.reason.trim().slice(0, 60) : '', sure: o.sure !== false }
+    return { tier: o.tier, reason: typeof o.reason === 'string' ? shorten(o.reason, 60) : '', sure: o.sure !== false }
   } catch {
     return null
   }
@@ -99,7 +110,7 @@ export function applyEscalation(cur: Route, req: EscalateRequest): { ok: true; r
     return { ok: false, why: `only opus may lower its effort; ${model} stays at ${cur.effort} or above` }
   }
   if (model === cur.model && effort === cur.effort) return { ok: false, why: `already on ${model} at ${effort}` }
-  const step = `${model} · ${effort}${req.reason ? ` (${req.reason.slice(0, 60)})` : ''}`
+  const step = `${model} · ${effort}${req.reason ? ` (${shorten(req.reason, 60)})` : ''}`
   return { ok: true, route: { ...cur, model, effort, trail: [...cur.trail, step] } }
 }
 

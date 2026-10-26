@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { add, costOf, EMPTY, keepWarm, saved } from '../hooks/meter'
-import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, withSuffixOf } from '../hooks/route'
+import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { decideSpawn, escalateAgent, logDir, startOf, stepUp } from '../hooks/subagent'
 
 describe('route rules', () => {
@@ -23,6 +23,27 @@ describe('route rules', () => {
     expect(settleTier({ tier: 'execute', reason: 'r', sure: false }, 'decide')).toEqual({ tier: 'decide', reason: 'r (unsure: not downgrading)' })
     expect(settleTier({ tier: 'decide', reason: 'r', sure: false }, 'lookup').tier).toBe('decide')
     expect(settleTier({ tier: 'lookup', reason: 'r', sure: false }, null).tier).toBe('execute')
+  })
+
+  // Seen in the band on 2026-10-26: "…scope of repo changes u (unsure: not downgrading)", a word sliced in half.
+  test('a long reason is cut at a word boundary with an ellipsis, never mid-word', async () => {
+    const long = 'Carrying out an agreed cleanup plan; scope of repo changes unclear'
+    const out = shorten(long, 60)
+    expect(out).toBe('Carrying out an agreed cleanup plan; scope of repo changes…')
+    expect(out.length).toBeLessThanOrEqual(60)
+    expect(parseDecision(`{"tier":"decide","reason":"${long}"}`)?.reason).toBe(out)
+  })
+
+  test('a short reason is left alone; one very long word is cut where it stands', async () => {
+    expect(shorten('  find the file  ', 60)).toBe('find the file')
+    expect(shorten('x'.repeat(80), 60)).toBe(`${'x'.repeat(59)}…`)
+    expect(shorten('架构取舍'.repeat(20), 60).length).toBe(60)
+  })
+
+  test('an escalation reason on the band is cut the same way', async () => {
+    const cur = routeFor('execute', 'x')
+    const out = applyEscalation(cur, { model: 'opus', reason: 'the design question turned out to need a real trade-off decision first' })
+    expect(out.ok && out.route.trail[0]).toBe('opus · high (the design question turned out to need a real trade-off…)')
   })
 
   test('#model pins the turn', async () => {

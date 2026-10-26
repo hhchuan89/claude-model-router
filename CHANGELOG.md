@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-10-26
+
+### Fixed
+- A long routing reason in the band is now cut at a word boundary and ends with an ellipsis. It used to be cut at 60
+  characters wherever that fell, which could leave half a word (for example "scope of repo changes u"). The same
+  applies to the reason shown after an escalation.
+
 ## [0.6.0] - 2026-10-26
 
 First public release.
