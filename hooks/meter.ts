@@ -88,12 +88,3 @@ export function keepWarm(target: ModelKey, last: LastRequest | null, now: number
     ctx * PRICES[target].write + (steps - 1) * ctx * PRICES[target].read + steps * out * PRICES[target].output
   return stay < move ? last.model : target
 }
-
-// Which model a subagent gets when the call names none: by its type first, else by its task's tier.
-export function subagentModel(type: string | undefined, tier: 'lookup' | 'execute' | 'decide' | null): ModelKey {
-  if (type === 'Explore') return 'haiku'
-  if (type === 'Plan') return 'opus'
-  if (tier === 'lookup') return 'haiku'
-  if (tier === 'decide') return 'opus'
-  return 'sonnet'
-}

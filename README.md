@@ -34,17 +34,35 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 4. **Keep a warm cache when it is cheaper.** Switching to a smaller model makes it read the whole context uncached. When
    the context is large and the bigger model's cache is still warm, the router compares the two costs over the turn's
    expected steps and stays on the warm model if switching would cost more (shown as `→ Opus (cache kept)`).
-5. **Route subagents.** A subagent spawned without a model gets one by its job: `Explore` on Haiku, `Plan` on Opus,
-   others by the same classifier (lookup → Haiku, execute → Sonnet, decide → Opus). A model the caller names is kept.
-6. **No Fable 5.1.** Any request or subagent asking for Fable runs on Opus instead. If **Fable 5.5** exists on your
-   account (checked once a day), each Opus decision is reviewed by it and the review is added as a notice.
+5. **Route subagents.** A subagent spawned without a model gets one by its job, decided when it starts:
+   `Explore` runs on Haiku · low; `general-purpose` is sorted by the same classifier (lookup → Haiku · low,
+   execute → Sonnet · medium, decide → inherits the parent's model, never a pinned Opus; if classification fails,
+   Sonnet). `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
+   workflow agents. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
+   capped at the parent's tier.
+6. **Subagents can escalate, and are escalated.** The same `escalate` tool works inside a subagent: it may raise its own
+   model or effort from its next step, up to the parent's tier (a raised tier runs at least at that tier's starting
+   effort). After three tool errors in a row the router raises a subagent one step by itself: the next tier while below
+   the parent's tier, otherwise the next effort. Escalation only goes up.
+7. **No Fable 5.1.** Any request or subagent asking for Fable runs on Opus instead, and a Fable parent never passes
+   Fable down. Optionally, set `reviewModel` (for example `claude-fable-5-5`) and, if that model exists on your account
+   (checked once a day), each Opus decision is reviewed by it and the review is added as a notice. The reviewer is off
+   by default: with `reviewModel` empty the router makes no review call and no availability probe.
+8. **Check the routing took effect.** After each request the router compares the model family that answered with the
+   family it asked for; any difference is counted as a model mismatch in `/model-router stats`.
+
+## Events log
+
+Main-turn routes (`turn route`, agent `main`) and subagent events (`<type> start`, `escalated`, `auto-escalated`), with
+per-subagent usage by model and effort, are written to `~/.claude/model-tiering/events-<sessionId>.json`, the format the
+weekly `tiering_report.py` reads. Writing is best effort and never affects a turn.
 
 ## How much you saved
 
 Every model request (the router's own Haiku calls included) is priced at Anthropic API rates and added to the turn,
 the day and the all-time totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
 `/model-router stats` shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
-keeps and routed subagents.
+keeps, routed subagents, Fable requests moved to Opus and model mismatches (routed model not the one that answered).
 
 This is an estimate: another model would not use exactly the same tokens, and on a subscription plan you pay in usage
 limits rather than dollars. The percentage is the useful number either way.
@@ -66,7 +84,7 @@ Answer `y` to add the marketplace and pick a scope. Installed at user scope it a
 |--------|---------|---------|
 | `language` | `en` | Language of the reason line and the savings line (`en` or `zh`) |
 | `haikuModel` / `sonnetModel` / `opusModel` | `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` | Model ids per tier |
-| `reviewModel` | `claude-fable-5-5` | Reviews Opus decisions only if it exists on your account; Fable 5.1 is never used |
+| `reviewModel` | empty (off) | Model that reviews Opus decisions, e.g. `claude-fable-5-5`, only if it exists on your account; Fable 5.1 is never used |
 
 ## Assumptions in the meter
 
