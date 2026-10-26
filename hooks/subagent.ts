@@ -10,9 +10,10 @@ import { EFFORTS } from './route'
 export type Family = ModelKey | 'fable'
 
 const RANK: Record<Family, number> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 }
-// Starting effort per pinned tier, matching the main thread's TIER_ROUTE; an inheriting agent keeps
-// the session's. Opus is a floor for escalation too: a haiku agent raised to opus must not stay on low.
-const START_EFFORT: Record<ModelKey, Effort> = { haiku: 'low', sonnet: 'medium', opus: 'high' }
+// Starting effort per pinned tier: medium everywhere, since effort can be raised later (by the agent or
+// the automatic ladder). A subagent raised to a new tier starts that tier at medium, whatever effort it
+// had before: a bigger model at medium beats a smaller one at max. An inheriting agent keeps the session's.
+const START_EFFORT: Record<ModelKey, Effort> = { haiku: 'medium', sonnet: 'medium', opus: 'medium' }
 export const AUTO_ESCALATE_AFTER = 3
 
 export function familyOf(model: string | undefined): Family | undefined {
@@ -101,13 +102,18 @@ export type SubEscalateRequest = { model?: string; effort?: string }
 
 // Only up, never past the ceiling. undefined: nothing would change.
 export function escalateAgent(s: AgentTier, req: SubEscalateRequest, ids: Record<ModelKey, string>): AgentTier | undefined {
-  const asked = familyOf(req.model)
-  const tier = asked === undefined ? s.tier : clamp(RANK[asked] > RANK[s.tier] ? asked : s.tier, s.ceiling)
+  const askedModel = familyOf(req.model)
+  const tier = askedModel === undefined ? s.tier : clamp(RANK[askedModel] > RANK[s.tier] ? askedModel : s.tier, s.ceiling)
   // A new tier starts no lower than its own starting effort: haiku raised to sonnet runs at least medium.
-  const floor = tier === s.tier ? -1 : EFFORTS.indexOf(START_EFFORT[tier])
-  const askedEffort = Math.max(EFFORTS.indexOf(req.effort as Effort), floor)
-  const nowEffort = s.effort === undefined ? -1 : EFFORTS.indexOf(s.effort)
-  const effort = askedEffort > nowEffort ? EFFORTS[askedEffort] : s.effort
+  const asked = EFFORTS.indexOf(req.effort as Effort)
+  // A tier change starts the new model at its starting effort (or the asked one, if higher), not at the
+  // old model's effort; on the same model effort only goes up.
+  const effort =
+    tier !== s.tier
+      ? EFFORTS[Math.max(asked, EFFORTS.indexOf(START_EFFORT[tier]))]
+      : asked > (s.effort === undefined ? -1 : EFFORTS.indexOf(s.effort))
+        ? EFFORTS[asked]
+        : s.effort
   if (tier === s.tier && effort === s.effort) return undefined
   // A tier change is a fresh start for the automatic ladder; an effort-only change is not.
   return { ...s, tier, model: tier === s.tier ? s.model : ids[tier], effort, retriedAtTier: tier === s.tier ? s.retriedAtTier : false }

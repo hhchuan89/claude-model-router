@@ -58,7 +58,7 @@ describe('route rules', () => {
 
   test('the assignment tells a non-opus model to judge first and escalate before any tool', async () => {
     const text = assignmentContext({ ...routeFor('lookup', '找文件'), turnId: null })
-    expect(text).toContain('haiku at low effort')
+    expect(text).toContain('haiku at medium effort')
     expect(text).toContain('FIRST, before any other tool')
     expect(assignmentContext(routeFor('decide', ''))).toContain('Decide the effort this task needs')
   })
@@ -140,16 +140,38 @@ async function step($: any, turnId: string, model = 'claude-opus-5-5[1m]', agent
   }
 }
 
-test('a lookup turn runs on Haiku at low effort, with the assignment in context', async ($, on) => {
+test('a lookup turn runs on Haiku at medium effort, with the assignment in context', async ($, on) => {
   const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
   await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
-  expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at low effort')
+  expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at medium effort')
   await step($, 't1')
-  expect(seen.steps[0]).toEqual({ model: 'claude-haiku-5-5[1m]', effort: 'low', agentId: undefined })
+  expect(seen.steps[0]).toEqual({ model: 'claude-haiku-5-5[1m]', effort: 'medium', agentId: undefined })
 
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /Haiku · low — 找文件/ })).toBeDefined()
+  expect(await ui.find({ text: /Haiku · medium — 找文件/ })).toBeDefined()
   expect(await ui.find({ text: /other mods/ })).toBeDefined()
+})
+
+// WHY: lookup work gets headroom at medium without a model switch, so a slightly harder lookup does not need Sonnet.
+test('a lookup main turn starts Haiku at medium: headroom without a model switch', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","reason":"find"}')
+  expect(routeFor('lookup', '')).toMatchObject({ model: 'haiku', effort: 'medium' })
+  await $.prompt.submit({ text: 'grep for TODO' } as never)
+  await step($, 't1')
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+})
+
+// WHY: main decisions stay at high however the turn got to Opus, so a skipped Sonnet step does not leave Opus at medium.
+test('main-thread escalation from haiku to opus lands at opus/high, not at the haiku effort', async ($, on) => {
+  const seen = world($, on, '{"tier":"lookup","reason":"find"}')
+  await $.prompt.submit({ text: 'look at the auth flow' } as never)
+  const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)) as { result: string }
+  expect(up.result).toContain('opus at high')
+  await step($, 't1')
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+  const haiku = routeFor('lookup', '')
+  const direct = applyEscalation(haiku, { model: 'opus', reason: 'x' })
+  expect(direct.ok && direct.route).toMatchObject({ model: 'opus', effort: 'high' })
 })
 
 test('the running model escalates itself, and the next step follows; downgrades are refused', async ($, on) => {
@@ -164,7 +186,7 @@ test('the running model escalates itself, and the next step follows; downgrades 
   expect(down.result).toContain('Not changed')
 
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /Haiku · low → opus · high \(要做设计决策\)/ })).toBeDefined()
+  expect(await ui.find({ text: /Haiku · medium → opus · high \(要做设计决策\)/ })).toBeDefined()
 })
 
 test('Fable 5.1 never runs, not even in a subagent; other subagent models are left alone', async ($, on) => {
@@ -367,11 +389,11 @@ describe('subagent rules', () => {
 
   test('escalation goes up only, lands no lower than the new tier starts, and stops at the parent', async () => {
     const haiku = startOf('haiku', OPUS, true, IDS_BY_KEY)
-    expect(haiku).toMatchObject({ tier: 'haiku', effort: 'low', model: IDS_BY_KEY.haiku })
+    expect(haiku).toMatchObject({ tier: 'haiku', effort: 'medium', model: IDS_BY_KEY.haiku })
     expect(escalateAgent(haiku, { model: 'sonnet' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'medium' })
     expect(escalateAgent(startOf('sonnet', OPUS, true, IDS_BY_KEY), { model: 'haiku', effort: 'low' }, IDS_BY_KEY)).toBeUndefined()
-    // A haiku agent raised to opus is doing decision work now: it must not stay on haiku's low effort.
-    expect(escalateAgent(haiku, { model: 'opus' }, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'high' })
+    // Every tier starts at medium, so a raised model starts at medium too.
+    expect(escalateAgent(haiku, { model: 'opus' }, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'medium' })
     expect(escalateAgent(startOf('haiku', 'claude-sonnet-5-5', true, IDS_BY_KEY), { model: 'opus' }, IDS_BY_KEY)?.tier).toBe('sonnet')
     expect(escalateAgent(startOf('haiku', 'claude-fable-5-1', true, IDS_BY_KEY), { model: 'fable' }, IDS_BY_KEY)?.tier).toBe('opus')
   })
@@ -379,7 +401,7 @@ describe('subagent rules', () => {
   // Changed from v0.3 ("tier first, then effort"): the first step is now more effort on the same model.
   test('the first step up is more effort on the same model: cheaper than a switch, and often enough', async () => {
     const haiku = startOf('haiku', OPUS, true, IDS_BY_KEY)
-    expect(stepUp(haiku, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'medium', retriedAtTier: true })
+    expect(stepUp(haiku, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'high', retriedAtTier: true })
   })
 
   test('the second step up raises the model at the new tier starting effort, and the new tier gets its own retry', async () => {
@@ -387,15 +409,17 @@ describe('subagent rules', () => {
     const sonnet = stepUp(retried, IDS_BY_KEY)!
     expect(sonnet).toMatchObject({ tier: 'sonnet', model: IDS_BY_KEY.sonnet, effort: 'medium', retriedAtTier: false })
     expect(stepUp(sonnet, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high', retriedAtTier: true })
-    // opus starts at high: a sonnet agent already on medium lands there, not on medium
-    const sonnetRetried = { ...sonnet, retriedAtTier: true }
-    expect(stepUp(sonnetRetried, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'high', retriedAtTier: false })
+    // opus starts at medium like every tier: a sonnet agent already on high does not carry that effort over
+    const sonnetRetried = { ...stepUp(sonnet, IDS_BY_KEY)!, retriedAtTier: true }
+    expect(stepUp(sonnetRetried, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'medium', retriedAtTier: false })
   })
 
   test('at the ceiling only effort rises, one step each time, and max stops it', async () => {
     const top = startOf('opus', OPUS, true, IDS_BY_KEY)
-    const xhigh = stepUp(top, IDS_BY_KEY)!
+    const high = stepUp(top, IDS_BY_KEY)!
+    const xhigh = stepUp(high, IDS_BY_KEY)!
     const max = stepUp(xhigh, IDS_BY_KEY)!
+    expect(high).toMatchObject({ tier: 'opus', effort: 'high' })
     expect(xhigh).toMatchObject({ tier: 'opus', effort: 'xhigh' })
     expect(max).toMatchObject({ tier: 'opus', effort: 'max' })
     expect(stepUp(max, IDS_BY_KEY)).toBeUndefined()
@@ -412,8 +436,33 @@ describe('subagent rules', () => {
 
   test('a manual effort-only escalate keeps the model and the retry flag; a model change resets the flag', async () => {
     const retried = stepUp(startOf('haiku', OPUS, true, IDS_BY_KEY), IDS_BY_KEY)!
-    expect(escalateAgent(retried, { effort: 'high' }, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'high', retriedAtTier: true })
+    expect(escalateAgent(retried, { effort: 'xhigh' }, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'xhigh', retriedAtTier: true })
     expect(escalateAgent(retried, { model: 'sonnet' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', retriedAtTier: false })
+  })
+
+  // WHY: effort is the cheap lever and can be raised later, but a bigger model at medium beats a smaller one at max,
+  // so a model change throws away the old model's effort instead of carrying it over.
+  test('a haiku at xhigh raised to sonnet runs sonnet at medium: effort resets on a model change', async () => {
+    const haiku = startOf('haiku', OPUS, true, IDS_BY_KEY)
+    const xhigh = escalateAgent(haiku, { effort: 'xhigh' }, IDS_BY_KEY)!
+    expect(xhigh).toMatchObject({ tier: 'haiku', effort: 'xhigh' })
+    expect(escalateAgent(xhigh, { model: 'sonnet' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', model: IDS_BY_KEY.sonnet, effort: 'medium', retriedAtTier: false })
+  })
+
+  // WHY: resetting to medium must not swallow a deliberate request for more thought on the new model.
+  test('an asked effort above medium on a model escalation is honoured: sonnet plus high is sonnet at high', async () => {
+    const haiku = startOf('haiku', OPUS, true, IDS_BY_KEY)
+    expect(escalateAgent(haiku, { model: 'sonnet', effort: 'high' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+    expect(escalateAgent(haiku, { model: 'sonnet', effort: 'low' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'medium' })
+  })
+
+  // WHY: the automatic ladder spends effort before it spends a model switch, and the new model starts fresh at medium.
+  test('the automatic ladder from haiku/medium is haiku/high first, then sonnet/medium', async () => {
+    const start = startOf('haiku', OPUS, true, IDS_BY_KEY)
+    expect(start).toMatchObject({ tier: 'haiku', effort: 'medium' })
+    const first = stepUp(start, IDS_BY_KEY)!
+    expect(first).toMatchObject({ tier: 'haiku', effort: 'high', retriedAtTier: true })
+    expect(stepUp(first, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', model: IDS_BY_KEY.sonnet, effort: 'medium', retriedAtTier: false })
   })
 
   test('the events log lands in ~/.claude/model-tiering wherever the plugin is installed under ~/.claude', async () => {
@@ -422,13 +471,13 @@ describe('subagent rules', () => {
   })
 })
 
-test('Explore runs on haiku at low effort from its first request, keeping the context suffix; main is untouched', async ($, on) => {
+test('Explore runs on haiku at medium effort from its first request, keeping the context suffix; main is untouched', async ($, on) => {
   const seen = world($, on, null)
   const id = await spawnAgent($, { subagentType: 'Explore' })
   await step($, 'sub', 'claude-opus-5-5[1m]', id)
   await step($, 'other', 'claude-opus-5-5[1m]')
   expect(seen.agents).toEqual(['haiku'])
-  expect(seen.steps[0]).toEqual({ model: 'claude-haiku-5-5[1m]', effort: 'low', agentId: id })
+  expect(seen.steps[0]).toEqual({ model: 'claude-haiku-5-5[1m]', effort: 'medium', agentId: id })
   expect(seen.steps[1]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'high', agentId: undefined })
 })
 
@@ -439,7 +488,7 @@ test('general-purpose is classified: lookup runs on haiku, a decision inherits t
   await step($, 'sub', OPUS, lookup)
   await step($, 'sub', OPUS, decide)
   expect(seen.agents).toEqual(['haiku', undefined])
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
   expect(seen.steps[1]).toMatchObject({ model: OPUS, effort: 'high' })
 })
 
@@ -489,7 +538,7 @@ test('subagent escalation applies from its next request, so the request after th
   const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'sonnet', effort: 'high', reason: 'results contradict' } as never)) as { result: string }
   expect(r.result).toBe('Escalated to sonnet/high from your next step.')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
   expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
 })
 
@@ -499,10 +548,10 @@ test('an unknown subagent cannot move the main route when it escalates', async (
   const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: 'ghost', model: 'opus', reason: 'x' } as never)) as { result: string }
   expect(r.result).toContain('No routed agent')
   await step($, 't1')
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'low' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
 })
 
-// Changed from v0.3: the first auto-escalation is now effort on the same model (haiku/low -> haiku/medium);
+// Changed from v0.3: the first auto-escalation is now effort on the same model (haiku/medium -> haiku/high);
 // the model switch comes with the second run of three errors.
 test('three tool errors in a row raise a subagent one step; a success in between starts the count over', async ($, on) => {
   const seen = world($, on, null)
@@ -515,10 +564,10 @@ test('three tool errors in a row raise a subagent one step; a success in between
   await read('bad')
   await read('bad')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
   await read('bad')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
 })
 
 test('the second run of three errors raises the model; the log says which stage fired', async ($, on) => {
@@ -530,12 +579,12 @@ test('the second run of three errors raises the model; the log says which stage 
   await step($, 'sub', OPUS, id)
   for (let i = 0; i < 3; i++) await bad()
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
   expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
   const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-tiering/events-sess-1.json'))
   const log = JSON.parse(seen.files[file!]!) as { events: { event: string; to: string; reason: string }[] }
   expect(log.events.filter(ev => ev.event === 'auto-escalated')).toMatchObject([
-    { to: 'haiku/medium', reason: '3 tool errors in a row: more effort on the same model' },
+    { to: 'haiku/high', reason: '3 tool errors in a row: more effort on the same model' },
     { to: 'sonnet/medium', reason: '3 tool errors in a row again: next model' },
   ])
 })
@@ -543,10 +592,10 @@ test('the second run of three errors raises the model; the log says which stage 
 test('a subagent can raise only its effort by hand: the model stays', async ($, on) => {
   const seen = world($, on, null)
   const id = await spawnAgent($, { subagentType: 'Explore' })
-  const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'high', reason: 'needs more thought' } as never)) as { result: string }
-  expect(r.result).toBe('Escalated to haiku/high from your next step.')
+  const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'xhigh', reason: 'needs more thought' } as never)) as { result: string }
+  expect(r.result).toBe('Escalated to haiku/xhigh from your next step.')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'xhigh' })
 })
 
 test('an unsure turn after a decide turn stays on opus: low confidence never downgrades', async ($, on) => {
@@ -581,14 +630,14 @@ test('an unsure general-purpose lookup subagent runs on sonnet, a sure one on ha
   await step($, 'sub', OPUS, sure)
   expect(seen.agents).toEqual(['sonnet', 'haiku'])
   expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low' })
+  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
 })
 
 test('#haiku still wins when the classifier would have been unsure, and the classifier is not asked', async ($, on) => {
   const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe"}')
   await $.prompt.submit({ text: 'list the files #haiku' } as never)
   expect(seen.asked).toEqual([])
-  expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at low')
+  expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at medium')
 })
 
 test('a model the router asked for that is not the one answering is counted as a mismatch', async ($, on) => {
@@ -615,11 +664,11 @@ test('main routes and subagent changes land in the events file the weekly report
   const log = JSON.parse(seen.files[file!]!) as { sessionId: string; events: { agentId: string; event: string; to: string; reason: string }[]; stats: Record<string, unknown> }
   expect(log.sessionId).toBe('sess-1')
   expect(log.events).toMatchObject([
-    { agentId: 'main', event: 'turn route', to: 'haiku/low', reason: '找文件' },
-    { agentId: id, event: 'Explore start', to: 'haiku/low' },
+    { agentId: 'main', event: 'turn route', to: 'haiku/medium', reason: '找文件' },
+    { agentId: id, event: 'Explore start', to: 'haiku/medium' },
     { agentId: id, event: 'escalated', to: 'sonnet/medium', reason: 'contradiction' },
   ])
-  expect(log.stats[id]).toEqual({ byModel: { 'claude-haiku-5-5': { steps: 1, input: 10, output: 1, cacheRead: 0, cacheWrite: 0 } }, byEffort: { low: 1 } })
+  expect(log.stats[id]).toEqual({ byModel: { 'claude-haiku-5-5': { steps: 1, input: 10, output: 1, cacheRead: 0, cacheWrite: 0 } }, byEffort: { medium: 1 } })
 })
 
 test('parallel subagent steps all land on the meter, and the turn includes the classifier call', { options: { language: 'zh' } }, async ($, on) => {
@@ -639,7 +688,7 @@ test('the band speaks English by default', async ($, on) => {
   seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /Haiku · low — find files/ })).toBeDefined()
+  expect(await ui.find({ text: /Haiku · medium — find files/ })).toBeDefined()
   expect(await ui.find({ text: /turn 21\.2k token · / })).toBeDefined()
   expect(await ui.find({ text: /today 21\.2k token · / })).toBeDefined()
   expect(await ui.find({ text: /saved ≈/ })).toBeDefined()

@@ -1,7 +1,7 @@
 import type { Effort, ModelKey, Route, Tier } from '../types'
 
 export const TIER_ROUTE: Record<Tier, { model: ModelKey; effort: Effort }> = {
-  lookup: { model: 'haiku', effort: 'low' },
+  lookup: { model: 'haiku', effort: 'medium' },
   execute: { model: 'sonnet', effort: 'medium' },
   decide: { model: 'opus', effort: 'high' },
 }
