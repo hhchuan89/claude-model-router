@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { ModelKey, Route, Tally, Tier } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, EMPTY, fmtTokens, fmtUsd, keepWarm, priceKey, saved, subagentModel, tokensOf } from './meter'
+import { add, EMPTY, fmtTokens, fmtUsd, keepWarm, priceKey, saved, tokensOf } from './meter'
 import { isPersonOrigin } from './origin'
 import { redact } from './redact'
 import type { Lang } from './route'
@@ -21,8 +21,22 @@ import {
   TIER_ROUTE,
   withSuffixOf,
 } from './route'
+import type { AgentTier, EventLog } from './subagent'
+import {
+  addUsage,
+  AUTO_ESCALATE_AFTER,
+  decideSpawn,
+  describeTier,
+  escalateAgent,
+  familyOf,
+  logDir,
+  needsClassifier,
+  startOf,
+  stepUp,
+} from './subagent'
 
 const TOOL = 'escalate'
+const TOOL_CALL = `mcp__model-router__${TOOL}`
 const CLASSIFY_MS = 4000
 const PROBE_EVERY_MS = 24 * 3600 * 1000
 
@@ -38,6 +52,11 @@ let pendingPrompt = ''
 let last: LastRequest | null = null
 let turnSteps = 0
 let turnOutput = 0
+// What each tiered subagent is on now, by agent id.
+const agents = new Map<string, AgentTier>()
+// Per session: what changed and what each tiered subagent cost per model and effort. Written to
+// ~/.claude/model-tiering/, one file per session, for the weekly report (tiering_report.py).
+const log: EventLog = { sessionId: '', events: [], stats: {} }
 
 const STR = {
   zh: {
@@ -73,6 +92,8 @@ type Counts = {
   cacheKeeps: number
   subagents: Record<ModelKey, number>
   fableBlocked: number
+  // Steps whose answering model was not the family the router asked for.
+  modelMismatch: number
 }
 const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
@@ -80,6 +101,7 @@ const NO_COUNTS: Counts = {
   cacheKeeps: 0,
   subagents: { haiku: 0, sonnet: 0, opus: 0 },
   fableBlocked: 0,
+  modelMismatch: 0,
 }
 
 function dayKey(ms: number): string {
@@ -119,6 +141,44 @@ function record($: EngineInterface, modelId: string, u: Usage): Promise<void> {
   })
 }
 
+// The log is for review only: a failed write never fails a turn or an agent. Writes go through the
+// serial chain so a slow older snapshot cannot land over a newer one.
+function persist($: EngineInterface): Promise<void> {
+  return serial($, async () => {
+    try {
+      if (log.sessionId === '') log.sessionId = await $.session.id()
+      await $.fs.write(`${logDir($.plugin.root)}/events-${log.sessionId}.json`, JSON.stringify(log, null, 1))
+    } catch {
+      // Nothing to do: the next event writes the whole log again.
+    }
+  })
+}
+
+// A reload runs session.start again: keep what this session already logged.
+async function restore($: EngineInterface) {
+  try {
+    log.sessionId = await $.session.id()
+    const saved = JSON.parse(await $.fs.read(`${logDir($.plugin.root)}/events-${log.sessionId}.json`)) as EventLog
+    log.events = saved.events ?? []
+    log.stats = saved.stats ?? {}
+  } catch {
+    // First load of this session: nothing to restore.
+  }
+}
+
+// agentId "main" is the main thread's own route; a subagent event also goes to the status line.
+async function logEvent($: EngineInterface, agentId: string, event: string, to: string, reason: string) {
+  log.events.push({ at: new Date(await $.clock.now()).toISOString(), agentId, event, to, reason })
+  if (agentId !== 'main') {
+    try {
+      $.ui.status(`subagent ${event}: ${to} (${reason})`)
+    } catch {
+      // A missing status line is not worth failing the agent.
+    }
+  }
+  await persist($)
+}
+
 async function recentContext($: EngineInterface): Promise<string> {
   const rows = (await $.session.messages()).filter(m => m.text.trim() !== '').slice(-2)
   return rows.map(m => `[${m.role}] ${m.text.length > 1200 ? `${m.text.slice(0, 200)}\n…\n${m.text.slice(-1000)}` : m.text}`).join('\n\n')
@@ -154,6 +214,7 @@ async function classify($: EngineInterface, lang: Lang, text: string, previous: 
 
 // Whether the reviewer model exists on this account; asked at most once a day.
 async function reviewerAvailable($: EngineInterface, reviewModel: string): Promise<boolean> {
+  if (reviewModel === '') return false
   if (/fable-5-1\b/i.test(reviewModel)) return false
   const now = await $.clock.now()
   const seen = (await $.store.get('reviewer')) as { model: string; ok: boolean; at: number } | undefined
@@ -182,8 +243,9 @@ async function reviewDecision($: EngineInterface, lang: Lang, reviewModel: strin
   await $.session.append({ message: { type: 'system', content: [{ type: 'text', text: `${STR[lang].review}：\n${r.text.trim()}` }] } })
 }
 
-// Runs after the turn, unawaited: an Opus decision goes to the reviewer only when that model exists.
+// Runs after the turn, unawaited: an Opus decision goes to the reviewer only when one is set and exists.
 async function maybeReview($: EngineInterface, lang: Lang, reviewModel: string, prompt: string, answer: string) {
+  if (reviewModel === '') return
   try {
     if (await reviewerAvailable($, reviewModel)) await reviewDecision($, lang, reviewModel, prompt, answer)
   } catch (err) {
@@ -218,7 +280,8 @@ async function statsText($: EngineInterface): Promise<string> {
     `Turns routed: lookup ${c.turns.lookup} · execute ${c.turns.execute} · decide ${c.turns.decide}. ` +
       `Escalations: ${c.escalations}. Kept on a warm cache: ${c.cacheKeeps}. ` +
       `Subagents routed: haiku ${c.subagents.haiku} · sonnet ${c.subagents.sonnet} · opus ${c.subagents.opus}. ` +
-      `Fable requests moved to Opus: ${c.fableBlocked}.`,
+      `Fable requests moved to Opus: ${c.fableBlocked}. ` +
+      `Routed model not the one that answered: ${c.modelMismatch ?? 0}.`,
     '',
     '_API-equivalent prices; the baseline prices the same tokens on Opus, so it is an estimate: another model would not use exactly the same tokens._',
   ].join('\n')
@@ -231,10 +294,12 @@ export const register: Register = (on, options) => {
     sonnet: String(options.sonnetModel ?? 'claude-sonnet-5-5'),
     opus: String(options.opusModel ?? 'claude-opus-5-5'),
   }
-  const reviewModel = String(options.reviewModel ?? 'claude-fable-5-5')
+  // Empty (the default) leaves the reviewer off.
+  const reviewModel = String(options.reviewModel ?? '').trim()
   const str = STR[lang]
 
   on('session.start', async ($, e, next) => {
+    await restore($)
     await $.command.register({
       name: 'model-router',
       description: 'Model router: "stats" for tokens and savings, "on" / "off" to toggle',
@@ -246,7 +311,9 @@ export const register: Register = (on, options) => {
       description:
         'Raise the model or effort for the rest of the current turn, before you start the work. ' +
         'Call it first when the task is beyond the model you were assigned (decisions must be made on opus) or needs more effort. ' +
-        'Only goes up; opus may set any effort. The change applies from your next step.',
+        'Only goes up; opus may set any effort. The change applies from your next step. ' +
+        'Works for subagents too: a subagent calls it when its task proves harder than its tier handles well ' +
+        '(guessing, a result contradicts it, the same step failed twice); capped at the parent session model.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -307,6 +374,7 @@ export const register: Register = (on, options) => {
       turnOutput = 0
       await update($, route, () => r)
       await count($, c => ({ ...c, turns: { ...c.turns, [r.tier]: c.turns[r.tier] + 1 } }))
+      await logEvent($, 'main', 'turn route', `${r.model}/${r.effort}`, r.reason)
     }
     return next(e)
   })
@@ -318,9 +386,15 @@ export const register: Register = (on, options) => {
     let effort = e.effort
     const r = await read($, route)
     const isMain = e.agentId === undefined
+    const sub = e.agentId === undefined ? undefined : agents.get(e.agentId)
     if (isMain && r && r.turnId === e.turnId) {
       model = withSuffixOf(ids[r.model], e.model)
       effort = r.effort
+    }
+    // A tiered subagent's own model and effort; an inheriting one keeps what the engine resolved.
+    if (sub) {
+      if (sub.model !== undefined) model = withSuffixOf(sub.model, e.model)
+      if (sub.effort !== undefined) effort = sub.effort
     }
     if (isFable(model)) {
       model = withSuffixOf(ids.opus, e.model)
@@ -337,14 +411,38 @@ export const register: Register = (on, options) => {
         turnSteps += 1
         turnOutput += u.output_tokens
       }
+      // Proof the rewrite took effect: the family that answered is the family asked for.
+      if (model !== e.model || effort !== e.effort) {
+        const asked = familyOf(model)
+        const got = familyOf(u.model)
+        if (asked !== undefined && got !== undefined && asked !== got) {
+          await count($, c => ({ ...c, modelMismatch: (c.modelMismatch ?? 0) + 1 }))
+        }
+      }
+      if (e.agentId !== undefined && sub) {
+        log.stats[e.agentId] = addUsage(log.stats[e.agentId], u.model || model, effort === undefined ? undefined : String(effort), u)
+        await persist($)
+      }
     }
     return result
   })
 
-  on('tool.call', { tool: 'mcp__model-router__escalate' }, async ($, e) => {
+  on('tool.call', { tool: TOOL_CALL }, async ($, e) => {
     const input = e as unknown as { agentId?: string; model?: string; effort?: string; reason?: string }
+    // A subagent the router tiered raises itself, capped at its ceiling.
+    if (input.agentId !== undefined) {
+      const s = agents.get(input.agentId)
+      if (s === undefined) {
+        return { result: 'No routed agent here: escalate applies to the main conversation of a routed turn and to subagents the router tiered. Carry on.' }
+      }
+      const up = escalateAgent(s, input, ids)
+      if (up === undefined) return { result: `No change: already on ${describeTier(s)}, the ceiling is ${s.ceiling}.` }
+      agents.set(input.agentId, { ...up, errorsInARow: 0 })
+      await logEvent($, input.agentId, 'escalated', describeTier(up), input.reason ?? 'no reason given')
+      return { result: `Escalated to ${describeTier(up)} from your next step.` }
+    }
     const r = await read($, route)
-    if (input.agentId !== undefined || !r || r.turnId === null) {
+    if (!r || r.turnId === null) {
       return { result: 'No routed turn here: escalate only applies to the main conversation of a routed turn. Carry on.' }
     }
     const out = applyEscalation(r, input)
@@ -356,20 +454,52 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // A subagent the call gives no model gets one by its job: search on Haiku, work on Sonnet, judgment on Opus.
-  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
-    if (!(await read($, enabled)) || e.subagent_type === 'fork') return next(e)
-    if (e.model === 'fable') {
-      await count($, c => ({ ...c, fableBlocked: c.fableBlocked + 1 }))
-      return next({ ...e, model: 'opus' })
+  // Automatic fallback: a subagent that keeps failing is raised one step.
+  on('tool.call', async ($, e, next) => {
+    const ran = await next(e)
+    const s = e.agentId === undefined ? undefined : agents.get(e.agentId)
+    if (e.agentId === undefined || s === undefined || e.tool === TOOL_CALL || !(await read($, enabled))) return ran
+    const failed = ran.deny === undefined && ran.isError === true
+    const errorsInARow = failed ? s.errorsInARow + 1 : 0
+    const up = errorsInARow >= AUTO_ESCALATE_AFTER ? stepUp(s, ids) : undefined
+    if (up === undefined) {
+      // At the top already: start counting again rather than retrying each call.
+      agents.set(e.agentId, { ...s, errorsInARow: errorsInARow >= AUTO_ESCALATE_AFTER ? 0 : errorsInARow })
+      return ran
     }
-    if (e.model !== undefined) return next(e)
-    const typed = e.subagent_type === 'Explore' || e.subagent_type === 'Plan'
-    const d = typed ? null : await classifyTier($, lang, e.prompt, null, false)
-    const model = subagentModel(e.subagent_type, d?.tier ?? null)
-    await count($, c => ({ ...c, subagents: { ...c.subagents, [model]: c.subagents[model] + 1 } }))
-    return next({ ...e, model })
+    agents.set(e.agentId, { ...up, errorsInARow: 0 })
+    await logEvent($, e.agentId, 'auto-escalated', describeTier(up), `${AUTO_ESCALATE_AFTER} tool errors in a row`)
+    return ran
   })
+
+  // A subagent the call gives no model gets one by its job: search on Haiku, work on Sonnet, judgment
+  // inherits the parent. Never above the parent, never Fable; forks and workflow agents are left alone.
+  on('agent.spawn', async ($, e, next) => {
+    if (!(await read($, enabled)) || e.fork || e.workflow !== undefined) return next(e)
+    const tier = needsClassifier(e) ? ((await classifyTier($, lang, e.prompt, null, false))?.tier ?? null) : null
+    const d = decideSpawn(e, tier)
+    const ran = await next(d?.model === undefined ? e : { ...e, model: d.model })
+    try {
+      if (ran.deny === undefined && ran.agentId !== undefined) {
+        const model = d?.model
+        if (model !== undefined) {
+          await count($, c => ({
+            ...c,
+            subagents: { ...c.subagents, [model]: c.subagents[model] + 1 },
+            fableBlocked: c.fableBlocked + (d?.fable ? 1 : 0),
+          }))
+        }
+        const s = startOf(ran.model, e.parentModel, model !== undefined, ids)
+        agents.set(ran.agentId, s)
+        await logEvent($, ran.agentId, `${e.subagentType} start`, describeTier(s), d?.reason ?? 'as asked')
+      }
+    } catch {
+      // Tracking is best effort: the agent has started either way.
+    }
+    return ran
+  })
+    // Fail open: a broken policy must never block a spawn.
+    .catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const r = await read($, route)
