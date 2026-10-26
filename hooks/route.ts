@@ -15,7 +15,7 @@ export type Lang = 'zh' | 'en'
 
 export function classifierSystem(lang: Lang): string {
   return `You route a developer's message to Claude Code (an AI coding agent) to the cheapest model that can do it well.
-Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","reason":string}
+Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}
 
 lookup (fast model): pure retrieval or mechanical work with nothing to judge — find/grep/list files, read and report a value
   or status, run a command the user named and report the output, rename, fix a typo, format, translate a short text,
@@ -33,6 +33,8 @@ Rules:
   except: approving a plan that was just made ("照这个做", "开始吧") is execute.
 - If a message mixes tiers, use the highest one it contains.
 - When unsure between two tiers, pick the higher one.
+- sure: set false when the message is ambiguous, could reasonably be read at two tiers, or depends on context you cannot
+  see; otherwise true. An unsure verdict is never used to move work to a cheaper model.
 - reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.`
 }
 
@@ -41,17 +43,32 @@ function isTier(x: unknown): x is Tier {
 }
 
 // Anything unreadable becomes null, and the caller falls back to execute.
-export function parseDecision(text: string): { tier: Tier; reason: string } | null {
+// sure defaults to true, so a reply in the old format (no "sure") still parses.
+export function parseDecision(text: string): { tier: Tier; reason: string; sure: boolean } | null {
   const start = text.indexOf('{')
   const end = text.lastIndexOf('}')
   if (start === -1 || end <= start) return null
   try {
     const o = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
     if (!isTier(o.tier)) return null
-    return { tier: o.tier, reason: typeof o.reason === 'string' ? o.reason.trim().slice(0, 60) : '' }
+    return { tier: o.tier, reason: typeof o.reason === 'string' ? o.reason.trim().slice(0, 60) : '', sure: o.sure !== false }
   } catch {
     return null
   }
+}
+
+const TIER_RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }
+
+// Low confidence never downgrades: after a higher-tier turn the previous tier stays, and a first turn
+// never starts on lookup. A wrong guess upward costs cents; a wrong guess downward costs a failed turn.
+export function settleTier(d: { tier: Tier; reason: string; sure: boolean }, previous: Tier | null): { tier: Tier; reason: string } {
+  if (d.sure) return { tier: d.tier, reason: d.reason }
+  if (previous !== null) {
+    return TIER_RANK[previous] > TIER_RANK[d.tier]
+      ? { tier: previous, reason: `${d.reason} (unsure: not downgrading)` }
+      : { tier: d.tier, reason: d.reason }
+  }
+  return d.tier === 'lookup' ? { tier: 'execute', reason: `${d.reason} (unsure: not starting on lookup)` } : { tier: d.tier, reason: d.reason }
 }
 
 // "#opus", "#sonnet" or "#haiku" in a message pins that turn's model.
