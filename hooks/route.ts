@@ -118,7 +118,7 @@ export function withSuffixOf(id: string, current: string): string {
 }
 
 export function assignmentContext(r: Route): string {
-  const head = `[prompt-cockpit model-router] This turn is assigned to ${r.model} at ${r.effort} effort (tier: ${r.tier}${r.reason ? ` — ${r.reason}` : ''}).`
+  const head = `[model-router] This turn is assigned to ${r.model} at ${r.effort} effort (tier: ${r.tier}${r.reason ? ` — ${r.reason}` : ''}).`
   const opus =
     r.model === 'opus'
       ? `You are on opus. Decide the effort this task needs; if it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work.`

@@ -10,10 +10,17 @@ your messages on a third-party service (TypeSafe AI or OpenRouter); this router 
 the same account Claude Code already uses. No proxy, no background service, no extra API key.
 This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
+> **Requirements**
+> Claude Code with function-hook plugins (the `register.tsx` hooks API), an early-access feature at the time of
+> writing. Tested on Claude Code 2.1.295–2.1.308 on Windows. If your Claude Code does not support function hooks, the
+> plugin installs but does nothing.
+
 ```
 ⚙ Sonnet · medium — implement the agreed plan                         [Disable router]
   turn 21.2k token · $0.04   today 310k token · $1.20, saved ≈$3.10 (72%) vs all on Opus
 ```
+
+<!-- screenshot: docs/band.png -->
 
 ## How a turn is routed
 
@@ -63,9 +70,47 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 ## Events log
 
-Main-turn routes (`turn route`, agent `main`) and subagent events (`<type> start`, `escalated`, `auto-escalated`), with
-per-subagent usage by model and effort, are written to `~/.claude/model-tiering/events-<sessionId>.json`, the format the
-weekly `tiering_report.py` reads. Writing is best effort and never affects a turn.
+The router writes one JSON file per session to `~/.claude/model-router/events-<sessionId>.json` (the `.claude`
+directory is the one the plugin is installed under). It stays on your machine and is there for your own analysis;
+nothing reads it back except the router itself, to keep a session's log across a reload. Writing is best effort and
+never affects a turn.
+
+```
+{
+  "sessionId": "...",
+  "events": [{ "at": "<ISO time>", "agentId": "...", "event": "...", "to": "...", "reason": "..." }],
+  "stats": {
+    "<agentId>": {
+      "byModel": { "<modelId>": { "steps": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } },
+      "byEffort": { "<effort>": 0 }
+    }
+  }
+}
+```
+
+`event` is one of: `turn route` (agent `main`, the route chosen for a turn), `<subagentType> start` (a subagent
+started, for example `Explore start`), `escalated` (a subagent raised its own model or effort) and `auto-escalated`
+(the router raised it after repeated tool errors). `byEffort` counts steps per effort; `default` means the session's
+own effort. `stats` covers routed subagents only.
+
+## Privacy
+
+- **Where classification runs.** On Claude Haiku, through the same Anthropic account Claude Code already uses: no third
+  party, no proxy, no extra key.
+- **What the classifier receives.** The new message, capped at 6,000 characters, plus the last two non-empty messages of
+  the conversation (each trimmed to its first 200 and last 1,000 characters when longer than 1,200). All three are
+  masked by `hooks/redact.ts` before they are sent (context messages before trimming): private-key blocks, Anthropic and OpenAI-style keys, GitHub, Slack and
+  Telegram tokens, AWS and Google API keys, JSON web tokens, `Bearer` tokens, 64-character hex strings, and values
+  assigned to names containing `api_key`, `secret`, `token`, `password` or `pwd`. This is pattern matching and will not
+  catch every secret.
+- **Subagents.** When a `general-purpose` subagent is started without a model, its prompt (masked and capped the same
+  way, without the conversation context) goes to the classifier.
+- **Nothing else is collected.** No telemetry and no analytics. The router makes no network call of its own: the only
+  traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
+  the events log are written to local files only.
+- **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
+  turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
+  also sends a one-word probe to check the model exists. With `reviewModel` empty, none of this happens.
 
 ## How much you saved
 
@@ -74,8 +119,7 @@ the day and the all-time totals. The baseline prices the same tokens on Opus 5.5
 `/model-router stats` shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
 keeps, routed subagents, Fable requests moved to Opus and model mismatches (routed model not the one that answered).
 
-This is an estimate: another model would not use exactly the same tokens, and on a subscription plan you pay in usage
-limits rather than dollars. The percentage is the useful number either way.
+This is an estimate; see "Assumptions in the meter" below.
 
 ## Install
 
@@ -98,9 +142,13 @@ Answer `y` to add the marketplace and pick a scope. Installed at user scope it a
 
 ## Assumptions in the meter
 
-Prices per million tokens (Anthropic first-party, as of 2026-10): Opus 5.5 $4 in / $20 out, Sonnet 5.5 $2 / $10,
-Haiku 5.5 $0.10 / $0.50; cache reads $0.20 (Haiku assumed at 10% of input); cache writes at 2× input (Claude Code's
-1-hour cache TTL). Change `hooks/meter.ts` if your rates differ.
+The dollar figures are **estimates**, computed from the price table in `hooks/meter.ts` (Anthropic first-party API
+rates, as of 2026-10). They may differ from your actual pricing or plan: on a subscription you pay in usage limits, not
+dollars, and another model would not have used exactly the same tokens. **The percentage is the more useful number.**
+
+Prices per million tokens in the table: Opus 5.5 $4 in / $20 out, Sonnet 5.5 $2 / $10, Haiku 5.5 $0.10 / $0.50; cache
+reads $0.20 (Haiku assumed at 10% of input); cache writes at 2× input (Claude Code's 1-hour cache TTL). Change
+`hooks/meter.ts` if your rates differ.
 
 ## Development
 
