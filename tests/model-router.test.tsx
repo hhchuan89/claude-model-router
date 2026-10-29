@@ -97,7 +97,7 @@ const BAND_PROPS = {
   view: {},
 } as never
 
-type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; maxTokens: (number | undefined)[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string> }
+type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; maxTokens: (number | undefined)[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string>; stepMs?: number }
 
 const IDS: Record<string, string> = { haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' }
 
@@ -148,6 +148,8 @@ function world(
   on('turn.complete', async () => ({ text: 'ok' }))
   on('turn.step', async function* (_$: unknown, e: { model: string; effort?: unknown; agentId?: string; turnId: string; index: number }) {
     seen.steps.push({ model: e.model, effort: e.effort, agentId: e.agentId })
+    // A response that takes this long to stream: the clock moves while the request is in flight.
+    if (seen.stepMs) await seen.clock.advance(seen.stepMs)
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: seen.usage.shift() ?? null }
   })
   // As the engine does: the alias resolves to an id, no model means the parent's.
@@ -1878,6 +1880,55 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await $.command.run({ command: 'model-router', args: 'off' } as never)
       await seen.clock.advance(60_000)
       expect(c.instructions).toHaveLength(1)
+    })
+  })
+
+  describe('second review (v0.9.1)', () => {
+    test('the TTL is measured from when the request was sent, not from when a long response ended', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      seen.stepMs = 6 * MIN
+      await mainTurn($, seen, 't1', 250_000)
+      seen.stepMs = 0
+      await seen.clock.advance(55 * MIN)
+      // Sent 61 minutes ago: past the safe window, so compacting now would pay the cold rewrite it means to avoid.
+      expect(c.instructions).toEqual([])
+    })
+
+    test('a short response still compacts at 55 minutes', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      seen.stepMs = 30_000
+      await mainTurn($, seen, 't1', 250_000)
+      seen.stepMs = 0
+      await seen.clock.advance(55 * MIN)
+      expect(c.instructions).toHaveLength(1)
+    })
+
+    test('a gap past the TTL with a warm prefix read is new input, not a rewrite', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'first' } as never)
+      seen.usage.push(U(1000, 500, 200_000, 0))
+      await step($, 't1')
+      await seen.clock.advance(CACHE_TTL_MS + 1000)
+      seen.usage.push(U(1000, 500, 300_000, 150_000))
+      await step($, 't1')
+      expect(await statsOf($)).toContain('Cache rewrites after the TTL (100k+ tokens): 0')
+    })
+
+    test('a prompt that lands while the timer reads the enabled state still cancels it', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      // Armed after the turn. runIdle reads the enabled state twice; the prompt lands during the second read, the last
+      // check before compacting.
+      let reads = -1
+      on('state.get', { plugin: 'model-router' }, async (_$: unknown, e: any, next: any) => {
+        if (reads >= 0 && e.key === 'enabled' && ++reads === 2) {
+          await $.prompt.submit({ text: 'back' } as never)
+        }
+        return next(e)
+      })
+      await mainTurn($, seen, 't1', 250_000)
+      reads = 0
+      await seen.clock.advance(21 * MIN)
+      expect(c.instructions).toEqual([])
     })
   })
 
