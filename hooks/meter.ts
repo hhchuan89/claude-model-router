@@ -111,3 +111,9 @@ export function keepWarm(target: ModelKey, last: LastRequest | null, now: number
     ctx * PRICES[target].write + (steps - 1) * ctx * PRICES[target].read + steps * out * PRICES[target].output
   return stay < move ? last.model : target
 }
+
+// A main turn that stays on Opus whatever the classifier says: the last main request was Opus, inside the cache TTL,
+// with a context of WARM_CONTEXT_KEEP tokens or more, so keepWarm would never move the turn below Opus.
+export function isWarmOpus(last: LastRequest | null, now: number): boolean {
+  return last !== null && last.model === 'opus' && now - last.at <= CACHE_TTL_MS && last.context >= WARM_CONTEXT_KEEP
+}

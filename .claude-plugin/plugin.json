@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Routes every Claude Code turn to the cheapest model that can do it well (Haiku lookups, Sonnet execution, Opus decisions), lets the model escalate itself, routes subagents too, keeps a warm cache when switching would cost more, and shows how much you saved vs all-Opus. Classification runs on your own Anthropic account; no third party sees your prompts.",
   "author": {
     "name": "hhchuan89"
@@ -20,7 +20,13 @@
     "mainRouting": {
       "type": "boolean",
       "title": "Route the main conversation",
-      "description": "On (the default): every turn you start is classified and runs on the cheapest model that fits. Off: subagent-only mode, the low-risk way to start. The main thread is left on your own model, and subagent routing, escalation, Fable blocking and the meter keep working.",
+      "description": "On (the default): every turn you start is classified and runs on the cheapest model that fits. Off: subagent-only mode, the low-risk way to start. The main thread is left on your own model (Fable included), and subagent routing, escalation, Fable blocking for subagents and the meter keep working.",
+      "default": true
+    },
+    "blockFable": {
+      "type": "boolean",
+      "title": "Block Fable",
+      "description": "On (the default): Fable never runs on a subagent, and never on the main conversation while main routing is on; those requests run on your Decision model instead. With main routing off, your own main model is left alone and only subagents are kept off Fable. Off: Fable is left alone everywhere, so you can run Fable as your main model; a subagent still never runs above its parent.",
       "default": true
     },
     "haikuModel": {
@@ -44,7 +50,7 @@
     "reviewModel": {
       "type": "string",
       "title": "Decision reviewer",
-      "description": "Optional: reviews Opus's decisions with this model (for example claude-fable-5-5), only if it exists on your account (checked daily). Empty (the default) turns the review off. Fable 5.1 is never used.",
+      "description": "Optional: reviews Opus's decisions with a model id available on your account, only if it exists there (checked daily). The reviewer is sent your request and Opus's answer unmasked. Empty (the default) turns the review off. Fable 5.1 is never used.",
       "default": ""
     }
   }
