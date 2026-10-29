@@ -55,16 +55,23 @@ function isTier(x: unknown): x is Tier {
 
 // Anything unreadable becomes null, and the caller falls back to execute.
 // sure defaults to true, so a reply in the old format (no "sure") still parses.
+// A reply cut off before its closing brace still carries the tier when that came first: it parses as unsure with
+// no reason, so it can never move work to a cheaper model.
 export function parseDecision(text: string): { tier: Tier; reason: string; sure: boolean } | null {
   const start = text.indexOf('{')
+  if (start === -1) return null
   const end = text.lastIndexOf('}')
-  if (start === -1 || end <= start) return null
+  const truncated = (): { tier: Tier; reason: string; sure: boolean } | null => {
+    const m = /"tier"\s*:\s*"(lookup|execute|decide)"/.exec(text.slice(start))
+    return m ? { tier: m[1] as Tier, reason: '', sure: false } : null
+  }
+  if (end <= start) return truncated()
   try {
     const o = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
     if (!isTier(o.tier)) return null
     return { tier: o.tier, reason: typeof o.reason === 'string' ? shorten(o.reason, 60) : '', sure: o.sure !== false }
   } catch {
-    return null
+    return truncated()
   }
 }
 

@@ -3,6 +3,35 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-10-29
+
+Fable blocking is now optional and counted honestly, the classifier fails less often, and it is skipped when its
+verdict cannot change anything. Items 1 to 4 below were found in a review by Muhafiz Madzlan.
+
+### Fixed
+- Fable blocking was unconditional: the rewrite ran even with `mainRouting` off, so a user who runs Fable as the main
+  model could not use subagent-only mode. New option `blockFable` (default on). Off: Fable is left alone on the main
+  thread and on subagents (a subagent still never runs above its parent; its own cap stays Opus at medium, main can
+  raise it to Opus at high). On with `mainRouting` off: the main thread's Fable is left alone, subagents are still kept
+  off Fable. Reported by Muhafiz Madzlan.
+- `Fable requests moved to Opus` counted every request; it now counts once per turn on the main thread and once per
+  subagent. Reported by Muhafiz Madzlan.
+- The `reviewModel` example `claude-fable-5-5` is not a real model id. README and the plugin description now say "a
+  model id available on your account". Reported by Muhafiz Madzlan.
+- The README now says next to the `reviewModel` option, not only under Privacy, that the reviewer is sent your request
+  and Opus's answer unmasked. Reported by Muhafiz Madzlan.
+- Classifier `unparseable` failures: the verdict is cut off at 120 tokens before its closing brace. The classifier's
+  `maxTokens` is now 300, and a reply cut off after a valid tier parses as an unsure verdict (never a downgrade).
+  The failure reason now carries the first 120 characters of the reply (single line, masked), for example
+  `classifier failed (unparseable: ...)`, so the cause shows in the events log; `/model-router stats` still counts
+  plain `unparseable`.
+
+### Changed
+- A main prompt whose last main request was Opus, within the cache TTL and with a context of 50,000 tokens or more,
+  skips the classifier: the turn would stay on Opus whatever the tier. It routes as decide on Opus at medium ("warm
+  large context: classifier skipped") with no Haiku call, and `/model-router stats` shows `Classifier skipped`. A
+  `#model` pin still wins.
+
 ## [0.8.1] - 2026-10-29
 
 Subagents no longer think longer on their own past a modest ceiling: hard judgement belongs to the main conversation,

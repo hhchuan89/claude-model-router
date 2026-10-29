@@ -65,10 +65,12 @@ export function needsClassifier(e: SpawnFacts): boolean {
 // general-purpose task, null when it failed (or was not asked).
 // sure: the classifier's confidence. An unsure lookup never goes to Haiku: the verdict was a guess, and
 // a wrong guess on the cheapest model costs a failed run, a wrong guess one tier up costs a few cents.
-export function decideSpawn(e: SpawnFacts, tier: Tier | null, sure = true): Decision | undefined {
+// blockFable false: Fable is left alone (a Fable parent's agents inherit it, an agent asking for Fable under a Fable
+// parent keeps it); the parent's tier is still the ceiling, so a lower parent still caps a Fable ask.
+export function decideSpawn(e: SpawnFacts, tier: Tier | null, sure = true, blockFable = true): Decision | undefined {
   if (e.fork || e.workflow !== undefined) return undefined
   const ceiling = ceilingOf(e.parentModel)
-  const parentIsFable = familyOf(e.parentModel) === 'fable'
+  const parentIsFable = blockFable && familyOf(e.parentModel) === 'fable'
   // Inheriting a Fable parent would run Fable: pin Opus instead.
   const inherit = (reason: string): Decision =>
     parentIsFable ? { model: 'opus', reason: 'no Fable tier', fable: true } : { model: undefined, reason }
@@ -77,8 +79,10 @@ export function decideSpawn(e: SpawnFacts, tier: Tier | null, sure = true): Deci
     const asked = familyOf(e.model)
     // An id or `inherit` we cannot rank is left alone, unless it would run Fable.
     if (asked === undefined) return parentIsFable ? inherit('') : undefined
+    // Under a Fable parent that is allowed to run Fable, an agent asking for Fable is within its ceiling.
+    if (asked === 'fable' && !blockFable && familyOf(e.parentModel) === 'fable') return undefined
     const model = clamp(asked, ceiling)
-    return model === asked ? undefined : { model, reason: `asked ${asked}, capped at ${model}`, fable: asked === 'fable' }
+    return model === asked ? undefined : { model, reason: `asked ${asked}, capped at ${model}`, fable: asked === 'fable' && blockFable }
   }
 
   if (e.subagentType === 'Explore') return { model: clamp('haiku', ceiling), reason: 'Explore: lookup' }

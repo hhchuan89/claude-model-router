@@ -97,7 +97,7 @@ const BAND_PROPS = {
   view: {},
 } as never
 
-type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string> }
+type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; maxTokens: (number | undefined)[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string> }
 
 const IDS: Record<string, string> = { haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' }
 
@@ -111,10 +111,11 @@ function world(
   opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown> } = {},
 ): Seen {
   mock.store(on, opts.store)
-  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], prompts: [], usage: [], agents: [], files: {} }
+  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {} }
   on('session.messages', async () => ({ value: (opts.messages ?? []).map(m => ({ ...m, toolUses: [] })) }))
-  on('model.complete', async (_$: unknown, e: { model: string; prompt: string }) => {
+  on('model.complete', async (_$: unknown, e: { model: string; prompt: string; maxTokens?: number }) => {
     seen.asked.push(e.model)
+    seen.maxTokens.push(e.maxTokens)
     seen.prompts.push(e.prompt)
     const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     if (e.model === 'haiku') {
@@ -376,7 +377,10 @@ test('a warm Opus cache on a long context keeps the next execute turn on Opus', 
   await step($, 't2')
   expect(seen.steps[1]!.model).toBe('claude-opus-5-5[1m]')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /Sonnet · medium → Opus \(保缓存\)/ })).toBeDefined()
+  // Changed in v0.8.2: the context is past WARM_CONTEXT_KEEP, so the classifier is skipped and the turn is Opus outright
+  // (it used to be classified execute, then kept on Opus: "Sonnet → Opus (保缓存)").
+  expect(await ui.find({ text: /Opus · medium — 大上下文缓存仍热：跳过分类/ })).toBeDefined()
+  expect(seen.asked).toEqual(['haiku'])
 })
 
 const OPUS = 'claude-opus-5-5'
@@ -837,9 +841,12 @@ test('a warm 200k-token Opus context is not downgraded to Sonnet for an execute 
   await step($, 't2')
   expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5[1m]' })
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /Sonnet · medium → Opus \(cache kept\)/ })).toBeDefined()
+  // Changed in v0.8.2: at 200k tokens the classifier is skipped (one Haiku call, for the first prompt only) instead of
+  // classifying execute and then keeping Opus warm. The Sonnet verdict is never asked for.
+  expect(await ui.find({ text: /Opus · medium — warm large context: classifier skipped/ })).toBeDefined()
+  expect(seen.asked).toEqual(['haiku'])
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
-  expect(r.text).toContain('Kept on a warm cache: 1')
+  expect(r.text).toContain('Classifier skipped (warm large Opus context): 1')
 })
 
 test('once the cache TTL has passed the same execute turn does move to Sonnet', async ($, on) => {
@@ -1044,7 +1051,7 @@ test('the meter flags exactly the main steps that changed family, going down and
 })
 
 describe('mainRouting off (subagent-only mode)', () => {
-  test('main steps are untouched and no context is injected, while subagent routing, escalation and Fable blocking still work', { options: { mainRouting: false } }, async ($, on) => {
+  test('main steps are untouched and no context is injected, while subagent routing, escalation and the meter still work; a main Fable is the user\'s own choice', { options: { mainRouting: false } }, async ($, on) => {
     const seen = world($, on, decide)
     await $.prompt.submit({ text: 'find files' } as never)
     // No classification, no assignment text.
@@ -1060,9 +1067,10 @@ describe('mainRouting off (subagent-only mode)', () => {
     await step($, 'tn', 'claude-sonnet-5-5')
     expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5' })
 
-    // Still on: Fable blocking on the main thread, subagent routing and escalation, and the meter.
+    // Changed in v0.8.2: with main routing off the main model is the user's own choice, Fable included.
+    // Still on: subagent routing and escalation, and the meter.
     await step($, 't1', 'claude-fable-5-1[1m]')
-    expect(seen.steps[2]!.model).toBe('claude-opus-5-5[1m]')
+    expect(seen.steps[2]!.model).toBe('claude-fable-5-1[1m]')
     const id = await spawnAgent($, { subagentType: 'Explore' })
     seen.usage.push(U(1000, 100, 0, 0, 'claude-haiku-5-5'))
     await step($, 'sub', OPUS, id)
@@ -1071,7 +1079,7 @@ describe('mainRouting off (subagent-only mode)', () => {
     expect(up.result).toBe('Escalated to sonnet/medium from your next step.')
     const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
     expect(r.text).toContain('| haiku |')
-    expect(r.text).toContain('Fable requests moved to Opus: 1')
+    expect(r.text).toContain('Fable requests moved to Opus: 0')
   })
 
   test('the turn tally still restarts with each prompt', { options: { mainRouting: false } }, async ($, on) => {
@@ -1294,5 +1302,167 @@ describe('subagent caps (v0.8.1)', () => {
     await bad()
     await bad()
     expect((await bad()).context?.[0]).toContain('subagent ceiling (opus/high)')
+  })
+})
+
+
+const statsOf = async ($: any): Promise<string> => ((await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }).text
+
+describe('blockFable (v0.8.2)', () => {
+  // WHY: a user who runs Fable as the main model could not use even subagent-only mode, because the rewrite ran
+  // unconditionally. Off must mean off, on the main thread and on subagents.
+  test('blockFable off leaves a Fable main thread and a Fable subagent alone, and counts nothing', { options: { blockFable: false } }, async ($, on) => {
+    const seen = world($, on, null)
+    await $.prompt.submit({ text: 'do the thing' } as never)
+    await step($, 't1', 'claude-fable-5-1[1m]')
+    await step($, 'other', 'claude-fable-5-1[1m]', 'agent-1')
+    expect(seen.steps[0]!.model).toBe('claude-fable-5-1[1m]')
+    expect(seen.steps[1]!.model).toBe('claude-fable-5-1[1m]')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 0')
+  })
+
+  test('blockFable off: a Fable parent hands Fable down (inherit), never above the parent; a lower parent still caps a Fable ask', async () => {
+    expect(decideSpawn(spawnInput({ parentModel: 'claude-fable-5-1' }), 'decide', true, false)).toMatchObject({ model: undefined, reason: 'decision work, inherits' })
+    expect(decideSpawn(spawnInput({ model: 'fable', parentModel: 'claude-fable-5-1' }), null, true, false)).toBeUndefined()
+    expect(decideSpawn(spawnInput({ model: 'fable', parentModel: OPUS }), null, true, false)).toMatchObject({ model: 'opus', fable: false })
+    // The default is unchanged: a Fable parent still gets Opus.
+    expect(decideSpawn(spawnInput({ parentModel: 'claude-fable-5-1' }), 'decide')).toMatchObject({ model: 'opus', fable: true })
+  })
+
+  test('blockFable off: a subagent under a Fable parent inherits Fable but is still capped at effort high', { options: { blockFable: false } }, async ($, on) => {
+    const seen = world($, on, '{"tier":"decide","reason":"audit"}')
+    const id = await spawnAgent($, { parentModel: 'claude-fable-5-1' })
+    await step($, 'sub', 'claude-fable-5-1', id, 'xhigh')
+    expect(seen.agents).toEqual([undefined])
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-fable-5-1', effort: 'high' })
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 0')
+  })
+
+  // WHY: with main routing off the user chose the main model; blocking it anyway made subagent-only mode unusable on Fable.
+  test('blockFable on with mainRouting off leaves the main Fable alone but still blocks a subagent Fable', { options: { mainRouting: false } }, async ($, on) => {
+    const seen = world($, on, null)
+    await $.prompt.submit({ text: 'do the thing' } as never)
+    await step($, 't1', 'claude-fable-5-1[1m]')
+    await step($, 'other', 'claude-fable-5-1[1m]', 'agent-1')
+    expect(seen.steps[0]!.model).toBe('claude-fable-5-1[1m]')
+    expect(seen.steps[1]!.model).toBe('claude-opus-5-5[1m]')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 1')
+  })
+
+  // WHY: the counter incremented on every request, so one Fable turn of 40 steps read as 40 blocks.
+  test('fableBlocked counts once per turn on the main thread and once per subagent, however many steps', async ($, on) => {
+    world($, on, null)
+    await $.prompt.submit({ text: 'first' } as never)
+    for (let i = 0; i < 6; i++) await step($, 't1', 'claude-fable-5-1[1m]')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 1')
+    await $.prompt.submit({ text: 'second' } as never)
+    for (let i = 0; i < 4; i++) await step($, 't2', 'claude-fable-5-1[1m]')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 2')
+    for (let i = 0; i < 5; i++) await step($, 't2', 'claude-fable-5-1[1m]', 'agent-1')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 3')
+    await step($, 't2', 'claude-fable-5-1[1m]', 'agent-2')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 4')
+  })
+
+  test('a subagent pinned to Opus at spawn because of a Fable parent is counted once, not again on its steps', async ($, on) => {
+    world($, on, '{"tier":"decide","reason":"audit"}')
+    const id = await spawnAgent($, { parentModel: 'claude-fable-5-1' })
+    await step($, 'sub', 'claude-fable-5-1', id)
+    await step($, 'sub', 'claude-fable-5-1', id)
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 1')
+  })
+})
+
+describe('classifier robustness (v0.8.2)', () => {
+  // WHY: the verdict carries tier, sure and reason; at 120 tokens it was cut before its closing brace and every such
+  // turn counted as unparseable.
+  test('the classifier gets 300 tokens, enough for the whole verdict', async ($, on) => {
+    const seen = world($, on, execute)
+    await $.prompt.submit({ text: 'build it' } as never)
+    expect(seen.maxTokens).toEqual([300])
+  })
+
+  test('a reply cut off after the tier still parses, as unsure with no reason; a cut-off junk reply does not', async () => {
+    expect(parseDecision('{"tier":"lookup","sure":tr')).toEqual({ tier: 'lookup', reason: '', sure: false })
+    expect(parseDecision('```json\n{"tier":"decide"')).toEqual({ tier: 'decide', reason: '', sure: false })
+    expect(parseDecision('{"tier":"decide","sure":true,"reason":"pick a da')).toEqual({ tier: 'decide', reason: '', sure: false })
+    expect(parseDecision('{"tier":"hug')).toBe(null)
+    expect(parseDecision('{"tier":"huge"')).toBe(null)
+    // A complete reply is unchanged.
+    expect(parseDecision('{"tier":"decide","sure":true,"reason":"x"}')).toEqual({ tier: 'decide', reason: 'x', sure: true })
+  })
+
+  test('a truncated lookup after a decide turn is unsure, so it never downgrades', async ($, on) => {
+    const seen = world($, on, [decide, '{"tier":"lookup","sure":tr'])
+    await $.prompt.submit({ text: 'which design' } as never)
+    await $.prompt.submit({ text: 'and now?' } as never)
+    expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus')
+  })
+
+  // WHY: "unparseable" said nothing about the cause; the start of the reply (masked) shows whether it was prose,
+  // a refusal or a cut-off verdict.
+  test('an unparseable reply logs its first 120 characters, single-line and masked, and is still counted as plain unparseable', async ($, on) => {
+    const reply = `Sorry,\nI cannot do that. key sk-ant-api03-${'k'.repeat(30)} ${'filler '.repeat(40)}`
+    const seen = world($, on, reply)
+    await $.prompt.submit({ text: 'do the thing' } as never)
+    const reason = eventsOf(seen).at(-1)!.reason
+    expect(reason).toMatch(/^classifier failed \(unparseable: Sorry, I cannot do that\. key \[REDACTED/)
+    expect(reason).not.toContain('kkkkkkkkkk')
+    expect(reason).not.toContain('\n')
+    const snippet = /unparseable: (.*)\): session model$/.exec(reason)![1]!
+    expect(snippet.length).toBeLessThanOrEqual(120)
+    expect(await statsOf($)).toContain('unparseable ×1')
+  })
+})
+
+describe('classifier skipped on a warm large Opus context (v0.8.2)', () => {
+  const lookup = '{"tier":"lookup","sure":true,"reason":"find"}'
+
+  // WHY: keepWarm keeps a warm Opus context of 50k+ tokens on Opus whatever the tier, so the Haiku call could not
+  // change the route and was pure cost on every prompt of a heavy session.
+  test('no Haiku call: the turn goes to Opus at the decide effort, with the reason, and the skip is counted', async ($, on) => {
+    const seen = world($, on, [decide, lookup])
+    await $.prompt.submit({ text: 'which design' } as never)
+    seen.usage.push(U(2000, 1000, 300_000, 0))
+    await step($, 't1')
+    await $.prompt.submit({ text: 'list the files' } as never)
+    expect(seen.asked).toEqual(['haiku'])
+    expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at medium')
+    expect(seen.submits[1]!.context?.[0]).toContain('warm large context: classifier skipped')
+    await step($, 't2')
+    expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+    expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'opus/medium', reason: 'warm large context: classifier skipped' })
+    expect(await statsOf($)).toContain('Classifier skipped (warm large Opus context): 1')
+  })
+
+  test('a #haiku pin still wins: no skip, and the reason is the pin', async ($, on) => {
+    const seen = world($, on, [decide, lookup])
+    await $.prompt.submit({ text: 'which design' } as never)
+    seen.usage.push(U(2000, 1000, 300_000, 0))
+    await step($, 't1')
+    await $.prompt.submit({ text: 'list the files #haiku' } as never)
+    expect(seen.asked).toEqual(['haiku'])
+    expect(seen.submits[1]!.context?.[0]).toContain('model pinned in your message')
+    expect(await statsOf($)).toContain('Classifier skipped (warm large Opus context): 0')
+  })
+
+  test('a small context still calls the classifier', async ($, on) => {
+    const seen = world($, on, [decide, lookup])
+    await $.prompt.submit({ text: 'which design' } as never)
+    seen.usage.push(U(2000, 1000, 10_000, 0))
+    await step($, 't1')
+    await $.prompt.submit({ text: 'list the files' } as never)
+    expect(seen.asked).toEqual(['haiku', 'haiku'])
+    expect(await statsOf($)).toContain('Classifier skipped (warm large Opus context): 0')
+  })
+
+  test('a cold cache (past the TTL) still calls the classifier', async ($, on) => {
+    const seen = world($, on, [decide, lookup])
+    await $.prompt.submit({ text: 'which design' } as never)
+    seen.usage.push(U(2000, 1000, 300_000, 0))
+    await step($, 't1')
+    await seen.clock.advance(CACHE_TTL_MS + 1000)
+    await $.prompt.submit({ text: 'list the files' } as never)
+    expect(seen.asked).toEqual(['haiku', 'haiku'])
   })
 })

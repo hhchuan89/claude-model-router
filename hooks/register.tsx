@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { ModelKey, Route, Tally, Tier } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, priceKey, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, priceKey, saved, tokensOf } from './meter'
 import { isPersonOrigin } from './origin'
 import { redact } from './redact'
 import type { Lang } from './route'
@@ -43,6 +43,9 @@ const TOOL = 'escalate'
 const TOOL_CALL = `mcp__model-router__${TOOL}`
 const CLASSIFY_MS = 8000
 const PROBE_EVERY_MS = 24 * 3600 * 1000
+// The verdict is a JSON object with a tier, a confidence and a reason; 120 tokens cut it off mid-reply.
+const CLASSIFY_MAX_TOKENS = 300
+const SNIPPET_CHARS = 120
 
 const route = atom({ plugin: 'model-router', key: 'route' } as const, null)
 const enabled = atom({ plugin: 'model-router', key: 'enabled' } as const, true)
@@ -52,6 +55,9 @@ const meter = atom({ plugin: 'model-router', key: 'meter' } as const, { turn: EM
 let pending: Route | null = null
 // The person's prompt for the running turn, kept for the decision review.
 let pendingPrompt = ''
+// Fable blocks already counted: a main turn once per turnId, a subagent once per agent. Without this every step of a
+// turn would add one.
+const fableCounted = new Set<string>()
 // The main thread's last model request, for keeping a warm cache; and the running turn's step count.
 let last: LastRequest | null = null
 let turnSteps = 0
@@ -68,6 +74,7 @@ const STR = {
     sessionModel: (why: string) => `分类失败（${why}）：用会话模型`,
     inherited: '沿用上一轮路由',
     forced: '你在消息里指定了模型',
+    warmSkip: '大上下文缓存仍热：跳过分类',
     off: 'Model router 已关闭',
     review: '决策审查',
     kept: '保缓存',
@@ -81,6 +88,7 @@ const STR = {
     sessionModel: (why: string) => `classifier failed (${why}): session model`,
     inherited: 'continues previous route',
     forced: 'model pinned in your message',
+    warmSkip: 'warm large context: classifier skipped',
     off: 'Model router is off',
     review: 'Decision review',
     kept: 'cache kept',
@@ -98,6 +106,8 @@ type Counts = {
   turns: Record<Tier, number>
   escalations: number
   cacheKeeps: number
+  // Main prompts that went to Opus without a classifier call: a warm large Opus context stays on Opus whatever the tier.
+  classifierSkipped: number
   subagents: Record<ModelKey, number>
   fableBlocked: number
   // Steps whose answering model was not the family the router asked for.
@@ -111,6 +121,7 @@ const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
   escalations: 0,
   cacheKeeps: 0,
+  classifierSkipped: 0,
   subagents: { haiku: 0, sonnet: 0, opus: 0 },
   fableBlocked: 0,
   modelMismatch: 0,
@@ -205,7 +216,12 @@ async function recentContext($: EngineInterface): Promise<string> {
 
 type Verdict = { tier: Tier; reason: string; sure: boolean }
 // A verdict, or why there is none: 'timeout', 'api-error <status>', 'empty-reply', 'unparseable' or 'exception'.
-type Classified = { ok: true; verdict: Verdict } | { ok: false; why: string }
+// why is the counted reason; detail (the start of an unparseable reply) is only for the person reading the log.
+type Classified = { ok: true; verdict: Verdict } | { ok: false; why: string; detail?: string }
+
+function failText(c: { why: string; detail?: string }): string {
+  return c.detail ? `${c.why}: ${c.detail}` : c.why
+}
 
 // Haiku sorts a text into a tier. withContext adds the last two messages.
 async function classifyTier($: EngineInterface, lang: Lang, text: string, previous: Tier | null, withContext: boolean): Promise<Classified> {
@@ -217,7 +233,7 @@ async function classifyTier($: EngineInterface, lang: Lang, text: string, previo
       prompt:
         `<previous_tier>${previous ?? 'none'}</previous_tier>\n` +
         `<context>\n${context || '(none)'}\n</context>\n\n<message>\n${redact(text).slice(0, 6000)}\n</message>`,
-      maxTokens: 120,
+      maxTokens: CLASSIFY_MAX_TOKENS,
       effort: 'low',
       timeoutMs: CLASSIFY_MS,
     })
@@ -228,7 +244,9 @@ async function classifyTier($: EngineInterface, lang: Lang, text: string, previo
       return { ok: false, why: 'empty-reply' }
     }
     const verdict = parseDecision(r.text)
-    return verdict ? { ok: true, verdict } : { ok: false, why: 'unparseable' }
+    if (verdict) return { ok: true, verdict }
+    // Masked whole before cutting, so a secret split by the cut is still caught.
+    return { ok: false, why: 'unparseable', detail: redact(r.text).replace(/\s+/g, ' ').trim().slice(0, SNIPPET_CHARS) }
   } catch {
     return { ok: false, why: 'exception' }
   }
@@ -247,11 +265,16 @@ function countFailure($: EngineInterface, why: string): Promise<void> {
 async function classify($: EngineInterface, lang: Lang, text: string, previous: Route | null): Promise<Route> {
   const forced = forcedModel(text)
   if (forced) return routeFor(TIER_OF[forced], STR[lang].forced)
+  // The verdict could not change anything: keepWarm keeps a warm large Opus context on Opus whatever the tier.
+  if (isWarmOpus(last, await $.clock.now())) {
+    await count($, c => ({ ...c, classifierSkipped: (c.classifierSkipped ?? 0) + 1 }))
+    return routeFor('decide', STR[lang].warmSkip)
+  }
   const c = await classifyTier($, lang, text, previous?.tier ?? null, true)
   if (!c.ok) {
     await countFailure($, c.why)
-    if (previous) return routeFor(previous.tier, STR[lang].keptTier(c.why))
-    return { ...routeFor('execute', STR[lang].sessionModel(c.why)), sessionModel: true }
+    if (previous) return routeFor(previous.tier, STR[lang].keptTier(failText(c)))
+    return { ...routeFor('execute', STR[lang].sessionModel(failText(c))), sessionModel: true }
   }
   const s = settleTier(c.verdict, previous?.tier ?? null)
   return routeFor(s.tier, s.reason)
@@ -332,6 +355,7 @@ async function statsText($: EngineInterface): Promise<string> {
     '',
     `Turns routed: lookup ${c.turns.lookup} · execute ${c.turns.execute} · decide ${c.turns.decide}. ` +
       `Escalations: ${c.escalations}. Kept on a warm cache: ${c.cacheKeeps}. ` +
+      `Classifier skipped (warm large Opus context): ${c.classifierSkipped ?? 0}. ` +
       `Subagents routed: haiku ${c.subagents.haiku} · sonnet ${c.subagents.sonnet} · opus ${c.subagents.opus}. ` +
       `Fable requests moved to Opus: ${c.fableBlocked}. ` +
       `Routed model not the one that answered: ${c.modelMismatch ?? 0}. ` +
@@ -350,8 +374,11 @@ export const register: Register = (on, options) => {
     opus: String(options.opusModel ?? 'claude-opus-5-5'),
   }
   // false: subagent-only mode. The main thread is neither classified nor rewritten; subagent routing, escalation,
-  // Fable blocking and the meter keep working.
+  // Fable blocking (of subagents) and the meter keep working.
   const mainRouting = options.mainRouting !== false
+  // true (the default): Fable never runs on a subagent, and on the main thread when main routing is on. false: Fable is
+  // left alone everywhere (a subagent still never runs above its parent).
+  const blockFable = options.blockFable !== false
   // Empty (the default) leaves the reviewer off.
   const reviewModel = String(options.reviewModel ?? '').trim()
   const str = STR[lang]
@@ -469,7 +496,7 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // Every model request: the turn's route on the main thread, never Fable 5.1 anywhere, and its usage on the meter.
+  // Every model request: the turn's route on the main thread, no Fable where blockFable says so, and its usage on the meter.
   on('turn.step', async function* ($, e, next) {
     if (!(await read($, enabled))) return yield* next(e)
     let model = e.model
@@ -488,9 +515,14 @@ export const register: Register = (on, options) => {
       // Hard ceiling for every tracked subagent, inheriting ones too: xhigh and max are main-thread only.
       effort = capSent(effort)
     }
-    if (isFable(model)) {
+    // With main routing off the main model is the person's own choice: only subagents are kept off Fable.
+    if (blockFable && isFable(model) && (!isMain || mainRouting)) {
       model = withSuffixOf(ids.opus, e.model)
-      await count($, c => ({ ...c, fableBlocked: c.fableBlocked + 1 }))
+      const key = isMain ? `turn:${e.turnId}` : `agent:${e.agentId}`
+      if (!fableCounted.has(key)) {
+        fableCounted.add(key)
+        await count($, c => ({ ...c, fableBlocked: c.fableBlocked + 1 }))
+      }
     }
     const result =
       model === e.model && effort === e.effort ? yield* next(e) : yield* next({ ...e, model, effort })
@@ -610,13 +642,16 @@ export const register: Register = (on, options) => {
     const verdict = needsClassifier(e) ? await classifyTier($, lang, e.prompt, null, false) : null
     const failure = verdict && !verdict.ok ? verdict.why : undefined
     if (failure !== undefined) await countFailure($, failure)
+    const failureText = verdict && !verdict.ok ? failText(verdict) : undefined
     const ok = verdict?.ok ? verdict.verdict : null
-    const d = decideSpawn(e, ok?.tier ?? null, ok?.sure ?? true)
+    const d = decideSpawn(e, ok?.tier ?? null, ok?.sure ?? true, blockFable)
     const ran = await next(d?.model === undefined ? e : { ...e, model: d.model })
     try {
       if (ran.deny === undefined && ran.agentId !== undefined) {
         const model = d?.model
         if (model !== undefined) {
+          // The spawn counts its own Fable block; the agent's steps then run on Opus, and fableCounted keeps any later one from counting again.
+          if (d?.fable) fableCounted.add(`agent:${ran.agentId}`)
           await count($, c => ({
             ...c,
             subagents: { ...c.subagents, [model]: c.subagents[model] + 1 },
@@ -626,7 +661,7 @@ export const register: Register = (on, options) => {
         const s = startOf(ran.model, e.parentModel, model !== undefined, ids)
         agents.set(ran.agentId, s)
         // A failed classification keeps today's fallback (sonnet) and says why.
-        const why = failure !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failure})`) : d?.reason
+        const why = failureText !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failureText})`) : d?.reason
         await logEvent($, ran.agentId, `${e.subagentType} start`, describeTier(s), why ?? 'as asked')
       }
     } catch {

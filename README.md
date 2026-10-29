@@ -37,9 +37,14 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    are masked before classification. **A failed classification never downgrades**: the turn keeps the previous turn's
    tier ("classifier failed (timeout): kept previous tier"), or, on a first turn with nothing to keep, is left unrouted
    on your own session model and effort ("classifier failed (...): session model"). The reason is one of `timeout`,
-   `api-error <status>`, `empty-reply`, `unparseable` or `exception`, and `/model-router stats` counts them. In
-   earlier versions a failure ran on Sonnet, and 24% of those turns later escalated to Opus (6% of classified turns did).
+   `api-error <status>`, `empty-reply`, `unparseable` or `exception`, and `/model-router stats` counts them. An
+   `unparseable` reply is logged with its first 120 characters (single line, masked) so the cause can be read in the
+   events log; a reply cut off after the tier still parses, as an unsure verdict. In earlier versions a failure ran on Sonnet, and 24% of those turns later escalated to Opus (6% of classified turns did).
    `#haiku`, `#sonnet` or `#opus` in a message pins the model.
+   **The classifier is skipped when it could not change the outcome.** If the last main request was Opus, is within the
+   cache TTL and had a context of 50,000 tokens or more (see the round-trip guard, 4), the turn stays on Opus whatever
+   the tier, so the prompt goes straight to Opus at the decide effort ("warm large context: classifier skipped") with no
+   Haiku call; `/model-router stats` counts these. A `#model` pin still wins.
 2. **Decide before working.** The model reads its assignment beside your prompt and must judge whether the task fits
    *before* doing any work. If not, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
    effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. A move to a higher model lands at that
@@ -86,10 +91,16 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    <id>."; a subagent passing `agent` is refused). **Hard ceiling:** no tracked subagent request is ever sent above
    effort high, including agents that inherit the session's model and effort, so an xhigh or max session still
    sends them at high; xhigh and max are main-thread only. Forks and workflow agents are not capped by the router.
-7. **No Fable 5.1.** Any request or subagent asking for Fable runs on Opus instead, and a Fable parent never passes
-   Fable down. Optionally, set `reviewModel` (for example `claude-fable-5-5`) and, if that model exists on your account
-   (checked once a day), each Opus decision is reviewed by it and the review is added as a notice. The reviewer is off
-   by default: with `reviewModel` empty the router makes no review call and no availability probe.
+7. **Fable blocking (`blockFable`, on by default).** With it on, a subagent asking for Fable runs on Opus instead, a
+   Fable parent never passes Fable down, and while main routing is on a Fable request on the main thread runs on Opus
+   too. With `mainRouting` off the main model is your own choice and is left alone; only subagents are kept off Fable.
+   With `blockFable` off nothing is rewritten for Fable, so you can run Fable as your main model and keep the other
+   features; a subagent still never runs above its parent (its own cap stays Opus at medium, and main can raise it to Opus
+   at high). Each block is counted once per turn on the main thread and once per subagent, not once per request.
+   Optionally, set `reviewModel` to a model id available on your account and, if that model exists there
+   (checked once a day), each Opus decision is reviewed by it and the review is added as a notice. **The reviewer is sent
+   your request and Opus's answer unmasked.** The reviewer is off by default: with `reviewModel` empty the router makes
+   no review call and no availability probe. Fable 5.1 is never used as the reviewer.
 8. **Check the routing took effect.** After each request the router compares the model family that answered with the
    family it asked for; any difference is counted as a model mismatch in `/model-router stats`.
 
@@ -143,7 +154,7 @@ own effort. `stats` covers routed subagents only.
 Every model request (the router's own Haiku calls included) is priced at Anthropic API rates and added to the turn,
 the day and the all-time totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
 `/model-router stats` shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
-keeps, routed subagents, Fable requests moved to Opus, model mismatches (routed model not the one that answered),
+keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus, model mismatches (routed model not the one that answered),
 classifier failures by reason and escalations to max effort (main thread only, counted when effort moves to
 max from below).
 
@@ -166,9 +177,10 @@ but leave your own conversation alone, turn `mainRouting` off instead (see Optio
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `language` | `en` | Language of the reason line and the savings line (`en` or `zh`) |
-| `mainRouting` | on | On: every turn you start is classified and routed. Off: **subagent-only mode, the low-risk way to start.** The main thread is never classified or rewritten (your session model and effort stay as they are, and no assignment text is added to your prompts), while subagent routing, subagent escalation and automatic escalation, Fable blocking and the savings meter keep working |
+| `mainRouting` | on | On: every turn you start is classified and routed. Off: **subagent-only mode, the low-risk way to start.** The main thread is never classified or rewritten (your session model and effort stay as they are, and no assignment text is added to your prompts), while subagent routing, subagent escalation and automatic escalation, Fable blocking for subagents and the savings meter keep working |
+| `blockFable` | on | On: Fable never runs on a subagent, and not on the main thread while `mainRouting` is on (those requests run on Opus); with `mainRouting` off your main model is left alone and only subagents are kept off Fable. Off: Fable is left alone everywhere, so Fable can be your main model; a subagent still never runs above its parent |
 | `haikuModel` / `sonnetModel` / `opusModel` | `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` | Model ids per tier |
-| `reviewModel` | empty (off) | Model that reviews Opus decisions, e.g. `claude-fable-5-5`, only if it exists on your account; Fable 5.1 is never used |
+| `reviewModel` | empty (off) | A model id available on your account that reviews Opus decisions, only if it exists there; Fable 5.1 is never used. **The reviewer is sent your request and Opus's answer unmasked** (see Privacy) |
 
 ## Assumptions in the meter
 
