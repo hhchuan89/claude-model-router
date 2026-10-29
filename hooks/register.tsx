@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { ModelKey, Route, Tally, Tier } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, priceKey, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, PRICES, priceKey, saved, tokensOf } from './meter'
 import { isPersonOrigin } from './origin'
 import { redact } from './redact'
 import type { Lang } from './route'
@@ -62,6 +62,38 @@ const fableCounted = new Set<string>()
 let last: LastRequest | null = null
 let turnSteps = 0
 let turnOutput = 0
+// The main thread's last request of ANY model family, Fable included (`last` skips Fable, which keepWarm never
+// routes). The compaction guards and the cache-expiry counter read this one. Null after a compaction: the context is
+// small now, so the old figure must not trigger again, and the next request is not a cache rewrite.
+let lastMain: { at: number; context: number } | null = null
+// True from a compaction this process saw until the next main request: that request reads a fresh summary, so its
+// big cache write is not an expiry rewrite even though lastMain is null.
+let justCompacted = false
+// The pending idle-compact (or deferred cap-compact) timer; at most one at a time. timerEpoch moves on every cancel:
+// a callback that is already awaiting when the person comes back compares it and stands down.
+let compactTimer: Timer | null = null
+let timerEpoch = 0
+// A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
+const REWRITE_MIN_TOKENS = 100_000
+// A cache read below this on a request with no earlier one in this process means the cache was cold.
+const COLD_READ_TOKENS = 1000
+// Idle compaction only makes sense inside the cache TTL, and with a margin: the summary request itself takes a while and
+// a clock a few minutes off must not let it land on an expired cache. 55 minutes is the longest setting; the margin is
+// 3 minutes, not 5, so a 55-minute timer, which fires a few seconds after the last step was stamped, still passes.
+const SAFE_MARGIN_MS = 3 * 60_000
+const IDLE_MIN_MINUTES = 1
+const IDLE_MAX_MINUTES = 55
+// The engine's own autoCompactWindow range starts here; a smaller cap would compact every turn.
+const CAP_MIN_CONTEXT = 100_000
+// A cap compaction that is refused (a turn is still marked running as the hook fires) is retried a few times.
+const CAP_RETRIES = 3
+const CAP_RETRY_MS = 2000
+// Background agents hold work the summary could cut from under them: one re-check this much later, then give up.
+const AGENT_RECHECK_MS = 5 * 60_000
+// Agent statuses that mean the agent is still working or about to (idle, completed, failed and killed are not).
+const BUSY_STATUSES: readonly string[] = ['pending', 'running', 'waiting']
+const COMPACT_INSTRUCTIONS =
+  'Keep the current task and its goal, the decisions made and why, open items and next steps, and the file paths and identifiers in play. Drop finished exploration and tool output.'
 // What each tiered subagent is on now, by agent id.
 const agents = new Map<string, AgentTier>()
 // Per session: what changed and what each tiered subagent cost per model and effort. Written to
@@ -82,6 +114,8 @@ const STR = {
     today: '今日',
     save: '省',
     vs: '对比全用 Opus',
+    idleCompacted: (size: string) => `空闲压缩：已压缩 ${size} 上下文（缓存仍热）`,
+    capCompacted: (size: string) => `上下文达到上限：已压缩 ${size}`,
   },
   en: {
     keptTier: (why: string) => `classifier failed (${why}): kept previous tier`,
@@ -96,6 +130,8 @@ const STR = {
     today: 'today',
     save: 'saved',
     vs: 'vs all on Opus',
+    idleCompacted: (size: string) => `Idle compact: compacted ${size} of context while the cache was warm`,
+    capCompacted: (size: string) => `Context cap reached: compacted ${size}`,
   },
 } as const
 
@@ -116,6 +152,12 @@ type Counts = {
   classifierFailures: Record<string, number>
   // Escalations to max effort, main thread and subagents: max is meant to be rare.
   maxEffort: number
+  // Compactions this plugin started: after an idle spell (cache still warm) and at the context cap.
+  idleCompactions: number
+  capCompactions: number
+  // Main-thread requests that rewrote 100k+ tokens of cache after a gap past the TTL, and what those writes cost.
+  cacheExpiryRewrites: number
+  cacheExpiryRewriteCost: number
 }
 const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
@@ -127,6 +169,10 @@ const NO_COUNTS: Counts = {
   modelMismatch: 0,
   classifierFailures: {},
   maxEffort: 0,
+  idleCompactions: 0,
+  capCompactions: 0,
+  cacheExpiryRewrites: 0,
+  cacheExpiryRewriteCost: 0,
 }
 
 function dayKey(ms: number): string {
@@ -134,7 +180,24 @@ function dayKey(ms: number): string {
   return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
 }
 
+// A person coming back, or any new turn, must never be compacted under.
+function cancelCompact() {
+  timerEpoch += 1
+  compactTimer?.cancel()
+  compactTimer = null
+}
+
+// The context is a summary now (whoever compacted): the old figures must not steer routing or trigger a guard.
+function forgetContext() {
+  last = null
+  lastMain = null
+  justCompacted = true
+  cancelCompact()
+}
+
 async function setEnabled($: EngineInterface, isOn: boolean) {
+  // Off must also stop a compaction already scheduled.
+  if (!isOn) cancelCompact()
   await update($, enabled, () => isOn)
   await $.store.set('enabled', isOn)
 }
@@ -360,10 +423,105 @@ async function statsText($: EngineInterface): Promise<string> {
       `Fable requests moved to Opus: ${c.fableBlocked}. ` +
       `Routed model not the one that answered: ${c.modelMismatch ?? 0}. ` +
       `Classifier failures: ${failures.length > 0 ? failures.join(' · ') : 'none'}. ` +
-      `Escalations to max effort: ${c.maxEffort ?? 0}.`,
+      `Escalations to max effort: ${c.maxEffort ?? 0}. ` +
+      `Compactions at idle (cache warm): ${c.idleCompactions ?? 0}. ` +
+      `Compactions at the context cap: ${c.capCompactions ?? 0}. ` +
+      `Cache rewrites after the TTL (100k+ tokens): ${c.cacheExpiryRewrites ?? 0}, costing ${fmtUsd(c.cacheExpiryRewriteCost ?? 0)}.`,
     '',
     '_API-equivalent prices; the baseline prices the same tokens on Opus, so it is an estimate: another model would not use exactly the same tokens._',
   ].join('\n')
+}
+
+type CompactOutcome = 'done' | 'skipped' | 'rejected'
+
+// Compacts the main conversation between turns while the cache is warm. $.session.compact rejects while a turn
+// runs ('rejected') and resolves { skip } when a hook vetoed it ('skipped'): neither is a compaction, so neither is
+// counted. Never throws.
+async function compactMain($: EngineInterface, lang: Lang, kind: 'idle' | 'cap'): Promise<CompactOutcome> {
+  const before = lastMain?.context ?? 0
+  let tokensBefore: number | undefined
+  let tokensAfter: number | undefined
+  try {
+    const r = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
+    if (r.skip !== undefined) return 'skipped'
+    tokensBefore = r.tokensBefore
+    tokensAfter = r.tokensAfter
+  } catch {
+    return 'rejected'
+  }
+  // The session.compact observer does this too, but whether it is reached for the plugin's own call is not
+  // guaranteed ("every hook but the calling one"), so it is done here as well; it is idempotent.
+  forgetContext()
+  await count($, c =>
+    kind === 'idle' ? { ...c, idleCompactions: (c.idleCompactions ?? 0) + 1 } : { ...c, capCompactions: (c.capCompactions ?? 0) + 1 },
+  )
+  // The engine's own figures when it recorded them, else the last request's context.
+  const size = tokensAfter === undefined ? fmtTokens(tokensBefore ?? before) : `${fmtTokens(tokensBefore ?? before)} → ${fmtTokens(tokensAfter)}`
+  const str = STR[lang]
+  try {
+    $.ui.toast((kind === 'idle' ? str.idleCompacted : str.capCompacted)(size))
+  } catch {
+    // A missing toast surface is not worth failing a compaction that happened.
+  }
+  return 'done'
+}
+
+// Whether the idle guard should compact now: a big enough context, last used safely inside the cache TTL.
+function idleDue(now: number, minContext: number): boolean {
+  return lastMain !== null && lastMain.context >= minContext && now - lastMain.at <= CACHE_TTL_MS - SAFE_MARGIN_MS
+}
+
+// Whether any subagent or teammate is still working. A failed lookup counts as busy: not compacting is the safe side.
+async function agentsBusy($: EngineInterface): Promise<boolean> {
+  try {
+    return (await $.agent.list()).some(a => BUSY_STATUSES.includes(a.status))
+  } catch {
+    return true
+  }
+}
+
+// What the timer callbacks need from the options.
+type Guard = { lang: Lang; idleMs: number; minContext: number }
+
+// Whether a timer callback armed at `epoch` still stands: cancelCompact moved the epoch, or the router was turned off.
+async function stale($: EngineInterface, epoch: number): Promise<boolean> {
+  return epoch !== timerEpoch || !(await read($, enabled))
+}
+
+// The idle compaction, a single re-check later while background agents run, never past the safe window.
+async function runIdle($: EngineInterface, g: Guard, epoch: number, rechecked: boolean): Promise<void> {
+  compactTimer = null
+  if (await stale($, epoch)) return
+  const now = await $.clock.now()
+  if (!idleDue(now, g.minContext)) return
+  if (await agentsBusy($)) {
+    if (await stale($, epoch)) return
+    if (!rechecked && lastMain !== null && now + AGENT_RECHECK_MS - lastMain.at <= CACHE_TTL_MS - SAFE_MARGIN_MS) {
+      compactTimer = $.clock.after(AGENT_RECHECK_MS, () => void runIdle($, g, epoch, true).catch(() => {}))
+    }
+    return
+  }
+  if (await stale($, epoch)) return
+  await compactMain($, g.lang, 'idle')
+}
+
+function armIdle($: EngineInterface, g: Guard) {
+  if (g.idleMs <= 0) return
+  const epoch = timerEpoch
+  compactTimer = $.clock.after(g.idleMs, () => void runIdle($, g, epoch, false).catch(() => {}))
+}
+
+// The cap compaction, retried when refused; if it never lands, the idle guard takes over for this turn.
+async function runCap($: EngineInterface, g: Guard, epoch: number, attempt: number): Promise<void> {
+  compactTimer = null
+  if (await stale($, epoch)) return
+  const outcome = await compactMain($, g.lang, 'cap')
+  if (outcome === 'done') return
+  if (outcome === 'rejected' && attempt < CAP_RETRIES) {
+    compactTimer = $.clock.after(CAP_RETRY_MS, () => void runCap($, g, epoch, attempt + 1).catch(() => {}))
+    return
+  }
+  if (epoch === timerEpoch) armIdle($, g)
 }
 
 export const register: Register = (on, options) => {
@@ -381,7 +539,19 @@ export const register: Register = (on, options) => {
   const blockFable = options.blockFable !== false
   // Empty (the default) leaves the reviewer off.
   const reviewModel = String(options.reviewModel ?? '').trim()
+  // Minutes of idle after which the main context is compacted while the cache is still warm; 0 (the default) is off.
+  // Outside 1 to 55 counts as off, not clamped: 56 or more cannot fire safely inside the TTL, and silently turning 90
+  // into 55 would compact sessions the person meant to leave alone.
+  const idleMinutes = Number(options.idleCompactMinutes ?? 0)
+  const idleMs = Number.isFinite(idleMinutes) && idleMinutes >= IDLE_MIN_MINUTES && idleMinutes <= IDLE_MAX_MINUTES ? idleMinutes * 60_000 : 0
+  // A smaller context is not worth a summarizer call: the rewrite it would save is cheap anyway.
+  const compactMinContext = Number(options.compactMinContext ?? 100_000)
+  // Token count at which the main context is compacted between turns; 0 (the default) is off. Below 100,000 counts as
+  // off, like the engine's own autoCompactWindow range (100,000 to 1,000,000): a smaller cap would compact every turn.
+  const compactAtContext = Number(options.compactAtContext ?? 0)
+  const capOn = Number.isFinite(compactAtContext) && compactAtContext >= CAP_MIN_CONTEXT
   const str = STR[lang]
+  const guard: Guard = { lang, idleMs, minContext: compactMinContext }
 
   on('session.start', async ($, e, next) => {
     await restore($)
@@ -422,11 +592,21 @@ export const register: Register = (on, options) => {
     const arg = e.args.trim()
     if (arg === 'stats' || arg === '') return { text: await statsText($) }
     if (arg !== 'on' && arg !== 'off') return { text: 'Usage: /model-router stats | on | off' }
+    // setEnabled cancels a pending compaction when switching off.
     await setEnabled($, arg === 'on')
     return { text: `Model router ${arg === 'on' ? 'enabled' : 'disabled'}.` }
   })
 
+  // Every compaction of the main conversation: the plugin's own, a manual /compact and the engine's auto-compact. The
+  // old context figures are stale after any of them, and a pending timer would compact a summary.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && result.skip === undefined) forgetContext()
+    return result
+  })
+
   on('prompt.submit', async ($, e, next) => {
+    cancelCompact()
     const origin = e.origin as typeof e.origin | undefined
     // A prompt typed into a running turn joins that turn's route.
     if (!(await read($, enabled)) || !isPersonOrigin(origin) || e.turnId !== undefined || e.text.trim() === '') {
@@ -468,6 +648,7 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     // A subagent's or teammate's run is not a main turn: it neither takes the pending route nor inherits one.
     if (e.agentId !== undefined) return next(e)
+    cancelCompact()
     if (pending) {
       const r = { ...pending, turnId: e.turnId }
       pending = null
@@ -534,6 +715,21 @@ export const register: Register = (on, options) => {
       const switched = isMain && isSwitchStep(last, key, now)
       await record($, u.model || model, u, switched)
       if (isMain) {
+        // A cache rewrite after the TTL: the person was away over an hour and the whole context was written again.
+        // Also the first request of this process (a --resume): nothing was read from the cache and a big context was
+        // written. Not right after a compaction, whose summary is written fresh.
+        const afterGap = lastMain !== null && now - lastMain.at > CACHE_TTL_MS
+        const coldStart = lastMain === null && !justCompacted && u.cache_read_input_tokens < COLD_READ_TOKENS
+        if ((afterGap || coldStart) && u.cache_creation_input_tokens >= REWRITE_MIN_TOKENS) {
+          const cost = (u.cache_creation_input_tokens * PRICES[key].write) / 1e6
+          await count($, c => ({
+            ...c,
+            cacheExpiryRewrites: (c.cacheExpiryRewrites ?? 0) + 1,
+            cacheExpiryRewriteCost: (c.cacheExpiryRewriteCost ?? 0) + cost,
+          }))
+        }
+        justCompacted = false
+        lastMain = { at: now, context: tokensOf(u) - u.output_tokens }
         if (key !== 'fable') last = { model: key, at: now, context: tokensOf(u) - u.output_tokens }
         turnSteps += 1
         turnOutput += u.output_tokens
@@ -683,6 +879,16 @@ export const register: Register = (on, options) => {
     }
     if (e.agentId === undefined && !e.isAborted && r && r.turnId === e.turnId && r.model === 'opus' && (await read($, enabled))) {
       void maybeReview($, lang, reviewModel, pendingPrompt, e.answer)
+    }
+    if (e.agentId === undefined && (capOn || idleMs > 0) && (await read($, enabled))) {
+      cancelCompact()
+      if (capOn && lastMain !== null && lastMain.context >= compactAtContext) {
+        // The hook runs as the turn ends and compact rejects while a turn runs, so it goes on the next tick of the clock.
+        const epoch = timerEpoch
+        compactTimer = $.clock.after(0, () => void runCap($, guard, epoch, 0).catch(() => {}))
+      } else {
+        armIdle($, guard)
+      }
     }
     return done
   })

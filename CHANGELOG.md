@@ -3,6 +3,31 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-10-29
+
+Compaction guards against the 1-hour cache TTL, and a counter that shows what the expiry costs. Everything new is off
+by default (the counter only observes).
+
+### Added
+- `idleCompactMinutes` (default 0 = off; 1 to 55, anything else counts as off): after that many idle minutes at the
+  prompt, compact the main conversation while the cache is still warm, if the last main request's context is at least
+  `compactMinContext` (new, default 100,000) and was at least 3 minutes inside the cache TTL. A new prompt or turn, or
+  switching the router off, cancels the timer. It never runs while a subagent or teammate is pending, running or
+  waiting: one re-check 5 minutes later while still inside the safe window, then it skips.
+- `compactAtContext` (default 0 = off; below 100,000 also counts as off): compact between turns when the main context
+  reaches this many tokens. A refused compaction is retried up to 3 times, 2 seconds apart, then falls back to the
+  idle guard.
+- Every compaction (the plugin's, a manual `/compact`, the engine's auto-compact) resets the router's cached context
+  figures and cancels a pending compaction, so a summarised context is no longer kept on Opus as if it were warm.
+- A compaction that is vetoed, or refused while a turn runs, is swallowed and not counted; a successful one shows a
+  toast with the engine's before and after sizes when it reports them.
+- The main thread's context is now tracked for every model family in its own variable, Fable included (`last` still
+  skips Fable, which `keepWarm` never routes).
+- `/model-router stats` counts idle compactions, cap compactions, and cache rewrites after the TTL (a main request after
+  a gap over an hour, or the first request of a resumed process, that wrote 100k or more tokens and read almost none)
+  with their write cost. A resume after the 1-hour TTL rewrites the whole context at 2x input: a 400k Opus context
+  costs about $3.20 to rewrite against about $0.08 to read warm. Older stored counts read as 0.
+
 ## [0.8.2] - 2026-10-29
 
 Fable blocking is now optional and counted honestly, the classifier fails less often, and it is skipped when its

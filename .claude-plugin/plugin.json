@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "description": "Routes every Claude Code turn to the cheapest model that can do it well (Haiku lookups, Sonnet execution, Opus decisions), lets the model escalate itself, routes subagents too, keeps a warm cache when switching would cost more, and shows how much you saved vs all-Opus. Classification runs on your own Anthropic account; no third party sees your prompts.",
   "author": {
     "name": "hhchuan89"
@@ -52,6 +52,28 @@
       "title": "Decision reviewer",
       "description": "Optional: reviews Opus's decisions with a model id available on your account, only if it exists there (checked daily). The reviewer is sent your request and Opus's answer unmasked. Empty (the default) turns the review off. Fable 5.1 is never used.",
       "default": ""
+    },
+    "idleCompactMinutes": {
+      "type": "number",
+      "title": "Idle compact after (minutes)",
+      "description": "0 (the default) is off. 1 to 55: after this many idle minutes at the prompt, compact the main conversation while the 1-hour prompt cache is still warm, so coming back later rewrites a small context instead of a huge one. Only when the context is at least the Compact minimum context and no background agent is running; a new prompt cancels it. 56 or more cannot fire safely inside the cache window (a 5-minute margin) and counts as off.",
+      "default": 0,
+      "min": 0,
+      "max": 55
+    },
+    "compactMinContext": {
+      "type": "number",
+      "title": "Compact minimum context (tokens)",
+      "description": "The idle compact only runs when the main context is at least this many tokens; a smaller one is cheap to rewrite and not worth a summary.",
+      "default": 100000,
+      "min": 0
+    },
+    "compactAtContext": {
+      "type": "number",
+      "title": "Compact at context (tokens)",
+      "description": "0 (the default) is off; below 100000 also counts as off (the engine's own auto-compact window starts there). Otherwise, when a main turn ends with the context at or above this many tokens (for example 200000), compact it between turns while the cache is warm, so each later step does not re-read a huge cache.",
+      "default": 0,
+      "min": 0
     }
   }
 }

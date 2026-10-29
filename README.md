@@ -103,6 +103,32 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    no review call and no availability probe. Fable 5.1 is never used as the reviewer.
 8. **Check the routing took effect.** After each request the router compares the model family that answered with the
    family it asked for; any difference is counted as a model mismatch in `/model-router stats`.
+9. **Compaction guards (off by default).** Prompt caching uses a 1-hour TTL: resume a session after more than an hour
+   idle and the next request rewrites the whole context into the cache at 2x input price. A 400k-token Opus context
+   costs about $3.20 to rewrite, against about $0.08 to read while the cache is warm. Two options act on the main
+   thread's context, tracked for every model family including Fable:
+   - `idleCompactMinutes` (1 to 55): after that many idle minutes at the prompt the router calls `/compact` itself,
+     while the cache is still warm, so the eventual rewrite is of a summary, not the whole context. It runs only if
+     the last main request's context is at least `compactMinContext` (default 100,000 tokens), that request was at
+     least 3 minutes inside the cache TTL, and no subagent or teammate is pending, running or waiting. If one is,
+     the router checks once more 5 minutes later (only while still inside that safe window) and otherwise skips.
+     Any new prompt or turn cancels the timer, so a person who comes back is never compacted under; so does turning
+     the router off. Values outside 1 to 55 count as off (not clamped): 56 or more cannot fire safely inside the
+     cache window.
+   - `compactAtContext` (tokens, e.g. 200000): when a main turn ends with the context at or above this figure it is
+     compacted between turns, while the cache is warm, so later steps do not each re-read a huge cache. A value
+     below 100,000 counts as off (the engine's own auto-compact window starts there). If the compaction is refused
+     because the turn still counts as running, it is retried up to 3 times, 2 seconds apart; if it never lands the
+     idle guard (if set) takes over.
+
+   After any compaction (this plugin's, a manual `/compact`, or the engine's auto-compact) the router forgets its
+   cached context figure, cancels any pending compaction, and stops treating the cache as warm for model switching.
+   A compaction another plugin vetoes, or one refused because a turn is running, is silently skipped and not counted.
+   Each compaction that happens shows a one-line toast with the size compacted (before and after, when the engine
+   reports both). `/model-router stats` counts both kinds, and also counts **cache rewrites after the TTL** (a main
+   request after a gap over an hour, or the first request after `claude --resume`, that wrote 100k or more tokens of
+   cache and read almost none) with what those writes cost, whether or not a guard is on, so you can see what the
+   guard would save.
 
 ## Events log
 
@@ -181,6 +207,9 @@ but leave your own conversation alone, turn `mainRouting` off instead (see Optio
 | `blockFable` | on | On: Fable never runs on a subagent, and not on the main thread while `mainRouting` is on (those requests run on Opus); with `mainRouting` off your main model is left alone and only subagents are kept off Fable. Off: Fable is left alone everywhere, so Fable can be your main model; a subagent still never runs above its parent |
 | `haikuModel` / `sonnetModel` / `opusModel` | `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` | Model ids per tier |
 | `reviewModel` | empty (off) | A model id available on your account that reviews Opus decisions, only if it exists there; Fable 5.1 is never used. **The reviewer is sent your request and Opus's answer unmasked** (see Privacy) |
+| `idleCompactMinutes` | `0` (off) | 1 to 55: compact the main conversation after this many idle minutes, while the cache is still warm, the context is at least `compactMinContext` and no background agent is running. A new prompt cancels it. Out-of-range values (including 56 or more) count as off |
+| `compactMinContext` | `100000` | Tokens: the idle compact is skipped below this context size (a small context is cheap to rewrite) |
+| `compactAtContext` | `0` (off) | Tokens (e.g. `200000`): compact between turns when the main context reaches this, so every step does not re-read a huge cache. Below `100000` counts as off |
 
 ## Assumptions in the meter
 
