@@ -1466,3 +1466,444 @@ describe('classifier skipped on a warm large Opus context (v0.8.2)', () => {
     expect(seen.asked).toEqual(['haiku', 'haiku'])
   })
 })
+
+describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
+  const MIN = 60_000
+  const done = (turnId: string, agentId?: string) =>
+    ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, agentId, text: 'ok', reason: 'completed' }) as never
+
+  // The engine's side of $.session.compact and $.ui.toast: what each was asked, and how compact answers.
+  // c.agents is what $.agent.list answers (statuses only); c.rejects makes the first n compact calls reject.
+  function compactWorld($: any, on: any, how: 'ok' | 'reject' | 'skip' = 'ok', drop = false) {
+    const seen = world($, on, '{"tier":"execute","reason":"x"}', { drop })
+    const c = {
+      instructions: [] as (string | undefined)[],
+      toasts: [] as string[],
+      agents: [] as string[],
+      rejects: how === 'reject' ? Infinity : 0,
+      sizes: {} as { tokensBefore?: number; tokensAfter?: number },
+    }
+    on('session.compact', async (_$: unknown, e: { instructions?: string }) => {
+      c.instructions.push(e.instructions)
+      if (c.rejects > 0) {
+        c.rejects -= 1
+        throw new Error('a turn is running')
+      }
+      return how === 'skip' ? { skip: 'vetoed' } : { messages: [{ role: 'user', text: 'summary', toolUses: [] }], ...c.sizes }
+    })
+    on('agent.list', async () => ({
+      value: c.agents.map((status, i) => ({ id: `agent-${i}`, description: 'd', type: 'general-purpose', status })),
+    }))
+    on('ui.toast', async (_$: unknown, e: { text: string }) => {
+      c.toasts.push(e.text)
+      return { value: undefined }
+    })
+    return { seen, c }
+  }
+
+  // One main turn with a given context (a read-only usage of `context` tokens plus 500 output), then its completion.
+  async function mainTurn($: any, seen: Seen, turnId: string, context: number, model = 'claude-opus-5-5') {
+    await $.prompt.submit({ text: 'work on it' } as never)
+    seen.usage.push(U(1000, 500, context - 1000, 0, model))
+    await step($, turnId, model === 'claude-opus-5-5' ? undefined : `${model}[1m]`)
+    await $.turn.complete(done(turnId))
+  }
+
+  test('off by default: no timer is set and nothing compacts, however long the idle', async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 300_000)
+    await seen.clock.advance(24 * 60 * MIN)
+    expect(c.instructions).toEqual([])
+    const text = await statsOf($)
+    expect(text).toContain('Compactions at idle (cache warm): 0')
+    expect(text).toContain('Compactions at the context cap: 0')
+  })
+
+  test('fires after N minutes when the context is big enough, with short instructions, a toast and a count', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 250_000)
+    await seen.clock.advance(19 * MIN)
+    expect(c.instructions).toEqual([])
+    await seen.clock.advance(2 * MIN)
+    expect(c.instructions).toHaveLength(1)
+    expect(c.instructions[0]).toContain('current task')
+    expect(c.toasts).toHaveLength(1)
+    expect(c.toasts[0]).toContain('250.0k')
+    expect(await statsOf($)).toContain('Compactions at idle (cache warm): 1')
+    // It does not repeat: the context is small now and the timer was one-shot.
+    await seen.clock.advance(60 * MIN)
+    expect(c.instructions).toHaveLength(1)
+  })
+
+  test('a new prompt cancels the pending compaction', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 250_000)
+    await seen.clock.advance(10 * MIN)
+    await $.prompt.submit({ text: 'I am back' } as never)
+    await seen.clock.advance(30 * MIN)
+    expect(c.instructions).toEqual([])
+  })
+
+  // A held-back prompt starts no turn, so turn.start never cancels: prompt.submit has to.
+  test('a prompt held back by another plugin still cancels the pending compaction', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on, 'ok', true)
+    await $.turn.complete(done('t0'))
+    seen.usage.push(U(1000, 500, 250_000, 0))
+    await step($, 't0')
+    await $.turn.complete(done('t0'))
+    await $.prompt.submit({ text: 'I am back' } as never)
+    await seen.clock.advance(30 * MIN)
+    expect(c.instructions).toEqual([])
+  })
+
+  test('a context below compactMinContext is not compacted', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 99_000)
+    await seen.clock.advance(30 * MIN)
+    expect(c.instructions).toEqual([])
+  })
+
+  test('compactMinContext is configurable', { options: { idleCompactMinutes: 20, compactMinContext: 20_000 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 30_000)
+    await seen.clock.advance(30 * MIN)
+    expect(c.instructions).toHaveLength(1)
+  })
+
+  test('a compact that rejects (a turn is running) is swallowed: nothing counted, no toast', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on, 'reject')
+    await mainTurn($, seen, 't1', 250_000)
+    await seen.clock.advance(30 * MIN)
+    expect(c.instructions).toHaveLength(1)
+    expect(c.toasts).toEqual([])
+    expect(await statsOf($)).toContain('Compactions at idle (cache warm): 0')
+  })
+
+  test('a vetoed compact ({ skip }) is not a compaction', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on, 'skip')
+    await mainTurn($, seen, 't1', 250_000)
+    await seen.clock.advance(30 * MIN)
+    expect(c.instructions).toHaveLength(1)
+    expect(c.toasts).toEqual([])
+    expect(await statsOf($)).toContain('Compactions at idle (cache warm): 0')
+  })
+
+  test('a subagent turn completing does not arm the guard', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await $.turn.complete(done('sub', 'agent-1'))
+    await seen.clock.advance(30 * MIN)
+    expect(c.instructions).toEqual([])
+  })
+
+  test('the cap compacts between turns when the context is at or above it', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 199_000)
+    await seen.clock.advance(0)
+    expect(c.instructions).toEqual([])
+    await mainTurn($, seen, 't2', 200_000)
+    await seen.clock.advance(0)
+    expect(c.instructions).toHaveLength(1)
+    expect(c.toasts[0]).toContain('200.0k')
+    const text = await statsOf($)
+    expect(text).toContain('Compactions at the context cap: 1')
+    expect(text).toContain('Compactions at idle (cache warm): 0')
+  })
+
+  test('the cap does not re-trigger on stale data: the next turn is judged on its own context', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 300_000)
+    await seen.clock.advance(0)
+    expect(c.instructions).toHaveLength(1)
+    await mainTurn($, seen, 't2', 30_000)
+    await seen.clock.advance(0)
+    expect(c.instructions).toHaveLength(1)
+  })
+
+  // WHY: `last` skips Fable, and blockFable off makes a Fable main thread the target user of these guards.
+  test('a Fable main thread with blockFable off is still tracked: the cap fires on its context', { options: { blockFable: false, compactAtContext: 200_000 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 250_000, 'claude-fable-5-1')
+    await seen.clock.advance(0)
+    expect(c.instructions).toHaveLength(1)
+  })
+
+  test('a Fable main thread with blockFable off: the idle guard fires too', { options: { blockFable: false, idleCompactMinutes: 30 } }, async ($, on) => {
+    const { seen, c } = compactWorld($, on)
+    await mainTurn($, seen, 't1', 250_000, 'claude-fable-5-1')
+    await seen.clock.advance(31 * MIN)
+    expect(c.instructions).toHaveLength(1)
+  })
+
+  describe('cache-expiry rewrites', () => {
+    test('counted, with the write cost, when the gap is past the TTL and the write is 100k or more', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'first' } as never)
+      seen.usage.push(U(1000, 500, 200_000, 0))
+      await step($, 't1')
+      await seen.clock.advance(CACHE_TTL_MS + 1000)
+      seen.usage.push(U(1000, 500, 0, 300_000))
+      await step($, 't1')
+      const text = await statsOf($)
+      // 300,000 tokens at Opus's $8 per million cache write.
+      expect(text).toContain('Cache rewrites after the TTL (100k+ tokens): 1, costing $2.40')
+    })
+
+    test('not counted inside the TTL, below 100k written, or for a first request that read from the cache', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'first' } as never)
+      seen.usage.push(U(1000, 500, 5000, 300_000))
+      await step($, 't1')
+      seen.usage.push(U(1000, 500, 0, 300_000))
+      await seen.clock.advance(CACHE_TTL_MS - 1000)
+      await step($, 't1')
+      await seen.clock.advance(CACHE_TTL_MS + 1000)
+      seen.usage.push(U(1000, 500, 0, 99_999))
+      await step($, 't1')
+      expect(await statsOf($)).toContain('Cache rewrites after the TTL (100k+ tokens): 0, costing $0.00')
+    })
+
+    test('a subagent request is not a main-thread rewrite', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'first' } as never)
+      seen.usage.push(U(1000, 500, 200_000, 0))
+      await step($, 't1')
+      await seen.clock.advance(CACHE_TTL_MS + 1000)
+      seen.usage.push(U(1000, 500, 0, 300_000))
+      await step($, 'sub', 'claude-sonnet-5-5', 'agent-1')
+      expect(await statsOf($)).toContain('Cache rewrites after the TTL (100k+ tokens): 0')
+    })
+
+    test('a Fable main thread counts too', { options: { blockFable: false } }, async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'first' } as never)
+      seen.usage.push(U(1000, 500, 200_000, 0, 'claude-fable-5-1'))
+      await step($, 't1', 'claude-fable-5-1[1m]')
+      await seen.clock.advance(CACHE_TTL_MS + 1000)
+      seen.usage.push(U(1000, 500, 0, 150_000, 'claude-fable-5-1'))
+      await step($, 't1', 'claude-fable-5-1[1m]')
+      // 150,000 tokens at Fable's $20 per million cache write.
+      expect(await statsOf($)).toContain('Cache rewrites after the TTL (100k+ tokens): 1, costing $3.00')
+    })
+  })
+
+  describe('cache-expiry rewrites in a new process (fix 7)', () => {
+    test('the first main request with a cold cache and a big write counts (a --resume)', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'resumed' } as never)
+      seen.usage.push(U(1000, 500, 200, 400_000))
+      await step($, 't1')
+      // 400,000 tokens at Opus's $8 per million cache write.
+      expect(await statsOf($)).toContain('Cache rewrites after the TTL (100k+ tokens): 1, costing $3.20')
+    })
+
+    test('not counted right after a compaction this process saw, then counted again for a later cold start', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'first' } as never)
+      seen.usage.push(U(1000, 500, 200_000, 0))
+      await step($, 't1')
+      await $.session.compact({ messages: [{ role: 'user', text: 'hi', toolUses: [] }] } as never)
+      // The summary is written fresh: a big write with no read is not an expiry.
+      seen.usage.push(U(1000, 500, 0, 150_000))
+      await step($, 't1')
+      expect(await statsOf($)).toContain('Cache rewrites after the TTL (100k+ tokens): 0')
+      // The flag cleared on that request: after another gap it counts as usual.
+      await seen.clock.advance(CACHE_TTL_MS + 1000)
+      seen.usage.push(U(1000, 500, 0, 150_000))
+      await step($, 't1')
+      expect(await statsOf($)).toContain('Cache rewrites after the TTL (100k+ tokens): 1')
+    })
+  })
+
+  describe('compaction resets routing state (fix 1)', () => {
+    test('a manual /compact clears the warm-cache memory: the next prompt is classified and not kept on Opus', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await $.session.compact({ messages: [{ role: 'user', text: 'hi', toolUses: [] }] } as never)
+      await $.prompt.submit({ text: 'rename a variable' } as never)
+      // Classifier ran (execute -> sonnet) instead of the warm-Opus skip.
+      expect(seen.asked).toContain('haiku')
+      await step($, 't2')
+      expect(seen.steps.at(-1)!.model).toContain('sonnet')
+    })
+
+    test("the plugin's own compaction clears it too", { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(21 * MIN)
+      expect(c.instructions).toHaveLength(1)
+      await $.prompt.submit({ text: 'rename a variable' } as never)
+      expect(seen.asked).toContain('haiku')
+      await step($, 't2')
+      expect(seen.steps.at(-1)!.model).toContain('sonnet')
+    })
+
+    test('a vetoed compaction ({ skip }) resets nothing', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on, 'skip')
+      await mainTurn($, seen, 't1', 250_000)
+      await $.session.compact({ messages: [{ role: 'user', text: 'hi', toolUses: [] }] } as never)
+      await seen.clock.advance(21 * MIN)
+      // The idle timer was not cancelled by the veto: it fired (and was itself vetoed).
+      expect(c.instructions).toHaveLength(2)
+    })
+
+    test('a manual compaction cancels a pending idle timer', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(5 * MIN)
+      await $.session.compact({ messages: [{ role: 'user', text: 'hi', toolUses: [] }] } as never)
+      await seen.clock.advance(60 * MIN)
+      expect(c.instructions).toHaveLength(1)
+    })
+  })
+
+  describe('background agents (fix 2)', () => {
+    test('a running agent blocks the idle compaction; the single re-check compacts once it is done', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.agents = ['running', 'completed']
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(21 * MIN)
+      expect(c.instructions).toEqual([])
+      c.agents = ['completed', 'idle', 'failed', 'killed']
+      await seen.clock.advance(5 * MIN)
+      expect(c.instructions).toHaveLength(1)
+    })
+
+    for (const status of ['pending', 'waiting']) {
+      test(`${status} also blocks, and a second busy check gives up`, { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+        const { seen, c } = compactWorld($, on)
+        c.agents = [status]
+        await mainTurn($, seen, 't1', 250_000)
+        await seen.clock.advance(60 * MIN)
+        expect(c.instructions).toEqual([])
+      })
+    }
+
+    test('no re-check when it would fall outside the safe window', { options: { idleCompactMinutes: 53 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.agents = ['running']
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(53 * MIN + 1000)
+      c.agents = []
+      await seen.clock.advance(10 * MIN)
+      expect(c.instructions).toEqual([])
+    })
+  })
+
+  describe('compactAtContext floor (fix 3)', () => {
+    test('a value below 100000 counts as off', { options: { compactAtContext: 50_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 90_000)
+      await seen.clock.advance(0)
+      expect(c.instructions).toEqual([])
+    })
+
+    test('exactly 100000 is on', { options: { compactAtContext: 100_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 100_000)
+      await seen.clock.advance(0)
+      expect(c.instructions).toHaveLength(1)
+    })
+  })
+
+  describe('cap retry (fix 4)', () => {
+    test('a rejection is retried every 2 seconds, up to 3 retries, then it stops', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on, 'reject')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      expect(c.instructions).toHaveLength(1)
+      await seen.clock.advance(2000)
+      expect(c.instructions).toHaveLength(2)
+      await seen.clock.advance(2000)
+      await seen.clock.advance(2000)
+      expect(c.instructions).toHaveLength(4)
+      await seen.clock.advance(60_000)
+      expect(c.instructions).toHaveLength(4)
+      expect(c.toasts).toEqual([])
+      expect(await statsOf($)).toContain('Compactions at the context cap: 0')
+    })
+
+    test('succeeds on a retry', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.rejects = 2
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      await seen.clock.advance(4000)
+      expect(c.instructions).toHaveLength(3)
+      expect(await statsOf($)).toContain('Compactions at the context cap: 1')
+    })
+
+    test('a new prompt cancels the retries', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on, 'reject')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      await $.prompt.submit({ text: 'back' } as never)
+      await seen.clock.advance(60_000)
+      expect(c.instructions).toHaveLength(1)
+    })
+
+    test('when the cap compaction never lands, the idle timer is armed', { options: { compactAtContext: 200_000, idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.rejects = 4
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(6000)
+      expect(c.instructions).toHaveLength(4)
+      await seen.clock.advance(21 * MIN)
+      expect(c.instructions).toHaveLength(5)
+    })
+  })
+
+  describe('TTL margin (fix 5)', () => {
+    // 56 and above is refused by plugin.json (max 55) before the hooks module loads, so only the edge is testable here.
+    test('55 minutes, the longest setting, still fires', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(55 * MIN)
+      expect(c.instructions).toHaveLength(1)
+    })
+  })
+
+  describe('enabled at fire time (fix 6)', () => {
+    test('turning the router off cancels a pending idle compaction', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await $.command.run({ command: 'model-router', args: 'off' } as never)
+      await seen.clock.advance(30 * MIN)
+      expect(c.instructions).toEqual([])
+    })
+
+    test('turning it off during the cap retries stops them', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on, 'reject')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      await $.command.run({ command: 'model-router', args: 'off' } as never)
+      await seen.clock.advance(60_000)
+      expect(c.instructions).toHaveLength(1)
+    })
+  })
+
+  describe('toast sizes (fix 8)', () => {
+    test('uses the engine figures, before and after', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.sizes = { tokensBefore: 412_000, tokensAfter: 31_000 }
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      expect(c.toasts[0]).toContain('412.0k → 31.0k')
+    })
+
+    test('falls back to the last request when the engine gives none', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      expect(c.toasts[0]).toContain('250.0k')
+      expect(c.toasts[0]).not.toContain('→')
+    })
+  })
+
+  test('counts stored by an older version (no new fields) still read as 0', async ($, on) => {
+    const seen = world($, on, null, {
+      store: { counts: { turns: { lookup: 0, execute: 0, decide: 0 }, escalations: 0, cacheKeeps: 0, subagents: { haiku: 0, sonnet: 0, opus: 0 }, fableBlocked: 0 } },
+    })
+    expect(seen).toBeDefined()
+    expect(await statsOf($)).toContain('Compactions at idle (cache warm): 0')
+  })
+})
