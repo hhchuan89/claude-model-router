@@ -3,7 +3,7 @@ import type { Effort, ModelKey, Route, Tier } from '../types'
 export const TIER_ROUTE: Record<Tier, { model: ModelKey; effort: Effort }> = {
   lookup: { model: 'haiku', effort: 'medium' },
   execute: { model: 'sonnet', effort: 'medium' },
-  decide: { model: 'opus', effort: 'high' },
+  decide: { model: 'opus', effort: 'medium' },
 }
 
 const MODEL_RANK: Record<ModelKey, number> = { haiku: 0, sonnet: 1, opus: 2 }
@@ -132,7 +132,7 @@ export function assignmentContext(r: Route): string {
   const head = `[model-router] This turn is assigned to ${r.model} at ${r.effort} effort (tier: ${r.tier}${r.reason ? ` — ${r.reason}` : ''}).`
   const opus =
     r.model === 'opus'
-      ? `You are on opus. Decide the effort this task needs; if it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work.`
+      ? `You are on opus at ${r.effort} effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed. If it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work.`
       : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews, anything irreversible) must be made on opus. If the task is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. If it fits, just start.`
   return `${head}\n${opus}\nEscalation only goes up within a turn; never call it to go down.`
 }
