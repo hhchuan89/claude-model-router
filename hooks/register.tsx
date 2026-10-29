@@ -484,8 +484,11 @@ async function agentsBusy($: EngineInterface): Promise<boolean> {
 type Guard = { lang: Lang; idleMs: number; minContext: number }
 
 // Whether a timer callback armed at `epoch` still stands: cancelCompact moved the epoch, or the router was turned off.
+// The epoch is compared after the read too: a cancel that lands while the read is pending must still win.
 async function stale($: EngineInterface, epoch: number): Promise<boolean> {
-  return epoch !== timerEpoch || !(await read($, enabled))
+  if (epoch !== timerEpoch) return true
+  const on = await read($, enabled)
+  return epoch !== timerEpoch || !on
 }
 
 // The idle compaction, a single re-check later while background agents run, never past the safe window.
@@ -705,6 +708,8 @@ export const register: Register = (on, options) => {
         await count($, c => ({ ...c, fableBlocked: c.fableBlocked + 1 }))
       }
     }
+    // When the request was sent: the cache is touched then, and a long streamed response must not stretch the TTL.
+    const sentAt = isMain ? await $.clock.now() : 0
     const result =
       model === e.model && effort === e.effort ? yield* next(e) : yield* next({ ...e, model, effort })
     const u = result?.usage
@@ -717,8 +722,11 @@ export const register: Register = (on, options) => {
       if (isMain) {
         // A cache rewrite after the TTL: the person was away over an hour and the whole context was written again.
         // Also the first request of this process (a --resume): nothing was read from the cache and a big context was
-        // written. Not right after a compaction, whose summary is written fresh.
-        const afterGap = lastMain !== null && now - lastMain.at > CACHE_TTL_MS
+        // written. Not right after a compaction, whose summary is written fresh. After a gap, the write must also
+        // outweigh the read: a big read means a warm prefix survived (say a background fork kept it), and the
+        // write is new input, not expiry.
+        const afterGap =
+          lastMain !== null && sentAt - lastMain.at > CACHE_TTL_MS && u.cache_read_input_tokens < u.cache_creation_input_tokens
         const coldStart = lastMain === null && !justCompacted && u.cache_read_input_tokens < COLD_READ_TOKENS
         if ((afterGap || coldStart) && u.cache_creation_input_tokens >= REWRITE_MIN_TOKENS) {
           const cost = (u.cache_creation_input_tokens * PRICES[key].write) / 1e6
@@ -729,7 +737,7 @@ export const register: Register = (on, options) => {
           }))
         }
         justCompacted = false
-        lastMain = { at: now, context: tokensOf(u) - u.output_tokens }
+        lastMain = { at: sentAt, context: tokensOf(u) - u.output_tokens }
         if (key !== 'fable') last = { model: key, at: now, context: tokensOf(u) - u.output_tokens }
         turnSteps += 1
         turnOutput += u.output_tokens

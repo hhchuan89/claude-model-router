@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-10-29
+
+Three fixes to the 0.9.0 compaction guards, found by a second adversarial review (Codex, `codex exec review`).
+
+### Fixed
+- The idle guard measured the cache TTL from when a main request's response finished, not from when it was sent. A
+  response that streamed for 6 minutes let a 55-minute timer compact about 61 minutes after the cache was last
+  touched, paying the cold rewrite the guard exists to avoid. The guard now records the send time.
+- A new prompt that arrived while a pending idle or cap timer was reading the router's on/off state could not cancel
+  it: the cancellation check ran before that read. It now runs after the read as well.
+- The cache-rewrite counter counted any 100k+ write after an hour-long gap, even when the same request read a large
+  warm prefix (kept warm by a background fork, say), so new input was reported as expiry. After a gap the write must
+  now outweigh the read.
+
 ## [0.9.0] - 2026-10-29
 
 Compaction guards against the 1-hour cache TTL, and a counter that shows what the expiry costs. Everything new is off
