@@ -233,6 +233,10 @@ claude plugin validate .
 claude plugin test .
 ```
 
+## Contributors
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 ## License
 
 MIT
