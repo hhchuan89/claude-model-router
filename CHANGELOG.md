@@ -3,6 +3,41 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-10-29
+
+Four days of real use showed main-turn routing losing money overall: 19 times a turn returned to Opus within the hour
+and rewrote 200k-800k tokens of Opus cache, which cost far more than Sonnet or Haiku saved. This release stops that,
+and makes the meter say so honestly.
+
+### Fixed
+- **Round trips.** While the main thread's last request is within the cache TTL (1 hour) and its context is 50,000
+  tokens or more, the router never moves the main thread to a lower model; it keeps the warm one (`→ Opus (cache
+  kept)`). Below 50,000 tokens the earlier cost comparison still applies. Upgrades are never blocked.
+- **Notification turns.** A turn that starts without a person prompt (a task notification, an agent message, a
+  scheduled prompt) used to run unrouted on the session model, adding a round trip away from the routed model. It now
+  continues the previous main route while that route's cache is warm, and is logged as `turn inherit` rather than
+  `turn route`. Without a previous route, or after the TTL, it stays unrouted.
+- **Classifier fallback.** A failed classification no longer falls back to Sonnet (24% of those turns later escalated to
+  Opus, against 6% of classified turns). It keeps the previous turn's tier; on a first turn with nothing to keep, the
+  turn is left unrouted on the session model. A subagent's failed classification still runs on Sonnet.
+- **Meter baseline.** The "all on Opus" baseline ignored the cache writes a model switch causes, so the saving shown was
+  overstated. A main-thread step that changes model family within the TTL, going down or coming back up to Opus, now
+  has its cache writes priced at Opus's cache-read rate in the baseline. Actual cost is unchanged.
+- A subagent's or teammate's `turn.start` no longer takes the pending main route.
+
+### Added
+- `mainRouting` option (default on). Off is subagent-only mode, the low-risk way to start: no main-turn
+  classification and no main model or effort rewrite, while subagent routing, escalation, Fable blocking and the meter
+  keep working.
+- The classifier failure reason (`timeout`, `api-error <status>`, `empty-reply`, `unparseable`, `exception`) is shown in
+  the band, counted in `/model-router stats` ("Classifier failures"), and recorded in a subagent's start event.
+
+### Changed
+- The classifier timeout is 8 s (was 4 s).
+- With no route (a new session, or `mainRouting` off) the band no longer draws an empty route row with a lone gear: the
+  meter line takes that row, with the Disable or Enable button beside it. A fresh session now shows that row too.
+- The `turn route` event for an unrouted first-turn failure has `to: "session model"`.
+
 ## [0.6.1] - 2026-10-26
 
 ### Fixed
