@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { add, costOf, EMPTY, keepWarm, saved } from '../hooks/meter'
+import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
 import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { decideSpawn, escalateAgent, logDir, startOf, stepUp } from '../hooks/subagent'
 
@@ -98,13 +98,16 @@ type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text
 
 const IDS: Record<string, string> = { haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' }
 
+// null: the call timed out (aborted). { fail }: the API refused, or the reply had no text.
+type Reply = string | null | { fail: 'api-error' | 'empty-reply' }
+
 function world(
   $: any,
   on: any,
-  classifier: string | null | (string | null)[],
-  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[] } = {},
+  classifier: Reply | Reply[],
+  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown> } = {},
 ): Seen {
-  mock.store(on)
+  mock.store(on, opts.store)
   const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], prompts: [], usage: [], agents: [], files: {} }
   on('session.messages', async () => ({ value: (opts.messages ?? []).map(m => ({ ...m, toolUses: [] })) }))
   on('model.complete', async (_$: unknown, e: { model: string; prompt: string }) => {
@@ -113,6 +116,11 @@ function world(
     const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     if (e.model === 'haiku') {
       const reply = Array.isArray(classifier) ? (classifier.shift() ?? null) : classifier
+      if (reply !== null && typeof reply === 'object') {
+        return reply.fail === 'api-error'
+          ? { value: { isAnswered: false as const, reason: 'api-error' as const, status: 529, error: 'overloaded', usage } }
+          : { value: { isAnswered: false as const, reason: 'empty-reply' as const, usage } }
+      }
       return reply === null
         ? { value: { isAnswered: false as const, reason: 'aborted' as const, usage } }
         : { value: { isAnswered: true as const, text: reply, usage } }
@@ -223,11 +231,14 @@ test('Fable 5.1 never runs, not even in a subagent; other subagent models are le
   expect(seen.steps[1]!.model).toBe('claude-sonnet-5-5')
 })
 
-test('a classifier failure falls back to Sonnet at medium', async ($, on) => {
+// Changed from v0.6 ("falls back to Sonnet at medium"): 24% of the turns that fell back later escalated to Opus
+// (6% of classified ones), so a failed first classification now leaves the turn on the session's own model.
+test('a classifier failure on the first turn leaves the turn unrouted: the session model and effort, no assignment', async ($, on) => {
   const seen = world($, on, null)
   await $.prompt.submit({ text: 'do the thing' } as never)
+  expect(seen.submits[0]!.context).toBeUndefined()
   await step($, 't1')
-  expect(seen.steps[0]).toEqual({ model: 'claude-sonnet-5-5[1m]', effort: 'medium', agentId: undefined })
+  expect(seen.steps[0]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'high', agentId: undefined })
 })
 
 test('#opus in the message skips the classifier', async ($, on) => {
@@ -324,11 +335,12 @@ describe('meter', () => {
     expect(saved(t).pct).toBe(49)
   })
 
+  // Changed from v0.6: the haiku line used to follow the cost comparison; a 200k context is now never moved down.
   test('a downgrade keeps the warm model only when the cold read costs more', async () => {
     const shape = { steps: 5, output: 1000 }
     const warm = { model: 'opus' as const, at: 0, context: 200_000 }
     expect(keepWarm('sonnet', warm, 60_000, shape)).toBe('opus')
-    expect(keepWarm('haiku', warm, 60_000, shape)).toBe('haiku')
+    expect(keepWarm('haiku', warm, 60_000, shape)).toBe('opus')
     expect(keepWarm('sonnet', { ...warm, context: 5_000 }, 60_000, shape)).toBe('sonnet')
     expect(keepWarm('sonnet', warm, 2 * 3600_000, shape)).toBe('sonnet')
     expect(keepWarm('opus', { ...warm, model: 'sonnet' }, 60_000, shape)).toBe('opus')
@@ -735,16 +747,355 @@ test('the band speaks English by default', async ($, on) => {
   expect(await ui.find({ text: /vs all on Opus/ })).toBeDefined()
 })
 
-test('a classifier failure reads in English by default and in Chinese on request', async ($, on) => {
-  world($, on, null)
+// Changed from v0.6 ("classifier failed, defaulted to Sonnet"): the band names the reason and what happened instead.
+test('a classifier failure reads in English by default, and names the reason', async ($, on) => {
+  world($, on, ['{"tier":"decide","reason":"选方案"}', null])
+  await $.prompt.submit({ text: 'which design' } as never)
   await $.prompt.submit({ text: 'do the thing' } as never)
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /classifier failed, defaulted to Sonnet/ })).toBeDefined()
+  expect(await ui.find({ text: /classifier failed \(timeout\): kept previous tier/ })).toBeDefined()
 })
 
 test('language zh gives the Chinese band', { options: { language: 'zh' } }, async ($, on) => {
-  world($, on, null)
+  world($, on, ['{"tier":"decide","reason":"选方案"}', null])
+  await $.prompt.submit({ text: 'which design' } as never)
   await $.prompt.submit({ text: 'do the thing' } as never)
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /分类失败，默认 Sonnet/ })).toBeDefined()
+  expect(await ui.find({ text: /分类失败（timeout）：沿用上一档位/ })).toBeDefined()
+})
+
+// ---- v0.7: round trips, notification turns, classifier failures, honest baseline, mainRouting ----
+
+function eventsOf(seen: Seen): { agentId: string; event: string; to: string; reason: string }[] {
+  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-router/events-sess-1.json'))
+  return (JSON.parse(seen.files[file!]!) as { events: { agentId: string; event: string; to: string; reason: string }[] }).events
+}
+
+const decide = '{"tier":"decide","sure":true,"reason":"选方案"}'
+const execute = '{"tier":"execute","sure":true,"reason":"照方案实现"}'
+
+describe('round-trip guard', () => {
+  // WHY: 19 turns went back to Opus within the hour and rewrote 200k-800k tokens of Opus cache each time; that cost far
+  // more than the cheaper model saved. Past this size the router does not even ask what the cheaper model would save.
+  test('a warm context of WARM_CONTEXT_KEEP tokens or more is never moved down, even when the cost model says move', async () => {
+    expect(WARM_CONTEXT_KEEP).toBe(50_000)
+    // Output-heavy turns make the cost comparison favour Sonnet at 200k...
+    const heavy = { steps: 5, output: 100_000 }
+    const big = { model: 'opus' as const, at: 0, context: 200_000 }
+    expect(keepWarm('sonnet', { ...big, context: WARM_CONTEXT_KEEP - 1 }, 60_000, heavy)).toBe('sonnet')
+    // ...and the guard overrides it from the threshold up, for Sonnet and Haiku alike.
+    expect(keepWarm('sonnet', { ...big, context: WARM_CONTEXT_KEEP }, 60_000, heavy)).toBe('opus')
+    expect(keepWarm('haiku', big, 60_000, heavy)).toBe('opus')
+    // A Sonnet context is guarded the same way: Haiku does not take it.
+    expect(keepWarm('haiku', { ...big, model: 'sonnet' }, 60_000, heavy)).toBe('sonnet')
+  })
+
+  test('upgrades are never blocked, and a context past the TTL is cold so it may move down', async () => {
+    const shape = { steps: 5, output: 1000 }
+    const big = { model: 'sonnet' as const, at: 0, context: 400_000 }
+    expect(keepWarm('opus', big, 60_000, shape)).toBe('opus')
+    expect(keepWarm('sonnet', { ...big, model: 'opus' }, CACHE_TTL_MS, shape)).toBe('opus')
+    expect(keepWarm('sonnet', { ...big, model: 'opus' }, CACHE_TTL_MS + 1, shape)).toBe('sonnet')
+  })
+
+  // WHY: below the threshold a rewrite is cheap, so the old comparison still decides: a small context moves down,
+  // a mid-size one with several steps ahead of it stays.
+  test('below the threshold the cost comparison still decides', async () => {
+    const shape = { steps: 5, output: 1000 }
+    const opus = { model: 'opus' as const, at: 0, context: 5_000 }
+    expect(keepWarm('sonnet', opus, 60_000, shape)).toBe('sonnet')
+    expect(keepWarm('sonnet', { ...opus, context: 40_000 }, 60_000, shape)).toBe('opus')
+  })
+})
+
+test('a warm 200k-token Opus context is not downgraded to Sonnet for an execute turn', async ($, on) => {
+  // Output-heavy turns: on cost alone Sonnet would win, so only the guard keeps this turn on Opus.
+  const seen = world($, on, [decide, execute], { store: { shape: { steps: 5, output: 100_000 } } })
+  await $.prompt.submit({ text: 'which design' } as never)
+  seen.usage.push(U(2000, 800, 198_000, 0))
+  await step($, 't1')
+  await $.prompt.submit({ text: 'implement it' } as never)
+  expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus')
+  await step($, 't2')
+  expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5[1m]' })
+  const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await ui.find({ text: /Sonnet · medium → Opus \(cache kept\)/ })).toBeDefined()
+  const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+  expect(r.text).toContain('Kept on a warm cache: 1')
+})
+
+test('once the cache TTL has passed the same execute turn does move to Sonnet', async ($, on) => {
+  const seen = world($, on, [decide, execute], { store: { shape: { steps: 5, output: 100_000 } } })
+  await $.prompt.submit({ text: 'which design' } as never)
+  seen.usage.push(U(2000, 800, 198_000, 0))
+  await step($, 't1')
+  await seen.clock.advance(CACHE_TTL_MS + 1000)
+  await $.prompt.submit({ text: 'implement it' } as never)
+  expect(seen.submits[1]!.context?.[0]).toContain('assigned to sonnet')
+  await step($, 't2')
+  expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+})
+
+describe('turns without a person prompt', () => {
+  const notification = { text: '<task-notification>build finished</task-notification>', turnId: 'tn' } as never
+
+  // WHY: a background task's notification is not a person prompt, so it was never routed and ran on the session model:
+  // an extra round trip away from, and back to, the model the cache was on.
+  test('a task-notification turn after a Sonnet route runs on Sonnet: it inherits, it does not fall back to the session model', async ($, on) => {
+    const seen = world($, on, execute)
+    await $.prompt.submit({ text: 'build it' } as never)
+    seen.usage.push(U(1000, 200, 20_000, 0, 'claude-sonnet-5-5'))
+    await step($, 't1')
+    await $.turn.start(notification)
+    await step($, 'tn')
+    expect(seen.steps[1]).toEqual({ model: 'claude-sonnet-5-5[1m]', effort: 'medium', agentId: undefined })
+
+    // Logged as an inherit, not as a route; and it is not counted as a routed turn.
+    const log = eventsOf(seen)
+    expect(log.filter(ev => ev.event === 'turn route')).toHaveLength(1)
+    expect(log.filter(ev => ev.event === 'turn inherit')).toMatchObject([{ agentId: 'main', to: 'sonnet/medium', reason: 'continues previous route' }])
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('execute 1')
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ text: /Sonnet · medium — continues previous route/ })).toBeDefined()
+  })
+
+  test('an inherited turn keeps what the route had become: an escalated Opus stays Opus', async ($, on) => {
+    const seen = world($, on, execute)
+    await $.prompt.submit({ text: 'build it' } as never)
+    await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)
+    seen.usage.push(U(1000, 200, 20_000, 0, 'claude-opus-5-5'))
+    await step($, 't1')
+    await $.turn.start(notification)
+    await step($, 'tn', 'claude-sonnet-5-5')
+    expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' })
+  })
+
+  test('after the cache TTL an inherited turn stays unrouted: nothing warm is worth continuing', async ($, on) => {
+    const seen = world($, on, execute)
+    await $.prompt.submit({ text: 'build it' } as never)
+    seen.usage.push(U(1000, 200, 20_000, 0, 'claude-sonnet-5-5'))
+    await step($, 't1')
+    await seen.clock.advance(CACHE_TTL_MS + 1000)
+    await $.turn.start(notification)
+    await step($, 'tn')
+    expect(seen.steps[1]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'high', agentId: undefined })
+    expect(eventsOf(seen).filter(ev => ev.event === 'turn inherit')).toHaveLength(0)
+  })
+
+  test('with no previous route a notification turn stays unrouted, as before', async ($, on) => {
+    const seen = world($, on, execute)
+    await $.turn.start(notification)
+    await step($, 'tn')
+    expect(seen.steps[0]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'high', agentId: undefined })
+  })
+
+  // WHY: a subagent's own turn.start is not a main turn; inheriting there would rebind the main route to the agent's id.
+  test('a subagent run starting does not rebind the main route', async ($, on) => {
+    const seen = world($, on, execute)
+    await $.prompt.submit({ text: 'build it' } as never)
+    seen.usage.push(U(1000, 200, 20_000, 0, 'claude-sonnet-5-5'))
+    await step($, 't1')
+    await $.turn.start({ text: 'sub task', turnId: 'ta', agentId: 'agent-1' } as never)
+    expect(eventsOf(seen).filter(ev => ev.event === 'turn inherit')).toHaveLength(0)
+    await step($, 't1')
+    expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+  })
+})
+
+describe('classifier failures', () => {
+  // WHY: falling back to Sonnet on failure was wrong 24% of the time (those turns later escalated to Opus), against
+  // 6% for classified turns; the previous tier is the better guess, and it never downgrades.
+  test('a timeout keeps the previous tier, and the reason names timeout', async ($, on) => {
+    const seen = world($, on, [decide, null])
+    await $.prompt.submit({ text: 'which design' } as never)
+    await $.prompt.submit({ text: 'and the rest?' } as never)
+    expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at high')
+    expect(seen.submits[1]!.context?.[0]).toContain('classifier failed (timeout): kept previous tier')
+    await step($, 't2')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+    expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'opus/high', reason: 'classifier failed (timeout): kept previous tier' })
+  })
+
+  test('a failure after an execute turn stays on execute: it does not drop to lookup, nor jump to the session model', async ($, on) => {
+    const seen = world($, on, [execute, { fail: 'api-error' }])
+    await $.prompt.submit({ text: 'build it' } as never)
+    await $.prompt.submit({ text: 'now the tests' } as never)
+    expect(seen.submits[1]!.context?.[0]).toContain('assigned to sonnet at medium')
+    expect(seen.submits[1]!.context?.[0]).toContain('classifier failed (api-error 529)')
+  })
+
+  test('a failure on the first turn leaves it unrouted, says so on the band, and is not a previous tier for the next turn', async ($, on) => {
+    const seen = world($, on, [null, execute])
+    await $.prompt.submit({ text: 'do the thing' } as never)
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ text: /classifier failed \(timeout\): session model/ })).toBeDefined()
+    expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'session model' })
+    // An unrouted turn gives the escalate tool nothing to change.
+    const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)) as { result: string }
+    expect(up.result).toContain('No routed turn')
+    await $.prompt.submit({ text: 'build it' } as never)
+    expect(seen.prompts[1]).toContain('<previous_tier>none</previous_tier>')
+  })
+
+  test('failures are counted by reason and shown in /model-router stats', async ($, on) => {
+    world($, on, [null, { fail: 'api-error' }, { fail: 'empty-reply' }, 'no json here', null])
+    for (const text of ['one', 'two', 'three', 'four', 'five']) await $.prompt.submit({ text } as never)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier failures: timeout ×2 · ')
+    expect(r.text).toContain('api-error 529 ×1')
+    expect(r.text).toContain('empty-reply ×1')
+    expect(r.text).toContain('unparseable ×1')
+  })
+
+  test('stats say none when nothing failed', async ($, on) => {
+    world($, on, execute)
+    await $.prompt.submit({ text: 'build it' } as never)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier failures: none.')
+  })
+
+  test('a subagent classifier failure still runs on sonnet, records the reason in its start event, and is counted', async ($, on) => {
+    const seen = world($, on, null)
+    const id = await spawnAgent($)
+    expect(seen.agents).toEqual(['sonnet'])
+    expect(eventsOf(seen)).toMatchObject([{ agentId: id, event: 'general-purpose start', to: 'sonnet/medium', reason: 'classifier failed (timeout), sonnet' }])
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('timeout ×1')
+  })
+})
+
+const near = (a: number, b: number) => Math.abs(a - b) < 1e-9
+
+describe('honest meter baseline', () => {
+  // WHY: staying on Opus all along would have read the context from a warm cache; a switch step's cache writes exist
+  // only because of the switch, so they must not be priced as writes in the "all on Opus" baseline.
+  test('a switch step prices its cache writes as Opus reads in the baseline; a normal step is unchanged', async () => {
+    const u = U(1000, 500, 0, 200_000, 'claude-sonnet-5-5')
+    expect(near(costOf(u, 'opus'), 1.614)).toBe(true)
+    expect(near(baselineOf(u, false), 1.614)).toBe(true)
+    expect(near(baselineOf(u, true), 0.054)).toBe(true)
+    // The actual cost is left as it is.
+    expect(near(add(EMPTY, 'claude-sonnet-5-5', u, true).cost, costOf(u, 'sonnet'))).toBe(true)
+    expect(near(add(EMPTY, 'claude-sonnet-5-5', u).baseline, baselineOf(u, false))).toBe(true)
+  })
+
+  test('only a family change inside the TTL is a switch step', async () => {
+    const prev = { model: 'opus' as const, at: 0, context: 1 }
+    expect(isSwitchStep(null, 'sonnet', 0)).toBe(false)
+    expect(isSwitchStep(prev, 'opus', 1000)).toBe(false)
+    expect(isSwitchStep(prev, 'sonnet', 1000)).toBe(true)
+    expect(isSwitchStep({ ...prev, model: 'sonnet' }, 'opus', 1000)).toBe(true)
+    expect(isSwitchStep(prev, 'sonnet', CACHE_TTL_MS)).toBe(true)
+    expect(isSwitchStep(prev, 'sonnet', CACHE_TTL_MS + 1)).toBe(false)
+  })
+
+  test('an Opus -> Sonnet -> Opus round trip shows no saving: the old baseline showed a fake one', async () => {
+    const steps: [string, ReturnType<typeof U>, boolean][] = [
+      ['claude-opus-5-5', U(1000, 500, 200_000, 0), false],
+      ['claude-sonnet-5-5', U(1000, 500, 0, 200_000, 'claude-sonnet-5-5'), true],
+      ['claude-opus-5-5', U(1000, 500, 0, 200_000), true],
+    ]
+    const t = steps.reduce((acc, [model, u, switched]) => add(acc, model, u, switched), EMPTY)
+    const naive = steps.reduce((sum, [, u]) => sum + costOf(u, 'opus'), 0)
+    expect(naive - t.cost).toBeGreaterThan(0.5)
+    expect(saved(t).usd).toBeLessThan(0)
+  })
+})
+
+test('the meter flags exactly the main steps that changed family, going down and coming back up', async ($, on) => {
+  const seen = world($, on, execute)
+  // 200k-token writes: the flagged and unflagged baselines differ by dollars, so the 2-decimal stats line tells them apart.
+  const u1 = U(100, 200, 0, 200_000)
+  const u2 = U(100, 200, 0, 200_000, 'claude-sonnet-5-5')
+  const u3 = U(100, 200, 200_000, 0, 'claude-sonnet-5-5')
+  const u4 = U(100, 200, 0, 200_000)
+  const turns = [u1, u2, u3, u4]
+  for (const [i, u] of turns.entries()) {
+    await $.prompt.submit({ text: `prompt ${i}` } as never)
+    seen.usage.push(u)
+    await step($, `t${i + 1}`)
+  }
+  const classifier = 4 * costOf({ input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, 'opus')
+  const flagged = classifier + costOf(u1, 'opus') + baselineOf(u2, true) + costOf(u3, 'opus') + baselineOf(u4, true)
+  const unflagged = classifier + turns.reduce((sum, u) => sum + costOf(u, 'opus'), 0)
+  expect(fmtUsd(flagged)).not.toBe(fmtUsd(unflagged))
+  const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+  expect(r.text).toContain(`all on Opus would be ${fmtUsd(flagged)}`)
+  expect(r.text).not.toContain(`all on Opus would be ${fmtUsd(unflagged)}`)
+})
+
+describe('mainRouting off (subagent-only mode)', () => {
+  test('main steps are untouched and no context is injected, while subagent routing, escalation and Fable blocking still work', { options: { mainRouting: false } }, async ($, on) => {
+    const seen = world($, on, decide)
+    await $.prompt.submit({ text: 'find files' } as never)
+    // No classification, no assignment text.
+    expect(seen.asked).toEqual([])
+    expect(seen.submits[0]!.context).toBeUndefined()
+    await step($, 't1')
+    expect(seen.steps[0]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'high', agentId: undefined })
+    const main = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)) as { result: string }
+    expect(main.result).toContain('No routed turn')
+
+    // A turn without a person prompt has no route to inherit.
+    await $.turn.start({ text: 'notification', turnId: 'tn' } as never)
+    await step($, 'tn', 'claude-sonnet-5-5')
+    expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5' })
+
+    // Still on: Fable blocking on the main thread, subagent routing and escalation, and the meter.
+    await step($, 't1', 'claude-fable-5-1[1m]')
+    expect(seen.steps[2]!.model).toBe('claude-opus-5-5[1m]')
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    seen.usage.push(U(1000, 100, 0, 0, 'claude-haiku-5-5'))
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps[3]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium', agentId: id })
+    const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'sonnet', reason: 'hard' } as never)) as { result: string }
+    expect(up.result).toBe('Escalated to sonnet/medium from your next step.')
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('| haiku |')
+    expect(r.text).toContain('Fable requests moved to Opus: 1')
+  })
+
+  test('the turn tally still restarts with each prompt', { options: { mainRouting: false } }, async ($, on) => {
+    const seen = world($, on, null)
+    await $.prompt.submit({ text: 'first' } as never)
+    seen.usage.push(U(1000, 200, 20_000, 0))
+    await step($, 't1')
+    await $.prompt.submit({ text: 'second' } as never)
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ text: /turn 0 token/ })).toBeDefined()
+    expect(await ui.find({ text: /today 21\.2k token/ })).toBeDefined()
+  })
+
+  test('on by default', async ($, on) => {
+    const seen = world($, on, execute)
+    await $.prompt.submit({ text: 'build it' } as never)
+    expect(seen.asked).toEqual(['haiku'])
+    expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet')
+  })
+})
+
+describe('the band without a route', () => {
+  // WHY: with no route (a new session, or main routing off) the route row was a lone gear and an empty line; the meter
+  // takes that row instead, with the Disable button beside it.
+  test('shows the meter on the gear row, with the button, and no empty route row', { options: { mainRouting: false } }, async ($, on) => {
+    const seen = world($, on, null)
+    await $.prompt.submit({ text: 'find files' } as never)
+    seen.usage.push(U(1000, 200, 20_000, 0))
+    await step($, 't1')
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(texts.filter(t => t.trim() === '')).toEqual([])
+    expect(texts.some(t => t.includes('⚙'))).toBe(true)
+    expect(await ui.find({ text: /today 21\.2k token/ })).toBeDefined()
+    expect(await ui.find({ key: 'router-disable' })).toBeDefined()
+  })
+
+  test('a fresh session, before any prompt, shows the gear row with the button', async ($, on) => {
+    world($, on, null)
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(texts.filter(t => t.trim() === '')).toEqual([])
+    expect(await ui.find({ key: 'router-disable' })).toBeDefined()
+  })
 })

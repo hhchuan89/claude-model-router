@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Routes every Claude Code turn to the cheapest model that can do it well (Haiku lookups, Sonnet execution, Opus decisions), lets the model escalate itself, routes subagents too, keeps a warm cache when switching would cost more, and shows how much you saved vs all-Opus. Classification runs on your own Anthropic account; no third party sees your prompts.",
   "author": {
     "name": "hhchuan89"
@@ -16,6 +16,12 @@
         "en",
         "zh"
       ]
+    },
+    "mainRouting": {
+      "type": "boolean",
+      "title": "Route the main conversation",
+      "description": "On (the default): every turn you start is classified and runs on the cheapest model that fits. Off: subagent-only mode, the low-risk way to start. The main thread is left on your own model, and subagent routing, escalation, Fable blocking and the meter keep working.",
+      "default": true
     },
     "haikuModel": {
       "type": "string",

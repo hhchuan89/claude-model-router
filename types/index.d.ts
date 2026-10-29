@@ -13,6 +13,9 @@ export type Route = {
   trail: string[]
   // the tier's own model, when a warm cache made it cheaper to stay on a bigger one
   keptFrom?: ModelKey
+  // The classifier failed on a first turn and there was no earlier route to keep: this turn is unrouted and runs
+  // on the session's own model and effort. tier/model/effort are placeholders and are never applied.
+  sessionModel?: boolean
 }
 
 export type Tally = {

@@ -11,6 +11,9 @@ export const PRICES: Record<ModelKey | 'fable', Price> = {
   fable: { input: 10, output: 50, read: 0.25, write: 20 },
 }
 export const CACHE_TTL_MS = 60 * 60 * 1000
+// A warm main-thread context this big is never moved to a lower model: leaving Opus and coming back within the
+// cache TTL rewrote the whole Opus cache (200k-800k tokens), which cost far more than the cheaper model saved.
+export const WARM_CONTEXT_KEEP = 50_000
 
 export type Usage = {
   input_tokens: number
@@ -42,7 +45,24 @@ export function tokensOf(u: Usage): number {
   return u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
 }
 
-export function add(t: Tally, modelId: string, u: Usage): Tally {
+// What the same tokens would have cost had the thread stayed on Opus. A main-thread step that switched model
+// family within the cache TTL wrote its context (cache_creation_input_tokens) because of the switch; staying on
+// Opus would have read that context from a warm cache, so those tokens are priced at Opus's cache-read rate,
+// not its write rate. This applies to a step going down and to the step coming back up to Opus.
+export function baselineOf(u: Usage, switched: boolean): number {
+  if (!switched) return costOf(u, 'opus')
+  return costOf(
+    { ...u, cache_read_input_tokens: u.cache_read_input_tokens + u.cache_creation_input_tokens, cache_creation_input_tokens: 0 },
+    'opus',
+  )
+}
+
+// Whether a main-thread step that ran on `key` is a family switch from the previous main step, within the TTL.
+export function isSwitchStep(prev: LastRequest | null, key: keyof typeof PRICES, now: number): boolean {
+  return prev !== null && prev.model !== key && now - prev.at <= CACHE_TTL_MS
+}
+
+export function add(t: Tally, modelId: string, u: Usage, switched = false): Tally {
   const key = priceKey(modelId)
   const cost = costOf(u, key)
   const tokens = tokensOf(u)
@@ -50,7 +70,7 @@ export function add(t: Tally, modelId: string, u: Usage): Tally {
   return {
     tokens: t.tokens + tokens,
     cost: t.cost + cost,
-    baseline: t.baseline + costOf(u, 'opus'),
+    baseline: t.baseline + baselineOf(u, switched),
     byModel: { ...t.byModel, [key]: { tokens: prev.tokens + tokens, cost: prev.cost + cost } },
   }
 }
@@ -76,10 +96,13 @@ const RANK: Record<ModelKey, number> = { haiku: 0, sonnet: 1, opus: 2 }
 export type LastRequest = { model: ModelKey; at: number; context: number }
 export type Shape = { steps: number; output: number }
 
-// A downgrade costs a cold read of the whole context on the new model. Keep the warm model when
-// that costs more than the cheaper model saves over the turn's expected steps and output.
+// A downgrade costs a cold read of the whole context on the new model, and usually a second rewrite when the
+// thread comes back up. Within the cache TTL, a context of WARM_CONTEXT_KEEP tokens or more never moves to a lower
+// model; a smaller one keeps the warm model only when the cold read costs more than the cheaper model saves over
+// the turn's expected steps and output. Upgrades are never blocked.
 export function keepWarm(target: ModelKey, last: LastRequest | null, now: number, shape: Shape): ModelKey {
   if (!last || RANK[target] >= RANK[last.model] || now - last.at > CACHE_TTL_MS) return target
+  if (last.context >= WARM_CONTEXT_KEEP) return last.model
   const steps = Math.max(1, shape.steps)
   const out = Math.max(0, shape.output)
   const ctx = last.context

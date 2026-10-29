@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { ModelKey, Route, Tally, Tier } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, EMPTY, fmtTokens, fmtUsd, keepWarm, priceKey, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, priceKey, saved, tokensOf } from './meter'
 import { isPersonOrigin } from './origin'
 import { redact } from './redact'
 import type { Lang } from './route'
@@ -38,7 +38,7 @@ import {
 
 const TOOL = 'escalate'
 const TOOL_CALL = `mcp__model-router__${TOOL}`
-const CLASSIFY_MS = 4000
+const CLASSIFY_MS = 8000
 const PROBE_EVERY_MS = 24 * 3600 * 1000
 
 const route = atom({ plugin: 'model-router', key: 'route' } as const, null)
@@ -61,7 +61,9 @@ const log: EventLog = { sessionId: '', events: [], stats: {} }
 
 const STR = {
   zh: {
-    fallback: '分类失败，默认 Sonnet',
+    keptTier: (why: string) => `分类失败（${why}）：沿用上一档位`,
+    sessionModel: (why: string) => `分类失败（${why}）：用会话模型`,
+    inherited: '沿用上一轮路由',
     forced: '你在消息里指定了模型',
     off: 'Model router 已关闭',
     review: '决策审查',
@@ -72,7 +74,9 @@ const STR = {
     vs: '对比全用 Opus',
   },
   en: {
-    fallback: 'classifier failed, defaulted to Sonnet',
+    keptTier: (why: string) => `classifier failed (${why}): kept previous tier`,
+    sessionModel: (why: string) => `classifier failed (${why}): session model`,
+    inherited: 'continues previous route',
     forced: 'model pinned in your message',
     off: 'Model router is off',
     review: 'Decision review',
@@ -95,6 +99,8 @@ type Counts = {
   fableBlocked: number
   // Steps whose answering model was not the family the router asked for.
   modelMismatch: number
+  // Classifier calls that gave no usable verdict, by reason (main turns and subagents alike).
+  classifierFailures: Record<string, number>
 }
 const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
@@ -103,6 +109,7 @@ const NO_COUNTS: Counts = {
   subagents: { haiku: 0, sonnet: 0, opus: 0 },
   fableBlocked: 0,
   modelMismatch: 0,
+  classifierFailures: {},
 }
 
 function dayKey(ms: number): string {
@@ -132,13 +139,14 @@ function count($: EngineInterface, change: (c: Counts) => Counts): Promise<void>
 }
 
 // Every model call this session pays for, the router's own included, goes on the turn, the day and the total.
-function record($: EngineInterface, modelId: string, u: Usage): Promise<void> {
+// switched: a main-thread step that changed model family within the cache TTL (see baselineOf).
+function record($: EngineInterface, modelId: string, u: Usage, switched = false): Promise<void> {
   return serial($, async () => {
     const day = `meter:${dayKey(await $.clock.now())}`
-    const today = add(((await $.store.get(day)) as Tally | undefined) ?? EMPTY, modelId, u)
+    const today = add(((await $.store.get(day)) as Tally | undefined) ?? EMPTY, modelId, u, switched)
     await $.store.set(day, today)
-    await $.store.set('meter:all', add(((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY, modelId, u))
-    await update($, meter, m => ({ turn: add((m ?? { turn: EMPTY }).turn, modelId, u), today }))
+    await $.store.set('meter:all', add(((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY, modelId, u, switched))
+    await update($, meter, m => ({ turn: add((m ?? { turn: EMPTY }).turn, modelId, u, switched), today }))
   })
 }
 
@@ -189,8 +197,12 @@ async function recentContext($: EngineInterface): Promise<string> {
     .join('\n\n')
 }
 
-// Haiku sorts a text into a tier; null when it cannot say. withContext adds the last two messages.
-async function classifyTier($: EngineInterface, lang: Lang, text: string, previous: Tier | null, withContext: boolean) {
+type Verdict = { tier: Tier; reason: string; sure: boolean }
+// A verdict, or why there is none: 'timeout', 'api-error <status>', 'empty-reply', 'unparseable' or 'exception'.
+type Classified = { ok: true; verdict: Verdict } | { ok: false; why: string }
+
+// Haiku sorts a text into a tier. withContext adds the last two messages.
+async function classifyTier($: EngineInterface, lang: Lang, text: string, previous: Tier | null, withContext: boolean): Promise<Classified> {
   try {
     const context = withContext ? await recentContext($) : ''
     const r = await $.model.complete({
@@ -204,19 +216,44 @@ async function classifyTier($: EngineInterface, lang: Lang, text: string, previo
       timeoutMs: CLASSIFY_MS,
     })
     await record($, 'claude-haiku-5-5', r.usage)
-    return r.isAnswered ? parseDecision(r.text) : null
+    if (!r.isAnswered) {
+      if (r.reason === 'aborted') return { ok: false, why: 'timeout' }
+      if (r.reason === 'api-error') return { ok: false, why: `api-error ${r.status ?? 'none'}` }
+      return { ok: false, why: 'empty-reply' }
+    }
+    const verdict = parseDecision(r.text)
+    return verdict ? { ok: true, verdict } : { ok: false, why: 'unparseable' }
   } catch {
-    return null
+    return { ok: false, why: 'exception' }
   }
 }
 
+function countFailure($: EngineInterface, why: string): Promise<void> {
+  return count($, c => {
+    const failures = c.classifierFailures ?? {}
+    return { ...c, classifierFailures: { ...failures, [why]: (failures[why] ?? 0) + 1 } }
+  })
+}
+
+// A failed classification never downgrades: it keeps the previous route's tier, and with no previous route the
+// turn is left unrouted, on the session's own model (sessionModel). Switching to Sonnet on failure cost money:
+// 24% of those turns later escalated to Opus, against 6% of classified ones.
 async function classify($: EngineInterface, lang: Lang, text: string, previous: Route | null): Promise<Route> {
   const forced = forcedModel(text)
   if (forced) return routeFor(TIER_OF[forced], STR[lang].forced)
-  const d = await classifyTier($, lang, text, previous?.tier ?? null, true)
-  if (!d) return routeFor('execute', STR[lang].fallback)
-  const s = settleTier(d, previous?.tier ?? null)
+  const c = await classifyTier($, lang, text, previous?.tier ?? null, true)
+  if (!c.ok) {
+    await countFailure($, c.why)
+    if (previous) return routeFor(previous.tier, STR[lang].keptTier(c.why))
+    return { ...routeFor('execute', STR[lang].sessionModel(c.why)), sessionModel: true }
+  }
+  const s = settleTier(c.verdict, previous?.tier ?? null)
   return routeFor(s.tier, s.reason)
+}
+
+// The last route that actually routed a turn: an unrouted (session model) turn is not one.
+function routed(r: Route | null): Route | null {
+  return r && !r.sessionModel ? r : null
 }
 
 // Whether the reviewer model exists on this account; asked at most once a day.
@@ -279,6 +316,9 @@ async function statsText($: EngineInterface): Promise<string> {
   const today = ((await $.store.get(`meter:${dayKey(now)}`)) as Tally | undefined) ?? EMPTY
   const all = ((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY
   const c = ((await $.store.get('counts')) as Counts | undefined) ?? NO_COUNTS
+  const failures = Object.entries(c.classifierFailures ?? {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([why, n]) => `${why} ×${n}`)
   return [
     tallyLines('Today', today),
     '',
@@ -288,7 +328,8 @@ async function statsText($: EngineInterface): Promise<string> {
       `Escalations: ${c.escalations}. Kept on a warm cache: ${c.cacheKeeps}. ` +
       `Subagents routed: haiku ${c.subagents.haiku} · sonnet ${c.subagents.sonnet} · opus ${c.subagents.opus}. ` +
       `Fable requests moved to Opus: ${c.fableBlocked}. ` +
-      `Routed model not the one that answered: ${c.modelMismatch ?? 0}.`,
+      `Routed model not the one that answered: ${c.modelMismatch ?? 0}. ` +
+      `Classifier failures: ${failures.length > 0 ? failures.join(' · ') : 'none'}.`,
     '',
     '_API-equivalent prices; the baseline prices the same tokens on Opus, so it is an estimate: another model would not use exactly the same tokens._',
   ].join('\n')
@@ -301,6 +342,9 @@ export const register: Register = (on, options) => {
     sonnet: String(options.sonnetModel ?? 'claude-sonnet-5-5'),
     opus: String(options.opusModel ?? 'claude-opus-5-5'),
   }
+  // false: subagent-only mode. The main thread is neither classified nor rewritten; subagent routing, escalation,
+  // Fable blocking and the meter keep working.
+  const mainRouting = options.mainRouting !== false
   // Empty (the default) leaves the reviewer off.
   const reviewModel = String(options.reviewModel ?? '').trim()
   const str = STR[lang]
@@ -354,7 +398,19 @@ export const register: Register = (on, options) => {
     }
     // The turn's tally starts here, so it includes the classifier's own call.
     await update($, meter, m => ({ turn: EMPTY, today: (m ?? { today: EMPTY }).today }))
-    let r = await classify($, lang, e.text, await read($, route))
+    if (!mainRouting) return next(e)
+    let r = await classify($, lang, e.text, routed(await read($, route)))
+    if (r.sessionModel) {
+      // Unrouted: nothing to rewrite and nothing to tell the model; turn.start still binds the reason for the band.
+      pending = r
+      pendingPrompt = e.text
+      const entered = await next(e)
+      if (entered.drop !== undefined) {
+        pending = null
+        pendingPrompt = ''
+      }
+      return entered
+    }
     const shape = ((await $.store.get('shape')) as Shape | undefined) ?? { steps: 3, output: 800 }
     const model = keepWarm(r.model, last, await $.clock.now(), shape)
     if (model !== r.model) {
@@ -374,14 +430,32 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    // A subagent's or teammate's run is not a main turn: it neither takes the pending route nor inherits one.
+    if (e.agentId !== undefined) return next(e)
     if (pending) {
       const r = { ...pending, turnId: e.turnId }
       pending = null
       turnSteps = 0
       turnOutput = 0
       await update($, route, () => r)
-      await count($, c => ({ ...c, turns: { ...c.turns, [r.tier]: c.turns[r.tier] + 1 } }))
-      await logEvent($, 'main', 'turn route', `${r.model}/${r.effort}`, r.reason)
+      if (r.sessionModel) {
+        await logEvent($, 'main', 'turn route', 'session model', r.reason)
+      } else {
+        await count($, c => ({ ...c, turns: { ...c.turns, [r.tier]: c.turns[r.tier] + 1 } }))
+        await logEvent($, 'main', 'turn route', `${r.model}/${r.effort}`, r.reason)
+      }
+    } else if (mainRouting && (await read($, enabled))) {
+      // A turn without a person prompt (a task notification, an agent message, a scheduled prompt) is never
+      // classified. While the previous route's cache is warm it continues that route: left on the session model it
+      // would switch away from, and back to, the model the cache is on. Without a previous route it stays unrouted.
+      const prev = routed(await read($, route))
+      if (prev && last && (await $.clock.now()) - last.at <= CACHE_TTL_MS) {
+        const r: Route = { ...prev, turnId: e.turnId, reason: str.inherited }
+        turnSteps = 0
+        turnOutput = 0
+        await update($, route, () => r)
+        await logEvent($, 'main', 'turn inherit', `${r.model}/${r.effort}`, r.reason)
+      }
     }
     return next(e)
   })
@@ -394,7 +468,7 @@ export const register: Register = (on, options) => {
     const r = await read($, route)
     const isMain = e.agentId === undefined
     const sub = e.agentId === undefined ? undefined : agents.get(e.agentId)
-    if (isMain && r && r.turnId === e.turnId) {
+    if (isMain && mainRouting && r && r.turnId === e.turnId && !r.sessionModel) {
       model = withSuffixOf(ids[r.model], e.model)
       effort = r.effort
     }
@@ -411,10 +485,13 @@ export const register: Register = (on, options) => {
       model === e.model && effort === e.effort ? yield* next(e) : yield* next({ ...e, model, effort })
     const u = result?.usage
     if (u) {
-      await record($, u.model || model, u)
+      const key = priceKey(u.model || model)
+      const now = await $.clock.now()
+      // Read before `last` moves on: a main step that switched family within the TTL is priced for what it cost.
+      const switched = isMain && isSwitchStep(last, key, now)
+      await record($, u.model || model, u, switched)
       if (isMain) {
-        const key = priceKey(u.model || model)
-        if (key !== 'fable') last = { model: key, at: await $.clock.now(), context: tokensOf(u) - u.output_tokens }
+        if (key !== 'fable') last = { model: key, at: now, context: tokensOf(u) - u.output_tokens }
         turnSteps += 1
         turnOutput += u.output_tokens
       }
@@ -449,7 +526,7 @@ export const register: Register = (on, options) => {
       return { result: `Escalated to ${describeTier(up)} from your next step.` }
     }
     const r = await read($, route)
-    if (!r || r.turnId === null) {
+    if (!mainRouting || !r || r.turnId === null || r.sessionModel) {
       return { result: 'No routed turn here: escalate only applies to the main conversation of a routed turn. Carry on.' }
     }
     const out = applyEscalation(r, input)
@@ -486,7 +563,10 @@ export const register: Register = (on, options) => {
   on('agent.spawn', async ($, e, next) => {
     if (!(await read($, enabled)) || e.fork || e.workflow !== undefined) return next(e)
     const verdict = needsClassifier(e) ? await classifyTier($, lang, e.prompt, null, false) : null
-    const d = decideSpawn(e, verdict?.tier ?? null, verdict?.sure ?? true)
+    const failure = verdict && !verdict.ok ? verdict.why : undefined
+    if (failure !== undefined) await countFailure($, failure)
+    const ok = verdict?.ok ? verdict.verdict : null
+    const d = decideSpawn(e, ok?.tier ?? null, ok?.sure ?? true)
     const ran = await next(d?.model === undefined ? e : { ...e, model: d.model })
     try {
       if (ran.deny === undefined && ran.agentId !== undefined) {
@@ -500,7 +580,9 @@ export const register: Register = (on, options) => {
         }
         const s = startOf(ran.model, e.parentModel, model !== undefined, ids)
         agents.set(ran.agentId, s)
-        await logEvent($, ran.agentId, `${e.subagentType} start`, describeTier(s), d?.reason ?? 'as asked')
+        // A failed classification keeps today's fallback (sonnet) and says why.
+        const why = failure !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failure})`) : d?.reason
+        await logEvent($, ran.agentId, `${e.subagentType} start`, describeTier(s), why ?? 'as asked')
       }
     } catch {
       // Tracking is best effort: the agent has started either way.
@@ -544,17 +626,38 @@ export const register: Register = (on, options) => {
 
     const r = await read($, route)
     const m = (await read($, meter)) ?? { turn: EMPTY, today: EMPTY }
-    if (!r && m.today.tokens === 0) return below
-    const routeText = r
-      ? `${LABEL[r.keptFrom ?? TIER_ROUTE[r.tier].model]} · ${TIER_ROUTE[r.tier].effort}` +
-        (r.keptFrom ? ` → ${LABEL[r.model]} (${str.kept})` : '') +
-        (r.trail.length > 0 ? ` → ${r.trail.join(' → ')}` : '') +
-        (r.reason ? ` — ${r.reason}` : '')
-      : ''
+    const routeText = !r
+      ? ''
+      : r.sessionModel
+        ? r.reason
+        : `${LABEL[r.keptFrom ?? TIER_ROUTE[r.tier].model]} · ${TIER_ROUTE[r.tier].effort}` +
+          (r.keptFrom ? ` → ${LABEL[r.model]} (${str.kept})` : '') +
+          (r.trail.length > 0 ? ` → ${r.trail.join(' → ')}` : '') +
+          (r.reason ? ` — ${r.reason}` : '')
     const s = saved(m.today)
     const meterText =
       `${str.turn} ${fmtTokens(m.turn.tokens)} token · ${fmtUsd(m.turn.cost)}   ` +
       `${str.today} ${fmtTokens(m.today.tokens)} token · ${fmtUsd(m.today.cost)}, ${str.save} ≈${fmtUsd(s.usd)} (${s.pct}%) ${str.vs}`
+
+    // No route yet (a new session, or main routing off): the meter takes the gear's row, so there is no empty route row.
+    if (!r) {
+      return (
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={1} alignItems="center">
+            <Box flexShrink={0}>
+              <Text dimColor>⚙</Text>
+            </Box>
+            <Box flexGrow={1} flexShrink={1} width={0}>
+              <Text dimColor wrap="truncate-end">
+                {meterText}
+              </Text>
+            </Box>
+            <Button key="router-disable" label="Disable router" onPress={() => setEnabled($, false)} />
+          </Box>
+          {below}
+        </Box>
+      )
+    }
 
     return (
       <Box flexDirection="column">
