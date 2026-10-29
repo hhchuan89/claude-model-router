@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
 import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
-import { decideSpawn, escalateAgent, logDir, startOf, stepUp } from '../hooks/subagent'
+import { AUTO_EFFORT_CAP, decideSpawn, escalateAgent, logDir, startOf, stepUp } from '../hooks/subagent'
 
 describe('route rules', () => {
   test('parses the classifier reply and rejects junk', async () => {
@@ -43,7 +43,7 @@ describe('route rules', () => {
   test('an escalation reason on the band is cut the same way', async () => {
     const cur = routeFor('execute', 'x')
     const out = applyEscalation(cur, { model: 'opus', reason: 'the design question turned out to need a real trade-off decision first' })
-    expect(out.ok && out.route.trail[0]).toBe('opus · high (the design question turned out to need a real trade-off…)')
+    expect(out.ok && out.route.trail[0]).toBe('opus · medium (the design question turned out to need a real trade-off…)')
   })
 
   test('#model pins the turn', async () => {
@@ -64,7 +64,10 @@ describe('route rules', () => {
     expect(applyEscalation(sonnet, { effort: 'low', reason: 'x' }).ok).toBe(false)
     expect(applyEscalation(sonnet, { model: 'fable', reason: 'x' }).ok).toBe(false)
 
-    const opus = routeFor('decide', '')
+    // A decide route now starts at medium, so raise it to high first: lowering must be proved from above.
+    const raised = applyEscalation(routeFor('decide', ''), { effort: 'high', reason: 'multi-step design' })
+    expect(raised.ok && raised.route.effort).toBe('high')
+    const opus = raised.ok ? raised.route : routeFor('decide', '')
     const lower = applyEscalation(opus, { effort: 'medium', reason: 'small decision' })
     expect(lower.ok && lower.route.effort).toBe('medium')
     expect(applyEscalation(opus, { effort: 'high', reason: 'same' }).ok).toBe(false)
@@ -195,17 +198,20 @@ test('a lookup main turn starts Haiku at medium: headroom without a model switch
   expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
 })
 
-// WHY: main decisions stay at high however the turn got to Opus, so a skipped Sonnet step does not leave Opus at medium.
-test('main-thread escalation from haiku to opus lands at opus/high, not at the haiku effort', async ($, on) => {
+// WHY: main decisions start at medium however the turn got to Opus (Opus picks its own effort from there), so a
+// skipped Sonnet step does not carry the haiku effort over, and a higher effort still wins when it is asked.
+test('main-thread escalation from haiku to opus lands at opus/medium unless a higher effort is asked', async ($, on) => {
   const seen = world($, on, '{"tier":"lookup","reason":"find"}')
   await $.prompt.submit({ text: 'look at the auth flow' } as never)
   const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)) as { result: string }
-  expect(up.result).toContain('opus at high')
+  expect(up.result).toContain('opus at medium')
   await step($, 't1')
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
   const haiku = routeFor('lookup', '')
   const direct = applyEscalation(haiku, { model: 'opus', reason: 'x' })
-  expect(direct.ok && direct.route).toMatchObject({ model: 'opus', effort: 'high' })
+  expect(direct.ok && direct.route).toMatchObject({ model: 'opus', effort: 'medium' })
+  const asked = applyEscalation(haiku, { model: 'opus', effort: 'high', reason: 'x' })
+  expect(asked.ok && asked.route).toMatchObject({ model: 'opus', effort: 'high' })
 })
 
 test('the running model escalates itself, and the next step follows; downgrades are refused', async ($, on) => {
@@ -213,14 +219,14 @@ test('the running model escalates itself, and the next step follows; downgrades 
   await $.prompt.submit({ text: 'look at the auth flow' } as never)
   await step($, 't1')
   const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: '要做设计决策' } as never)) as { result: string }
-  expect(up.result).toContain('opus at high')
+  expect(up.result).toContain('opus at medium')
   await step($, 't1')
-  expect(seen.steps[1]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'high', agentId: undefined })
+  expect(seen.steps[1]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'medium', agentId: undefined })
   const down = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'x' } as never)) as { result: string }
   expect(down.result).toContain('Not changed')
 
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /Haiku · medium → opus · high \(要做设计决策\)/ })).toBeDefined()
+  expect(await ui.find({ text: /Haiku · medium → opus · medium \(要做设计决策\)/ })).toBeDefined()
 })
 
 test('Fable 5.1 never runs, not even in a subagent; other subagent models are left alone', async ($, on) => {
@@ -466,15 +472,15 @@ describe('subagent rules', () => {
     expect(stepUp(sonnetRetried, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'medium', retriedAtTier: false })
   })
 
-  test('at the ceiling only effort rises, one step each time, and max stops it', async () => {
+  // WHY: max is the most expensive setting; an agent that merely keeps failing must not be walked up to it by the router.
+  test('at the ceiling only effort rises, one step each time, and the automatic ladder stops at xhigh', async () => {
     const top = startOf('opus', OPUS, true, IDS_BY_KEY)
     const high = stepUp(top, IDS_BY_KEY)!
     const xhigh = stepUp(high, IDS_BY_KEY)!
-    const max = stepUp(xhigh, IDS_BY_KEY)!
     expect(high).toMatchObject({ tier: 'opus', effort: 'high' })
     expect(xhigh).toMatchObject({ tier: 'opus', effort: 'xhigh' })
-    expect(max).toMatchObject({ tier: 'opus', effort: 'max' })
-    expect(stepUp(max, IDS_BY_KEY)).toBeUndefined()
+    expect(AUTO_EFFORT_CAP).toBe('xhigh')
+    expect(stepUp(xhigh, IDS_BY_KEY)).toBeUndefined()
     // a sonnet parent caps a sonnet agent the same way: no opus, effort only
     const capped = startOf('sonnet', 'claude-sonnet-5-5', true, IDS_BY_KEY)
     expect(stepUp({ ...capped, retriedAtTier: true }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
@@ -654,9 +660,9 @@ test('an unsure turn after a decide turn stays on opus: low confidence never dow
   const seen = world($, on, ['{"tier":"decide","sure":true,"reason":"选方案"}', '{"tier":"execute","sure":false,"reason":"不确定"}'])
   await $.prompt.submit({ text: 'which design' } as never)
   await $.prompt.submit({ text: 'ok, and the rest?' } as never)
-  expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at high')
+  expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at medium')
   await step($, 't2')
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /unsure: not downgrading/ })).toBeDefined()
 })
@@ -868,7 +874,7 @@ describe('turns without a person prompt', () => {
     await step($, 't1')
     await $.turn.start(notification)
     await step($, 'tn', 'claude-sonnet-5-5')
-    expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' })
+    expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5', effort: 'medium' })
   })
 
   test('after the cache TTL an inherited turn stays unrouted: nothing warm is worth continuing', async ($, on) => {
@@ -910,11 +916,11 @@ describe('classifier failures', () => {
     const seen = world($, on, [decide, null])
     await $.prompt.submit({ text: 'which design' } as never)
     await $.prompt.submit({ text: 'and the rest?' } as never)
-    expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at high')
+    expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at medium')
     expect(seen.submits[1]!.context?.[0]).toContain('classifier failed (timeout): kept previous tier')
     await step($, 't2')
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
-    expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'opus/high', reason: 'classifier failed (timeout): kept previous tier' })
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+    expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'opus/medium', reason: 'classifier failed (timeout): kept previous tier' })
   })
 
   test('a failure after an execute turn stays on execute: it does not drop to lookup, nor jump to the session model', async ($, on) => {
@@ -1097,5 +1103,54 @@ describe('the band without a route', () => {
     const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
     expect(texts.filter(t => t.trim() === '')).toEqual([])
     expect(await ui.find({ key: 'router-disable' })).toBeDefined()
+  })
+})
+
+describe('opus effort guidance and the max-effort guard', () => {
+  // WHY: Opus at medium is the cheap default; the assignment must tell it when a task is worth more, and that max is rare.
+  test('a decide turn starts Opus at medium, and the assignment says when to use high, xhigh and max', async ($, on) => {
+    const seen = world($, on, decide)
+    await $.prompt.submit({ text: 'which design' } as never)
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+    const ctx = seen.submits[0]!.context?.[0] ?? ''
+    expect(ctx).toContain('assigned to opus at medium')
+    expect(ctx).toContain('medium for most work')
+    expect(ctx).toContain('high for multi-step design, plans or reviews')
+    expect(ctx).toContain('xhigh for hard debugging or architecture')
+    expect(ctx).toContain('max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed')
+    expect(assignmentContext(routeFor('decide', 'x'))).toContain('max only for an irreversible')
+  })
+
+  test('the automatic ladder never sets max, even at the ceiling, while a subagent may still escalate to max by hand', async ($, on) => {
+    const ceiling = stepUp(stepUp(startOf('opus', OPUS, true, IDS_BY_KEY)!, IDS_BY_KEY)!, IDS_BY_KEY)!
+    expect(ceiling.effort).toBe('xhigh')
+    expect(stepUp(ceiling, IDS_BY_KEY)).toBeUndefined()
+    expect(escalateAgent(ceiling, { effort: 'max' }, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'max' })
+
+    const seen = world($, on, null)
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'max', reason: 'irreversible change' } as never)) as { result: string }
+    expect(r.result).toBe('Escalated to haiku/max from your next step.')
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'max' })
+    const stats = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(stats.text).toContain('Escalations to max effort: 1.')
+  })
+
+  // WHY: max should be rare; the stats line is how that is checked, so only a move to max from below may count.
+  test('a main-thread escalate to max is applied and counted; an escalate to xhigh is not', async ($, on) => {
+    const seen = world($, on, decide)
+    await $.prompt.submit({ text: 'which design' } as never)
+    const stats = async () => ((await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }).text
+    expect(await stats()).toContain('Escalations to max effort: 0.')
+    const x = (await $.tool.call({ tool: 'mcp__model-router__escalate', effort: 'xhigh', reason: 'hard bug' } as never)) as { result: string }
+    expect(x.result).toContain('opus at xhigh')
+    expect(await stats()).toContain('Escalations to max effort: 0.')
+    const m = (await $.tool.call({ tool: 'mcp__model-router__escalate', effort: 'max', reason: 'irreversible prod change' } as never)) as { result: string }
+    expect(m.result).toContain('opus at max')
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'max' })
+    expect(await stats()).toContain('Escalations to max effort: 1.')
   })
 })

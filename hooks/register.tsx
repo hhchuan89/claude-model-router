@@ -101,6 +101,8 @@ type Counts = {
   modelMismatch: number
   // Classifier calls that gave no usable verdict, by reason (main turns and subagents alike).
   classifierFailures: Record<string, number>
+  // Escalations to max effort, main thread and subagents: max is meant to be rare.
+  maxEffort: number
 }
 const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
@@ -110,6 +112,7 @@ const NO_COUNTS: Counts = {
   fableBlocked: 0,
   modelMismatch: 0,
   classifierFailures: {},
+  maxEffort: 0,
 }
 
 function dayKey(ms: number): string {
@@ -329,7 +332,8 @@ async function statsText($: EngineInterface): Promise<string> {
       `Subagents routed: haiku ${c.subagents.haiku} · sonnet ${c.subagents.sonnet} · opus ${c.subagents.opus}. ` +
       `Fable requests moved to Opus: ${c.fableBlocked}. ` +
       `Routed model not the one that answered: ${c.modelMismatch ?? 0}. ` +
-      `Classifier failures: ${failures.length > 0 ? failures.join(' · ') : 'none'}.`,
+      `Classifier failures: ${failures.length > 0 ? failures.join(' · ') : 'none'}. ` +
+      `Escalations to max effort: ${c.maxEffort ?? 0}.`,
     '',
     '_API-equivalent prices; the baseline prices the same tokens on Opus, so it is an estimate: another model would not use exactly the same tokens._',
   ].join('\n')
@@ -522,6 +526,7 @@ export const register: Register = (on, options) => {
       const up = escalateAgent(s, input, ids)
       if (up === undefined) return { result: `No change: already on ${describeTier(s)}, the ceiling is ${s.ceiling}.` }
       agents.set(input.agentId, { ...up, errorsInARow: 0 })
+      if (up.effort === 'max' && s.effort !== 'max') await count($, c => ({ ...c, maxEffort: (c.maxEffort ?? 0) + 1 }))
       await logEvent($, input.agentId, 'escalated', describeTier(up), input.reason ?? 'no reason given')
       return { result: `Escalated to ${describeTier(up)} from your next step.` }
     }
@@ -532,7 +537,11 @@ export const register: Register = (on, options) => {
     const out = applyEscalation(r, input)
     if (!out.ok) return { result: `Not changed: ${out.why}. Carry on with the current route.` }
     await update($, route, () => out.route)
-    await count($, c => ({ ...c, escalations: c.escalations + 1 }))
+    await count($, c => ({
+      ...c,
+      escalations: c.escalations + 1,
+      maxEffort: (c.maxEffort ?? 0) + (out.route.effort === 'max' && r.effort !== 'max' ? 1 : 0),
+    }))
     return {
       result: `Route updated: from your next step this turn runs on ${out.route.model} at ${out.route.effort} effort. Now do the work.`,
     }

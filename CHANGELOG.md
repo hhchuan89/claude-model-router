@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-10-29
+
+Opus now decides how much effort it needs instead of starting every decision at high, and the router no longer walks
+a failing subagent up to the most expensive effort on its own.
+
+### Changed
+- A decide turn starts Opus at medium effort (was high). A main-thread escalation to Opus lands at Opus · medium unless
+  a higher effort is asked.
+- The automatic subagent ladder is capped at xhigh (`AUTO_EFFORT_CAP`): at the ceiling it raises effort up to xhigh and
+  then stops, and never sets max. A manual `escalate` may still set max.
+
+### Added
+- The Opus assignment now guides effort: medium for most work; high for multi-step design, plans or reviews; xhigh for
+  hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at
+  xhigh has failed.
+- A max-effort counter: escalations (main thread or subagent) that move effort to max from below are shown in
+  `/model-router stats` as "Escalations to max effort".
+
 ## [0.7.0] - 2026-10-29
 
 Four days of real use showed main-turn routing losing money overall: 19 times a turn returned to Opus within the hour

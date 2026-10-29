@@ -122,8 +122,12 @@ export function escalateAgent(s: AgentTier, req: SubEscalateRequest, ids: Record
 // The automatic ladder, one step per call. First more effort on the same model (cheaper than a model
 // switch, and often enough), then the next tier at its starting effort; at the ceiling effort only,
 // until max. undefined: nothing left to raise.
+// The automatic ladder never reaches max: max is for a model that judges a task needs it, through escalate.
+export const AUTO_EFFORT_CAP: Effort = 'xhigh'
+
 export function stepUp(s: AgentTier, ids: Record<ModelKey, string>): AgentTier | undefined {
-  const nextEffort = EFFORTS[(s.effort === undefined ? EFFORTS.indexOf('high') : EFFORTS.indexOf(s.effort)) + 1]
+  const raised = EFFORTS[(s.effort === undefined ? EFFORTS.indexOf('high') : EFFORTS.indexOf(s.effort)) + 1]
+  const nextEffort = raised !== undefined && EFFORTS.indexOf(raised) <= EFFORTS.indexOf(AUTO_EFFORT_CAP) ? raised : undefined
   if (!s.retriedAtTier && nextEffort !== undefined) {
     const up = escalateAgent(s, { effort: nextEffort }, ids)
     return up && { ...up, retriedAtTier: true }
