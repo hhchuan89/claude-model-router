@@ -26,11 +26,14 @@ import type { AgentTier, EventLog } from './subagent'
 import {
   addUsage,
   AUTO_ESCALATE_AFTER,
+  capSent,
   decideSpawn,
   describeTier,
+  effortCap,
   escalateAgent,
   familyOf,
   logDir,
+  modelCap,
   needsClassifier,
   startOf,
   stepUp,
@@ -368,12 +371,14 @@ export const register: Register = (on, options) => {
         'Call it first when the task is beyond the model you were assigned (decisions must be made on opus) or needs more effort. ' +
         'Only goes up; opus may set any effort. The change applies from your next step. ' +
         'Works for subagents too: a subagent calls it when its task proves harder than its tier handles well ' +
-        '(guessing, a result contradicts it, the same step failed twice); capped at the parent session model.',
+        '(guessing, a result contradicts it, the same step failed twice); on its own it stops at opus/medium. ' +
+        'Main conversation only: pass `agent` (a subagent id) to raise that subagent, up to opus/high.',
       inputSchema: {
         type: 'object',
         properties: {
           model: { type: 'string', enum: MODELS, description: 'Model to move up to; omit to change only the effort' },
           effort: { type: 'string', enum: EFFORTS, description: 'Effort for the rest of the turn' },
+          agent: { type: 'string', description: 'Main conversation only: id of the subagent to raise, as the Agent tool returned it' },
           reason: { type: 'string', description: 'One short line: why the assignment does not fit' },
         },
         required: ['reason'],
@@ -480,6 +485,8 @@ export const register: Register = (on, options) => {
     if (sub) {
       if (sub.model !== undefined) model = withSuffixOf(sub.model, e.model)
       if (sub.effort !== undefined) effort = sub.effort
+      // Hard ceiling for every tracked subagent, inheriting ones too: xhigh and max are main-thread only.
+      effort = capSent(effort)
     }
     if (isFable(model)) {
       model = withSuffixOf(ids.opus, e.model)
@@ -516,15 +523,33 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: TOOL_CALL }, async ($, e) => {
-    const input = e as unknown as { agentId?: string; model?: string; effort?: string; reason?: string }
-    // A subagent the router tiered raises itself, capped at its ceiling.
+    const input = e as unknown as { agentId?: string; agent?: string; model?: string; effort?: string; reason?: string }
+    // A subagent cannot raise another agent: only the main conversation passes `agent`.
+    if (input.agentId !== undefined && input.agent !== undefined) {
+      return { result: 'Not changed: only the main conversation can raise a subagent. Use escalate without `agent` to raise yourself.' }
+    }
+    // The main conversation raises a tracked subagent: up only, never above the parent's tier nor opus/high.
+    if (input.agentId === undefined && input.agent !== undefined) {
+      const s = agents.get(input.agent)
+      if (s === undefined) return { result: `No tracked subagent ${input.agent}.` }
+      const up = escalateAgent(s, input, ids, 'main')
+      if (up === undefined) {
+        return { result: `No change: subagent ${input.agent} already runs ${describeTier(s)}; main can raise it to ${modelCap(s, 'main')}/${effortCap(modelCap(s, 'main'), 'main')} at most.` }
+      }
+      agents.set(input.agent, { ...up, errorsInARow: 0 })
+      await logEvent($, input.agent, 'raised by main', describeTier(up), input.reason ?? 'no reason given')
+      return { result: `Subagent ${input.agent} now runs ${describeTier(up)} from its next step.` }
+    }
+    // A subagent the router tiered raises itself, capped at its own ceiling.
     if (input.agentId !== undefined) {
       const s = agents.get(input.agentId)
       if (s === undefined) {
         return { result: 'No routed agent here: escalate applies to the main conversation of a routed turn and to subagents the router tiered. Carry on.' }
       }
       const up = escalateAgent(s, input, ids)
-      if (up === undefined) return { result: `No change: already on ${describeTier(s)}, the ceiling is ${s.ceiling}.` }
+      if (up === undefined) {
+        return { result: `No change: already on ${describeTier(s)}, the ceiling is ${modelCap(s, 'self')}/${effortCap(modelCap(s, 'self'), 'self')} for a subagent on its own.` }
+      }
       agents.set(input.agentId, { ...up, errorsInARow: 0 })
       if (up.effort === 'max' && s.effort !== 'max') await count($, c => ({ ...c, maxEffort: (c.maxEffort ?? 0) + 1 }))
       await logEvent($, input.agentId, 'escalated', describeTier(up), input.reason ?? 'no reason given')
@@ -556,9 +581,20 @@ export const register: Register = (on, options) => {
     const errorsInARow = failed ? s.errorsInARow + 1 : 0
     const up = errorsInARow >= AUTO_ESCALATE_AFTER ? stepUp(s, ids) : undefined
     if (up === undefined) {
+      const atCeiling = errorsInARow >= AUTO_ESCALATE_AFTER
       // At the top already: start counting again rather than retrying each call.
-      agents.set(e.agentId, { ...s, errorsInARow: errorsInARow >= AUTO_ESCALATE_AFTER ? 0 : errorsInARow })
-      return ran
+      agents.set(e.agentId, { ...s, errorsInARow: atCeiling ? 0 : errorsInARow })
+      if (!atCeiling || ran.isError !== true) return ran
+      // Nothing left to raise: only the main conversation can go further, so tell the agent to hand back.
+      const at = `${s.tier}/${s.effort ?? 'session effort'}`
+      await logEvent($, e.agentId, 'ceiling reached', at, `${AUTO_ESCALATE_AFTER} tool errors in a row at the subagent ceiling`)
+      return {
+        ...ran,
+        context: [
+          ...(ran.context ?? []),
+          `[model-router] You are at the subagent ceiling (${at}). Stop retrying: report what you found and what is blocking to the main conversation.`,
+        ],
+      }
     }
     agents.set(e.agentId, { ...up, errorsInARow: 0 })
     const why = up.tier === s.tier ? 'more effort on the same model' : 'next model'

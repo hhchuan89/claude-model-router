@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-10-29
+
+Subagents no longer think longer on their own past a modest ceiling: hard judgement belongs to the main conversation,
+which verifies what subagents return, and a subagent that keeps failing should report back.
+
+### Changed
+- A subagent's own cap is Opus at medium. The automatic ladder is now haiku/medium, haiku/high, sonnet/medium,
+  sonnet/high, opus/medium, then stop (still capped by the parent's tier). A subagent's own `escalate` is capped the
+  same way: haiku and sonnet may reach high, Opus stays at medium, and xhigh or max are cut down. `AUTO_EFFORT_CAP`
+  (xhigh) is replaced by `SUBAGENT_SELF_CAP` and a per-model `SELF_EFFORT_CAP`.
+- Hard ceiling for every tracked subagent, including ones that inherit the session's model and effort (decision work,
+  Plan, named agents): a request is never sent above effort high, so an xhigh or max session sends them at high. xhigh
+  and max are main-thread only. Forks and workflow agents are untouched.
+- Escalations to max effort can now only come from the main thread, so the stats counter no longer includes subagents.
+
+### Added
+- The main conversation can raise a subagent: `escalate` takes an optional `agent` (the id the Agent tool returned).
+  It is up-only and capped at Opus (never above the parent's tier, never Fable) at high. Unknown ids reply "No tracked
+  subagent <id>."; a subagent passing `agent` is refused. Logged as `raised by main`.
+- Ceiling guidance: when a subagent already at its cap hits three tool errors in a row again, the failing call's result
+  gets a `[model-router] You are at the subagent ceiling (...)` note telling it to stop retrying and report to the main
+  conversation. Logged as `ceiling reached`.
+
 ## [0.8.0] - 2026-10-29
 
 Opus now decides how much effort it needs instead of starting every decision at high, and the router no longer walks

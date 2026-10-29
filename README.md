@@ -44,7 +44,7 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    *before* doing any work. If not, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
    effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. A move to a higher model lands at that
    tier's effort in the table (Sonnet medium, Opus medium) unless a higher effort is asked. Escalation only goes up within a turn.
-   Effort-only escalation (same model, more effort) exists for the main thread and for subagents alike.
+   Effort-only escalation (same model, more effort) exists for the main thread and for subagents alike (a subagent's own effort is capped, see 6).
    **Opus picks its own effort.** Its assignment starts it at medium and says when to ask for more: medium for most
    work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an
    irreversible, production-affecting decision or after an attempt at xhigh has failed. Max is the most expensive
@@ -68,16 +68,24 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    the automatic ladder below. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
    workflow agents. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
    capped at the parent's tier.
-6. **Subagents can escalate, and are escalated.** The same `escalate` tool works inside a subagent: it may raise its own
-   model or effort from its next step, up to the parent's tier. A model change starts the new tier at medium, or at the asked effort if higher,
-   whatever effort the old model had (a Haiku at xhigh raised to Sonnet runs Sonnet · medium: a bigger model at medium
-   beats a smaller one at max). Effort-only escalation on the same model only goes up. The router also escalates a failing subagent by itself, in two stages. After three tool errors in a row it
-   first raises the effort one step on the same model (Haiku · medium → Haiku · high; cheaper than a model switch, and
-   often enough). If three more errors follow at that tier, it moves to the next model at medium (Haiku · high →
-   Sonnet · medium), and the new model gets its own same-model retry. At the parent's tier only effort rises, and the automatic ladder stops at xhigh: it never sets max
-   (`AUTO_EFFORT_CAP` in `hooks/subagent.ts`), so an agent that merely keeps failing cannot run up the most expensive
-   setting. An agent that inherits the session's effort counts as `high`. A manual `escalate` from the subagent may
-   still set max. Escalation only goes up.
+6. **Subagents can escalate, are escalated, and have a ceiling.** The same `escalate` tool works inside a subagent: it
+   may raise its own model or effort from its next step, but on its own never above **Opus at medium** (haiku and
+   sonnet may reach high; xhigh and max are cut down), and never above the parent's tier. A model change starts the new
+   tier at medium, or at the asked effort if higher, whatever effort the old model had. Effort-only escalation on the
+   same model only goes up. The router also escalates a failing subagent by itself, in two stages. After three tool
+   errors in a row it first raises the effort one step on the same model (Haiku · medium → Haiku · high), and if three
+   more follow at that tier it moves to the next model at medium (Haiku · high → Sonnet · medium), where the new model
+   gets its own same-model retry. The whole ladder is haiku/medium, haiku/high, sonnet/medium, sonnet/high,
+   opus/medium, then it stops (`SUBAGENT_SELF_CAP` and `SELF_EFFORT_CAP` in `hooks/subagent.ts`). An agent that
+   inherits the session's effort counts as `high`. **At the ceiling the router raises nothing:** after three more tool
+   errors it appends a note to that failing call's result ("You are at the subagent ceiling (opus/medium). Stop
+   retrying: report what you found and what is blocking to the main conversation") and logs `ceiling reached`.
+   **Only the main conversation can raise a subagent further:** it calls `escalate` with `agent` set to the subagent's
+   id (as the Agent tool returned it), and the subagent is raised up-only to at most Opus at high, never above the
+   parent's tier ("Subagent <id> now runs opus/high from its next step."; an unknown id gets "No tracked subagent
+   <id>."; a subagent passing `agent` is refused). **Hard ceiling:** no tracked subagent request is ever sent above
+   effort high, including agents that inherit the session's model and effort, so an xhigh or max session still
+   sends them at high; xhigh and max are main-thread only. Forks and workflow agents are not capped by the router.
 7. **No Fable 5.1.** Any request or subagent asking for Fable runs on Opus instead, and a Fable parent never passes
    Fable down. Optionally, set `reviewModel` (for example `claude-fable-5-5`) and, if that model exists on your account
    (checked once a day), each Opus decision is reviewed by it and the review is added as a notice. The reviewer is off
@@ -107,8 +115,8 @@ never affects a turn.
 
 `event` is one of: `turn route` (agent `main`, the route chosen for a turn), `turn inherit` (agent `main`, a turn without
 a person prompt that continued the previous route), `<subagentType> start` (a subagent
-started, for example `Explore start`), `escalated` (a subagent raised its own model or effort) and `auto-escalated`
-(the router raised it after repeated tool errors). `byEffort` counts steps per effort; `default` means the session's
+started, for example `Explore start`), `escalated` (a subagent raised its own model or effort), `raised by main` (the main conversation raised it), `auto-escalated`
+(the router raised it after repeated tool errors) and `ceiling reached` (three more errors at the subagent ceiling). `byEffort` counts steps per effort; `default` means the session's
 own effort. `stats` covers routed subagents only.
 
 ## Privacy
@@ -136,7 +144,7 @@ Every model request (the router's own Haiku calls included) is priced at Anthrop
 the day and the all-time totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
 `/model-router stats` shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
 keeps, routed subagents, Fable requests moved to Opus, model mismatches (routed model not the one that answered),
-classifier failures by reason and escalations to max effort (main thread and subagents, counted when effort moves to
+classifier failures by reason and escalations to max effort (main thread only, counted when effort moves to
 max from below).
 
 This is an estimate; see "Assumptions in the meter" below.

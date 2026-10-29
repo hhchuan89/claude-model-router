@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
 import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
-import { AUTO_EFFORT_CAP, decideSpawn, escalateAgent, logDir, startOf, stepUp } from '../hooks/subagent'
+import { capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
   test('parses the classifier reply and rejects junk', async () => {
@@ -170,8 +170,8 @@ function world(
   return seen
 }
 
-async function step($: any, turnId: string, model = 'claude-opus-5-5[1m]', agentId?: string) {
-  const s = $.turn.step({ turnId, index: 0, model, effort: 'high', messageCount: 3, agentId } as never)
+async function step($: any, turnId: string, model = 'claude-opus-5-5[1m]', agentId?: string, effort = 'high') {
+  const s = $.turn.step({ turnId, index: 0, model, effort, messageCount: 3, agentId } as never)
   for await (const _ of s) {
     // drain
   }
@@ -472,39 +472,51 @@ describe('subagent rules', () => {
     expect(stepUp(sonnetRetried, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'medium', retriedAtTier: false })
   })
 
-  // WHY: max is the most expensive setting; an agent that merely keeps failing must not be walked up to it by the router.
-  test('at the ceiling only effort rises, one step each time, and the automatic ladder stops at xhigh', async () => {
-    const top = startOf('opus', OPUS, true, IDS_BY_KEY)
-    const high = stepUp(top, IDS_BY_KEY)!
-    const xhigh = stepUp(high, IDS_BY_KEY)!
-    expect(high).toMatchObject({ tier: 'opus', effort: 'high' })
-    expect(xhigh).toMatchObject({ tier: 'opus', effort: 'xhigh' })
-    expect(AUTO_EFFORT_CAP).toBe('xhigh')
-    expect(stepUp(xhigh, IDS_BY_KEY)).toBeUndefined()
-    // a sonnet parent caps a sonnet agent the same way: no opus, effort only
-    const capped = startOf('sonnet', 'claude-sonnet-5-5', true, IDS_BY_KEY)
-    expect(stepUp({ ...capped, retriedAtTier: true }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+  // WHY: hard judgement belongs to the main conversation, which verifies what subagents return; a subagent that keeps
+  // failing reports back instead of thinking longer, so its own ladder ends at opus/medium.
+  test('the automatic ladder ends at opus/medium: no effort step on opus, and nothing above', async () => {
+    expect(SUBAGENT_SELF_CAP).toEqual({ model: 'opus', effort: 'medium' })
+    expect(SELF_EFFORT_CAP).toEqual({ haiku: 'high', sonnet: 'high', opus: 'medium' })
+    const walk: string[] = []
+    let cur: ReturnType<typeof startOf> | undefined = startOf('haiku', OPUS, true, IDS_BY_KEY)
+    while (cur) {
+      walk.push(`${cur.tier}/${cur.effort}`)
+      cur = stepUp(cur, IDS_BY_KEY)
+    }
+    expect(walk).toEqual(['haiku/medium', 'haiku/high', 'sonnet/medium', 'sonnet/high', 'opus/medium'])
+    // a sonnet parent caps the ladder at sonnet's own last step
+    const sonnet = startOf('sonnet', 'claude-sonnet-5-5', true, IDS_BY_KEY)
+    const high = stepUp(sonnet, IDS_BY_KEY)!
+    expect(high).toMatchObject({ tier: 'sonnet', effort: 'high' })
+    expect(stepUp(high, IDS_BY_KEY)).toBeUndefined()
   })
 
-  test('an agent that inherits the session effort counts as high, so its first step is xhigh on the same model', async () => {
+  // WHY: an inheriting agent counts as high, which is already above opus's self cap, so it has no effort step left.
+  test('an agent that inherits the session effort counts as high: on opus it has nowhere to go by itself', async () => {
     const inheriting = startOf(OPUS, OPUS, false, IDS_BY_KEY)
     expect(inheriting.effort).toBeUndefined()
-    expect(stepUp(inheriting, IDS_BY_KEY)).toMatchObject({ tier: 'opus', model: undefined, effort: 'xhigh', retriedAtTier: true })
+    expect(stepUp(inheriting, IDS_BY_KEY)).toBeUndefined()
+    expect(escalateAgent(inheriting, { effort: 'xhigh' }, IDS_BY_KEY)).toBeUndefined()
+    // an inherited sonnet (a named agent) can still move to opus at medium
+    expect(stepUp(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY), IDS_BY_KEY)).toMatchObject({ tier: 'opus', model: IDS_BY_KEY.opus, effort: 'medium' })
   })
 
   test('a manual effort-only escalate keeps the model and the retry flag; a model change resets the flag', async () => {
     const retried = stepUp(startOf('haiku', OPUS, true, IDS_BY_KEY), IDS_BY_KEY)!
-    expect(escalateAgent(retried, { effort: 'xhigh' }, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'xhigh', retriedAtTier: true })
+    const fresh = startOf('haiku', OPUS, true, IDS_BY_KEY)
+    expect(escalateAgent({ ...fresh, retriedAtTier: true }, { effort: 'high' }, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', model: IDS_BY_KEY.haiku, effort: 'high', retriedAtTier: true })
+    // xhigh is above a subagent's own cap: the request changes nothing
+    expect(escalateAgent(retried, { effort: 'xhigh' }, IDS_BY_KEY)).toBeUndefined()
     expect(escalateAgent(retried, { model: 'sonnet' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', retriedAtTier: false })
   })
 
   // WHY: effort is the cheap lever and can be raised later, but a bigger model at medium beats a smaller one at max,
   // so a model change throws away the old model's effort instead of carrying it over.
-  test('a haiku at xhigh raised to sonnet runs sonnet at medium: effort resets on a model change', async () => {
+  test('a haiku at high raised to sonnet runs sonnet at medium: effort resets on a model change', async () => {
     const haiku = startOf('haiku', OPUS, true, IDS_BY_KEY)
-    const xhigh = escalateAgent(haiku, { effort: 'xhigh' }, IDS_BY_KEY)!
-    expect(xhigh).toMatchObject({ tier: 'haiku', effort: 'xhigh' })
-    expect(escalateAgent(xhigh, { model: 'sonnet' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', model: IDS_BY_KEY.sonnet, effort: 'medium', retriedAtTier: false })
+    const high = escalateAgent(haiku, { effort: 'high' }, IDS_BY_KEY)!
+    expect(high).toMatchObject({ tier: 'haiku', effort: 'high' })
+    expect(escalateAgent(high, { model: 'sonnet' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', model: IDS_BY_KEY.sonnet, effort: 'medium', retriedAtTier: false })
   })
 
   // WHY: resetting to medium must not swallow a deliberate request for more thought on the new model.
@@ -647,13 +659,13 @@ test('the second run of three errors raises the model; the log says which stage 
   ])
 })
 
-test('a subagent can raise only its effort by hand: the model stays', async ($, on) => {
+test('a subagent can raise only its effort by hand: the model stays, and effort stops at high on haiku', async ($, on) => {
   const seen = world($, on, null)
   const id = await spawnAgent($, { subagentType: 'Explore' })
   const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'xhigh', reason: 'needs more thought' } as never)) as { result: string }
-  expect(r.result).toBe('Escalated to haiku/xhigh from your next step.')
+  expect(r.result).toBe('Escalated to haiku/high from your next step.')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'xhigh' })
+  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
 })
 
 test('an unsure turn after a decide turn stays on opus: low confidence never downgrades', async ($, on) => {
@@ -1122,20 +1134,16 @@ describe('opus effort guidance and the max-effort guard', () => {
     expect(assignmentContext(routeFor('decide', 'x'))).toContain('max only for an irreversible')
   })
 
-  test('the automatic ladder never sets max, even at the ceiling, while a subagent may still escalate to max by hand', async ($, on) => {
-    const ceiling = stepUp(stepUp(startOf('opus', OPUS, true, IDS_BY_KEY)!, IDS_BY_KEY)!, IDS_BY_KEY)!
-    expect(ceiling.effort).toBe('xhigh')
-    expect(stepUp(ceiling, IDS_BY_KEY)).toBeUndefined()
-    expect(escalateAgent(ceiling, { effort: 'max' }, IDS_BY_KEY)).toMatchObject({ tier: 'opus', effort: 'max' })
-
+  // WHY: xhigh and max are main-thread only: a subagent that asks for them by hand gets the cap, and max is never counted for it.
+  test('a subagent cannot reach max or xhigh by hand: the request is capped, and no max is counted', async ($, on) => {
     const seen = world($, on, null)
     const id = await spawnAgent($, { subagentType: 'Explore' })
     const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'max', reason: 'irreversible change' } as never)) as { result: string }
-    expect(r.result).toBe('Escalated to haiku/max from your next step.')
+    expect(r.result).toBe('Escalated to haiku/high from your next step.')
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'max' })
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
     const stats = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
-    expect(stats.text).toContain('Escalations to max effort: 1.')
+    expect(stats.text).toContain('Escalations to max effort: 0.')
   })
 
   // WHY: max should be rare; the stats line is how that is checked, so only a move to max from below may count.
@@ -1152,5 +1160,139 @@ describe('opus effort guidance and the max-effort guard', () => {
     await step($, 't1')
     expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'max' })
     expect(await stats()).toContain('Escalations to max effort: 1.')
+  })
+})
+
+// ---- v0.8.1: subagent caps ----
+
+const ESCALATE = 'mcp__model-router__escalate'
+const call = ($: any, input: Record<string, unknown>) => $.tool.call({ tool: ESCALATE, ...input } as never) as Promise<{ result: string }>
+
+describe('subagent caps (v0.8.1)', () => {
+  // WHY: a subagent that keeps failing must hand the problem back to the main conversation, not think longer on its own.
+  test('a subagent escalating itself to opus/high or opus/xhigh is capped at opus/medium', async ($, on) => {
+    const seen = world($, on, null)
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    const r = await call($, { agentId: id, model: 'opus', effort: 'high', reason: 'hard' })
+    expect(r.result).toBe('Escalated to opus/medium from your next step.')
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'medium' })
+    const more = await call($, { agentId: id, effort: 'xhigh', reason: 'harder' })
+    expect(more.result).toContain('No change')
+    expect(more.result).toContain('the ceiling is opus/medium')
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps[1]).toMatchObject({ model: OPUS, effort: 'medium' })
+  })
+
+  // WHY: the main conversation verifies what subagents return, so it alone may spend more on one; never beyond opus/high.
+  test('the main conversation raises a subagent to opus/high, but xhigh and max are cut down to high', async ($, on) => {
+    const seen = world($, on, null)
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    const r = await call($, { agent: id, model: 'opus', effort: 'xhigh', reason: 'main judges it needs more' })
+    expect(r.result).toBe(`Subagent ${id} now runs opus/high from its next step.`)
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'high' })
+    const max = await call($, { agent: id, effort: 'max', reason: 'x' })
+    expect(max.result).toContain('No change')
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps[1]).toMatchObject({ model: OPUS, effort: 'high' })
+    expect(MAIN_RAISE_CAP).toEqual({ model: 'opus', effort: 'high' })
+    expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: id, event: 'raised by main', to: 'opus/high', reason: 'main judges it needs more' }))
+  })
+
+  test('main raising a subagent never passes the parent tier: a sonnet parent keeps its subagents on sonnet', async ($, on) => {
+    const seen = world($, on, null)
+    const id = await spawnAgent($, { subagentType: 'Explore', parentModel: 'claude-sonnet-5-5' })
+    const r = await call($, { agent: id, model: 'opus', effort: 'high', reason: 'x' })
+    expect(r.result).toBe(`Subagent ${id} now runs sonnet/high from its next step.`)
+    await step($, 'sub', 'claude-sonnet-5-5', id)
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+  })
+
+  test('main naming an agent the router does not track gets a clear reply and changes nothing', async ($, on) => {
+    const seen = world($, on, '{"tier":"lookup","reason":"找文件"}')
+    await $.prompt.submit({ text: 'find files' } as never)
+    const r = await call($, { agent: 'ghost', model: 'opus', reason: 'x' })
+    expect(r.result).toBe('No tracked subagent ghost.')
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+  })
+
+  // WHY: only the main conversation judges what a subagent needs; one subagent steering another would bypass that check.
+  test('a subagent passing agent cannot raise another agent, and does not raise itself either', async ($, on) => {
+    const seen = world($, on, null)
+    const a = await spawnAgent($, { subagentType: 'Explore' })
+    const b = await spawnAgent($, { subagentType: 'Explore' })
+    const r = await call($, { agentId: a, agent: b, model: 'sonnet', reason: 'x' })
+    expect(r.result).toContain('only the main conversation can raise a subagent')
+    await step($, 'sub', OPUS, a)
+    await step($, 'sub', OPUS, b)
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+    expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+  })
+
+  // WHY: agents that inherit (decide work, Plan, named agents) keep the session's effort, which may be xhigh or max;
+  // those two are main-thread only, so the request is cut to high on its way out. The main thread keeps its own.
+  test('an inheriting subagent on an xhigh or max session is sent at high; the main thread is left at its own effort', async ($, on) => {
+    const seen = world($, on, null)
+    const id = await spawnAgent($, { subagentType: 'thorough-reviewer' })
+    await step($, 'sub', OPUS, id, 'xhigh')
+    await step($, 'sub', OPUS, id, 'max')
+    await step($, 'sub', OPUS, id, 'medium')
+    await step($, 'main', OPUS, undefined, 'xhigh')
+    expect(seen.steps.map(x => x.effort)).toEqual(['high', 'high', 'medium', 'xhigh'])
+    expect(capSent('max')).toBe('high')
+    expect(capSent(undefined)).toBeUndefined()
+    expect(HARD_EFFORT_CAP).toBe('high')
+  })
+
+  test('a subagent raised by main to opus/high is still sent at high, never above', async ($, on) => {
+    const seen = world($, on, null)
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    await call($, { agent: id, model: 'opus', effort: 'high', reason: 'x' })
+    await step($, 'sub', OPUS, id, 'max')
+    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'high' })
+  })
+
+  // WHY: forks and workflow agents are not tiered by the router, so they are not capped by it either.
+  test('forks are untouched: not tracked, so xhigh stays xhigh', async ($, on) => {
+    const seen = world($, on, null)
+    const id = await spawnAgent($, { fork: true })
+    await step($, 'sub', OPUS, id, 'xhigh')
+    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'xhigh' })
+    const r = await call($, { agent: id, effort: 'high', reason: 'x' })
+    expect(r.result).toBe(`No tracked subagent ${id}.`)
+  })
+
+  // WHY: at the ceiling nothing more can be raised, so the failing agent is told to stop and report instead of retrying.
+  test('at the ceiling, three more errors add the stop-and-report guidance to that call, and are logged', async ($, on) => {
+    const seen = world($, on, null)
+    on('tool.call', async (_$: unknown, e: any) => ({ result: 'boom', isError: e.file_path === 'bad' }) as never)
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    const bad = () => $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never) as Promise<{ context?: string[]; result: unknown; isError?: boolean }>
+    const results = []
+    // haiku/medium -> haiku/high -> sonnet/medium -> sonnet/high -> opus/medium: four climbs of three errors each
+    for (let i = 0; i < 15; i++) results.push(await bad())
+    expect(results.slice(0, 14).every(r => r.context === undefined)).toBe(true)
+    const last = results[14]!
+    expect(last.context).toEqual([
+      '[model-router] You are at the subagent ceiling (opus/medium). Stop retrying: report what you found and what is blocking to the main conversation.',
+    ])
+    // the original result is otherwise unchanged
+    expect(last).toMatchObject({ result: 'boom', isError: true })
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'medium' })
+    expect(eventsOf(seen).filter(ev => ev.event === 'ceiling reached')).toMatchObject([{ agentId: id, to: 'opus/medium' }])
+  })
+
+  test('a subagent that main raised to opus/high gets the guidance after three errors: the ladder has no step above its own cap', async ($, on) => {
+    world($, on, null)
+    on('tool.call', async (_$: unknown, e: any) => ({ result: 'boom', isError: e.file_path === 'bad' }) as never)
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    await call($, { agent: id, model: 'opus', effort: 'high', reason: 'x' })
+    const bad = () => $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never) as Promise<{ context?: string[] }>
+    await bad()
+    await bad()
+    expect((await bad()).context?.[0]).toContain('subagent ceiling (opus/high)')
   })
 })

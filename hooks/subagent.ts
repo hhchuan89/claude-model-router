@@ -16,6 +16,23 @@ const RANK: Record<Family, number> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 }
 const START_EFFORT: Record<ModelKey, Effort> = { haiku: 'medium', sonnet: 'medium', opus: 'medium' }
 export const AUTO_ESCALATE_AFTER = 3
 
+// Who may raise a subagent how far. xhigh and max belong to the main conversation's own thread: a subagent
+// never reaches them, so a failing one hands the problem back instead of thinking longer (the main thread
+// verifies what subagents return).
+// 1. By itself (the automatic ladder and its own `escalate`): never above Opus at medium; lower models
+//    keep their effort steps (haiku and sonnet up to high).
+export const SUBAGENT_SELF_CAP: { model: ModelKey; effort: Effort } = { model: 'opus', effort: 'medium' }
+export const SELF_EFFORT_CAP: Record<ModelKey, Effort> = { haiku: 'high', sonnet: 'high', opus: SUBAGENT_SELF_CAP.effort }
+// 2. Raised by the main conversation (`escalate` with `agent`): never above Opus at high.
+export const MAIN_RAISE_CAP: { model: ModelKey; effort: Effort } = { model: 'opus', effort: 'high' }
+// 3. Whatever a tracked subagent is sent, including one that inherits the session's effort: never above this.
+export const HARD_EFFORT_CAP: Effort = 'high'
+
+// The engine's effort type also allows a number, which has no named rank here and passes through.
+export function capSent<T extends Effort | number | undefined>(effort: T): T | Effort {
+  return typeof effort === 'string' && EFFORTS.indexOf(effort) > EFFORTS.indexOf(HARD_EFFORT_CAP) ? HARD_EFFORT_CAP : effort
+}
+
 export function familyOf(model: string | undefined): Family | undefined {
   const m = model?.toLowerCase() ?? ''
   return (['fable', 'opus', 'sonnet', 'haiku'] as const).find(f => m.includes(f))
@@ -26,6 +43,9 @@ function ceilingOf(parentModel: string | undefined): ModelKey {
   const parent = familyOf(parentModel) ?? 'opus'
   return parent === 'fable' ? 'opus' : parent
 }
+
+// The effort a tracked subagent counts as running at when it inherits the session's.
+const INHERITED_EFFORT: Effort = 'high'
 
 function clamp(target: Family, ceiling: ModelKey): ModelKey {
   return RANK[target] > RANK[ceiling] ? ceiling : (target as ModelKey)
@@ -99,19 +119,39 @@ export function startOf(resolved: string | undefined, parentModel: string, isPin
 }
 
 export type SubEscalateRequest = { model?: string; effort?: string }
+// self: the subagent itself (or the automatic ladder). main: the main conversation raising it.
+export type RaisedBy = 'self' | 'main'
 
-// Only up, never past the ceiling. undefined: nothing would change.
-export function escalateAgent(s: AgentTier, req: SubEscalateRequest, ids: Record<ModelKey, string>): AgentTier | undefined {
+// The most a subagent on `tier` may be raised to, by `by`. The model never passes the parent's tier (s.ceiling)
+// and never the cap's model; effort is capped per who raises it.
+export function modelCap(s: AgentTier, by: RaisedBy): ModelKey {
+  const cap = by === 'main' ? MAIN_RAISE_CAP.model : SUBAGENT_SELF_CAP.model
+  return RANK[cap] < RANK[s.ceiling] ? cap : s.ceiling
+}
+
+export function effortCap(tier: ModelKey, by: RaisedBy): Effort {
+  return by === 'main' ? MAIN_RAISE_CAP.effort : SELF_EFFORT_CAP[tier]
+}
+
+// Only up, never past the caps. undefined: nothing would change.
+export function escalateAgent(
+  s: AgentTier,
+  req: SubEscalateRequest,
+  ids: Record<ModelKey, string>,
+  by: RaisedBy = 'self',
+): AgentTier | undefined {
   const askedModel = familyOf(req.model)
-  const tier = askedModel === undefined ? s.tier : clamp(RANK[askedModel] > RANK[s.tier] ? askedModel : s.tier, s.ceiling)
-  // A new tier starts no lower than its own starting effort: haiku raised to sonnet runs at least medium.
-  const asked = EFFORTS.indexOf(req.effort as Effort)
+  const tier = askedModel === undefined ? s.tier : clamp(RANK[askedModel] > RANK[s.tier] ? askedModel : s.tier, modelCap(s, by))
+  // A request for more than the cap is the cap; a request below what the agent already has changes nothing.
+  const cap = EFFORTS.indexOf(effortCap(tier, by))
+  const wanted = EFFORTS.indexOf(req.effort as Effort)
+  const asked = wanted > cap ? cap : wanted
   // A tier change starts the new model at its starting effort (or the asked one, if higher), not at the
-  // old model's effort; on the same model effort only goes up.
+  // old model's effort; on the same model effort only goes up. An inheriting agent counts as high.
   const effort =
     tier !== s.tier
       ? EFFORTS[Math.max(asked, EFFORTS.indexOf(START_EFFORT[tier]))]
-      : asked > (s.effort === undefined ? -1 : EFFORTS.indexOf(s.effort))
+      : asked > EFFORTS.indexOf(s.effort ?? INHERITED_EFFORT)
         ? EFFORTS[asked]
         : s.effort
   if (tier === s.tier && effort === s.effort) return undefined
@@ -119,21 +159,19 @@ export function escalateAgent(s: AgentTier, req: SubEscalateRequest, ids: Record
   return { ...s, tier, model: tier === s.tier ? s.model : ids[tier], effort, retriedAtTier: tier === s.tier ? s.retriedAtTier : false }
 }
 
-// The automatic ladder, one step per call. First more effort on the same model (cheaper than a model
-// switch, and often enough), then the next tier at its starting effort; at the ceiling effort only,
-// until max. undefined: nothing left to raise.
-// The automatic ladder never reaches max: max is for a model that judges a task needs it, through escalate.
-export const AUTO_EFFORT_CAP: Effort = 'xhigh'
-
+// The automatic ladder, one step per call, always by the subagent's own authority: first more effort on the same
+// model (cheaper than a model switch, and often enough), then the next tier at its starting effort; it stops at
+// the self cap (opus/medium, or the parent's tier if lower, with that tier's own effort step).
+// undefined: nothing left to raise.
 export function stepUp(s: AgentTier, ids: Record<ModelKey, string>): AgentTier | undefined {
-  const raised = EFFORTS[(s.effort === undefined ? EFFORTS.indexOf('high') : EFFORTS.indexOf(s.effort)) + 1]
-  const nextEffort = raised !== undefined && EFFORTS.indexOf(raised) <= EFFORTS.indexOf(AUTO_EFFORT_CAP) ? raised : undefined
+  const raised = EFFORTS[EFFORTS.indexOf(s.effort ?? INHERITED_EFFORT) + 1]
+  const nextEffort = raised !== undefined && EFFORTS.indexOf(raised) <= EFFORTS.indexOf(effortCap(s.tier, 'self')) ? raised : undefined
   if (!s.retriedAtTier && nextEffort !== undefined) {
     const up = escalateAgent(s, { effort: nextEffort }, ids)
     return up && { ...up, retriedAtTier: true }
   }
   const next = (['haiku', 'sonnet', 'opus'] as const)[RANK[s.tier] + 1]
-  if (next !== undefined && RANK[next] <= RANK[s.ceiling]) return escalateAgent(s, { model: next }, ids)
+  if (next !== undefined && RANK[next] <= RANK[modelCap(s, 'self')]) return escalateAgent(s, { model: next }, ids)
   return nextEffort === undefined ? undefined : escalateAgent(s, { effort: nextEffort }, ids)
 }
 
