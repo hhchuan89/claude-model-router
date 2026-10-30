@@ -26,8 +26,8 @@ everything on Opus. The numbers are one person's working day, not a typical resu
 | Tier | Model · effort | What lands here |
 |------|----------------|-----------------|
 | lookup | Haiku · medium | Retrieval and mechanical work with nothing to judge: find/grep/list, read a value or status, run a named command, rename, typo, format, short translation |
-| execute | Sonnet · medium | Work whose "what" is settled: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan |
-| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, anything irreversible or outward-facing |
+| execute | Sonnet · medium | Work whose "what" is settled in the message or visible context: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan |
+| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs, anything irreversible or outward-facing |
 
 1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
@@ -54,6 +54,9 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an
    irreversible, production-affecting decision or after an attempt at xhigh has failed. Max is the most expensive
    setting, so it is meant to be rare, and `/model-router stats` counts every escalation to max.
+   **Opus plans, a subagent carries it out.** Once a plan is settled and carrying it out spans several files or many
+   steps, the assignment tells Opus to delegate it to a general-purpose subagent without a model, which the classifier
+   puts on Sonnet, and to verify the result. Switching the main thread itself to Sonnet would rewrite its whole cache.
 3. **Route every request.** Each model request of the turn runs on the route, keeping a context-window suffix such as `[1m]`.
 4. **Never leave a warm cache for a cheaper model (the round-trip guard).** Switching to a smaller model makes it read
    the whole context uncached, and coming back to the bigger one rewrites that cache again. Real use showed this
@@ -69,7 +72,9 @@ everything on Opus. The numbers are one person's working day, not a typical resu
 5. **Route subagents.** A subagent spawned without a model gets one by its job, decided when it starts:
    `Explore` runs on Haiku · medium; `general-purpose` is sorted by the same classifier (lookup → Haiku · medium,
    execute → Sonnet · medium, decide → inherits the parent's model, never a pinned Opus; if classification fails,
-   Sonnet). Pinned subagents start at medium on every model, because effort can be raised later, by the agent or by
+   Sonnet). Pinned subagents start at medium on every model, whether the router pinned them or the caller named Haiku or
+   Sonnet (the caller's model is kept; an Opus pin keeps the session effort, since medium is Opus's self cap), unless
+   the Agent call set an effort, which is kept, because effort can be raised later, by the agent or by
    the automatic ladder below. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
    workflow agents. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
    capped at the parent's tier.
@@ -153,7 +158,9 @@ never affects a turn.
 `event` is one of: `turn route` (agent `main`, the route chosen for a turn), `turn inherit` (agent `main`, a turn without
 a person prompt that continued the previous route), `<subagentType> start` (a subagent
 started, for example `Explore start`), `escalated` (a subagent raised its own model or effort), `raised by main` (the main conversation raised it), `auto-escalated`
-(the router raised it after repeated tool errors) and `ceiling reached` (three more errors at the subagent ceiling). `byEffort` counts steps per effort; `default` means the session's
+(the router raised it after repeated tool errors), `ceiling reached` (three more errors at the subagent ceiling), and
+`compact idle` / `compact cap` (agent `main`: a compaction attempt; `to` is `done`, `skipped` or `rejected`, `reason` the
+size before → after, the veto or the engine error). `byEffort` counts steps per effort; `default` means the session's
 own effort. `stats` covers routed subagents only.
 
 ## Privacy
@@ -179,7 +186,8 @@ own effort. `stats` covers routed subagents only.
 
 Every model request (the router's own Haiku calls included) is priced at Anthropic API rates and added to the turn,
 the day and the all-time totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
-`/model-router stats` shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
+`/model-router stats` first names the compaction settings this session loaded and whether the router is on (if a
+settings change does not show, reload plugins or restart the session), then shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
 keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus, model mismatches (routed model not the one that answered),
 classifier failures by reason and escalations to max effort (main thread only, counted when effort moves to
 max from below).

@@ -1,8 +1,8 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
-import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
-import { capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
+import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
   test('parses the classifier reply and rejects junk', async () => {
@@ -1970,5 +1970,157 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     })
     expect(seen).toBeDefined()
     expect(await statsOf($)).toContain('Compactions at idle (cache warm): 0')
+  })
+
+  // ---- v0.10.0 ----
+
+  describe('compaction is visible (v0.10.0)', () => {
+    // WHY: a session started before the settings changed ran all day at 950k with the guard off, and nothing said so.
+    test('stats name the compaction settings this session loaded, and say off when they are off', async ($, on) => {
+      compactWorld($, on)
+      expect(await statsOf($)).toContain('Compaction in this session: router on · idle off · cap off · min context 100.0k.')
+    })
+
+    test('stats show loaded idle minutes and cap', { options: { idleCompactMinutes: 50, compactAtContext: 300_000 } }, async ($, on) => {
+      compactWorld($, on)
+      const text = await statsOf($)
+      expect(text).toContain('Compaction in this session: router on · idle after 50 min · cap at 300.0k · min context 100.0k.')
+      expect(text).toContain('reload plugins or restart the session')
+    })
+
+    // WHY: off stops both guards; a line that still lists thresholds reads as if compaction ran.
+    test('with the router off the line says no compaction runs', { options: { compactAtContext: 300_000 } }, async ($, on) => {
+      compactWorld($, on)
+      await $.command.run({ command: 'model-router', args: 'off' } as never)
+      expect(await statsOf($)).toContain('Compaction in this session: router off, so no compaction runs · idle off · cap at 300.0k')
+    })
+
+    test('every compaction attempt lands in the events log with its outcome', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.sizes = { tokensBefore: 250_000, tokensAfter: 20_000 }
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: 'main', event: 'compact cap', to: 'done', reason: '250.0k → 20.0k' }))
+    })
+
+    test('a rejected compaction is logged with the engine error', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen } = compactWorld($, on, 'reject')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(30 * 60_000)
+      // The reason is the engine's error text, which the test kit words its own way.
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: 'main', event: 'compact idle', to: 'rejected' }))
+    })
+
+    test('a vetoed compaction is logged as skipped with the veto', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen } = compactWorld($, on, 'skip')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(30 * 60_000)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ event: 'compact idle', to: 'skipped', reason: 'vetoed' }))
+    })
+  })
+})
+
+describe('caller-pinned subagents start at medium (v0.10.0)', () => {
+  // WHY: 30 subagents pinned to sonnet by the caller ran 1,649 steps at high, against "every tier starts at medium".
+  test('a sonnet the caller named runs at medium, not at the session effort', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'sonnet' })
+    seen.usage.push(U(10, 1, 0, 0, 'claude-sonnet-5-5'))
+    await step($, 'sub', 'claude-sonnet-5-5', id, 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium', agentId: id })
+    expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: id, to: 'sonnet/medium' }))
+  })
+
+  test('its model stays the one the caller named: only the effort starts at medium', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'claude-sonnet-4-5' })
+    await step($, 'sub', 'claude-sonnet-4-5', id, 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-4-5', effort: 'medium' })
+  })
+
+  test('it can still be raised: the ladder goes to sonnet/high first', async () => {
+    expect(stepUp(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true), IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+  })
+
+  // WHY: medium is Opus's own self cap: an Opus pin at medium could never raise itself, and it used to run at the
+  // session effort. Sonnet and Haiku at medium can still go to high by themselves, so they start at medium anywhere.
+  test('an opus pin keeps the session effort; sonnet and haiku pins start at medium, even on the parent tier', async () => {
+    expect(startOf(OPUS, OPUS, false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf(OPUS, 'claude-fable-5-1', false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf('claude-sonnet-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBe('medium')
+    expect(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true).effort).toBe('medium')
+    expect(startOf('claude-haiku-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBe('medium')
+  })
+
+  test('an opus the caller named under an opus parent runs at the session effort, capped at high', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'opus' })
+    await step($, 'sub', OPUS, id, 'xhigh')
+    expect(seen.steps.at(-1)).toMatchObject({ model: OPUS, effort: 'high' })
+  })
+
+  test('an inheriting agent, `inherit` and an unknown id keep the session effort, as before', async () => {
+    expect(startOf(OPUS, OPUS, false, IDS_BY_KEY).effort).toBeUndefined()
+    expect(isCallerPin(undefined)).toBe(false)
+    expect(isCallerPin('inherit')).toBe(false)
+    expect(isCallerPin('my-model')).toBe(false)
+    expect(isCallerPin('claude-fable-5-1')).toBe(false)
+    expect(isCallerPin('haiku')).toBe(true)
+  })
+})
+
+describe('execute needs a settled plan; opus delegates settled work (v0.10.0)', () => {
+  // WHY: 9 of 37 Sonnet main turns went to Opus at their first step. The wording read as execute ("add it to the PR",
+  // "cherry-pick it") while what to change still had to be worked out.
+  test('the classifier calls work execute only when what to change is visible', async () => {
+    const text = classifierSystem('en')
+    expect(text).toContain('already settled in the message or the context you can see')
+    expect(text).toContain('is execute when the context shows what to\n  change (an approved plan')
+    expect(text).toContain('When what to change still has to be worked out, it is decide.')
+    // An approved plan stays execute: the new rule must not contradict the old one.
+    expect(text).toContain('is execute, because the plan settles what to do')
+    expect(text).toContain('porting a change to a branch whose version of the code differs')
+  })
+
+  test('opus is told to hand settled multi-file work to an unpinned subagent and verify it; other models are not', async () => {
+    expect(assignmentContext(routeFor('decide', ''))).toContain('delegate it to a general-purpose subagent without a model')
+    expect(assignmentContext(routeFor('decide', ''))).toContain('make small changes directly')
+    expect(assignmentContext(routeFor('execute', ''))).not.toContain('delegate it')
+  })
+})
+
+describe('an effort the caller sets on the Agent tool is kept (v0.10.0, review P2)', () => {
+  // WHY: Agent({ model: "sonnet", effort: "high" }) is an explicit request; starting it at medium silently overrode it.
+  function agentWorld($: any, on: any) {
+    const seen = world($, on, execute)
+    const ids: string[] = []
+    // As the engine does: the Agent tool call spawns the subagent while the call runs, under the same tool_use_id.
+    on('tool.call', async (_$: unknown, e: any) => {
+      if (e.tool === 'Agent') ids.push(await spawnAgent($, { tool_use_id: e.tool_use_id, model: e.model, subagentType: e.subagent_type ?? 'general-purpose' }))
+      return { result: 'ok' } as never
+    })
+    return { seen, ids }
+  }
+
+  test('a caller pin with an explicit effort runs at that effort, not at medium', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-1', model: 'sonnet', effort: 'high', prompt: 'p' } as never)
+    await step($, 'sub', 'claude-sonnet-5-5', ids[0], 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+  })
+
+  test('a router pin with an explicit effort keeps it too; the hard cap still holds', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-2', effort: 'max', prompt: 'p', subagent_type: 'Explore' } as never)
+    await step($, 'sub', OPUS, ids[0], 'max')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+  })
+
+  test('without an explicit effort the pin starts at medium; one call never leaks its effort into the next', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-3', model: 'sonnet', effort: 'high', prompt: 'p' } as never)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-4', model: 'sonnet', prompt: 'p' } as never)
+    await step($, 'sub', 'claude-sonnet-5-5', ids[1], 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ effort: 'medium' })
   })
 })
