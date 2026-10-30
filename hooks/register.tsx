@@ -717,7 +717,8 @@ export const register: Register = (on, options) => {
       const key = priceKey(u.model || model)
       const now = await $.clock.now()
       // Read before `last` moves on: a main step that switched family within the TTL is priced for what it cost.
-      const switched = isMain && isSwitchStep(last, key, now)
+      // Send time, like lastMain: the cache is touched when the request goes out, not when a long reply ends.
+      const switched = isMain && isSwitchStep(last, key, sentAt)
       await record($, u.model || model, u, switched)
       if (isMain) {
         // A cache rewrite after the TTL: the person was away over an hour and the whole context was written again.
@@ -738,7 +739,7 @@ export const register: Register = (on, options) => {
         }
         justCompacted = false
         lastMain = { at: sentAt, context: tokensOf(u) - u.output_tokens }
-        if (key !== 'fable') last = { model: key, at: now, context: tokensOf(u) - u.output_tokens }
+        if (key !== 'fable') last = { model: key, at: sentAt, context: tokensOf(u) - u.output_tokens }
         turnSteps += 1
         turnOutput += u.output_tokens
       }
