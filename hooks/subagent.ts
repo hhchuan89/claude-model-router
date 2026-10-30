@@ -56,6 +56,13 @@ export type Decision = { model: ModelKey | undefined; reason: string; fable?: bo
 
 type SpawnFacts = Pick<AgentSpawnInput, 'subagentType' | 'model' | 'parentModel' | 'fork' | 'workflow'>
 
+// A model the caller named that the router can rank, below Fable: such an agent starts at medium (see startOf).
+// `inherit`, an unknown id and Fable are not pins of a tier.
+export function isCallerPin(model: string | undefined): boolean {
+  const f = familyOf(model)
+  return f !== undefined && f !== 'fable'
+}
+
 // Only a general-purpose agent the call gave no model needs the classifier.
 export function needsClassifier(e: SpawnFacts): boolean {
   return !e.fork && e.workflow === undefined && e.model === undefined && e.subagentType === 'general-purpose'
@@ -108,13 +115,21 @@ export type AgentTier = {
 }
 
 // The tier a started agent is on: what the engine resolved it to, and whether this router pinned it.
-export function startOf(resolved: string | undefined, parentModel: string, isPinned: boolean, ids: Record<ModelKey, string>): AgentTier {
+// callerPinned: the caller named a model the router left as it was. Its model is the caller's, but it starts at medium
+// like a router pin: otherwise it ran at the session's effort (high, once capped), against "every tier starts at medium".
+export function startOf(
+  resolved: string | undefined,
+  parentModel: string,
+  isPinned: boolean,
+  ids: Record<ModelKey, string>,
+  callerPinned = false,
+): AgentTier {
   const ceiling = ceilingOf(parentModel)
   const tier = clamp(familyOf(resolved) ?? ceiling, ceiling)
   return {
     tier,
     model: isPinned ? ids[tier] : undefined,
-    effort: isPinned ? START_EFFORT[tier] : undefined,
+    effort: isPinned || callerPinned ? START_EFFORT[tier] : undefined,
     ceiling,
     parentModel,
     errorsInARow: 0,

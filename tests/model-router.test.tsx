@@ -1,8 +1,8 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
-import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
-import { capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
+import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
   test('parses the classifier reply and rejects junk', async () => {
@@ -1971,4 +1971,94 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     expect(seen).toBeDefined()
     expect(await statsOf($)).toContain('Compactions at idle (cache warm): 0')
   })
+
+  // ---- v0.10.0 ----
+
+  describe('compaction is visible (v0.10.0)', () => {
+    // WHY: a session started before the settings changed ran all day at 950k with the guard off, and nothing said so.
+    test('stats name the compaction settings this session loaded, and say off when they are off', async ($, on) => {
+      compactWorld($, on)
+      expect(await statsOf($)).toContain('Compaction in this session: idle off · cap off.')
+    })
+
+    test('stats show loaded idle minutes and cap', { options: { idleCompactMinutes: 50, compactAtContext: 300_000 } }, async ($, on) => {
+      compactWorld($, on)
+      const text = await statsOf($)
+      expect(text).toContain('Compaction in this session: idle after 50 min · cap at 300.0k.')
+      expect(text).toContain('restart it after changing them')
+    })
+
+    test('every compaction attempt lands in the events log with its outcome', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.sizes = { tokensBefore: 250_000, tokensAfter: 20_000 }
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: 'main', event: 'compact cap', to: 'done', reason: '250.0k → 20.0k' }))
+    })
+
+    test('a rejected compaction is logged with the engine error', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen } = compactWorld($, on, 'reject')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(30 * 60_000)
+      // The reason is the engine's error text, which the test kit words its own way.
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: 'main', event: 'compact idle', to: 'rejected' }))
+    })
+
+    test('a vetoed compaction is logged as skipped with the veto', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen } = compactWorld($, on, 'skip')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(30 * 60_000)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ event: 'compact idle', to: 'skipped', reason: 'vetoed' }))
+    })
+  })
 })
+
+describe('caller-pinned subagents start at medium (v0.10.0)', () => {
+  // WHY: 30 subagents pinned to sonnet by the caller ran 1,649 steps at high, against "every tier starts at medium".
+  test('a sonnet the caller named runs at medium, not at the session effort', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'sonnet' })
+    seen.usage.push(U(10, 1, 0, 0, 'claude-sonnet-5-5'))
+    await step($, 'sub', 'claude-sonnet-5-5', id, 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium', agentId: id })
+    expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: id, to: 'sonnet/medium' }))
+  })
+
+  test('its model stays the one the caller named: only the effort starts at medium', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'claude-sonnet-4-5' })
+    await step($, 'sub', 'claude-sonnet-4-5', id, 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-4-5', effort: 'medium' })
+  })
+
+  test('it can still be raised: the ladder goes to sonnet/high first', async () => {
+    expect(stepUp(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true), IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+  })
+
+  test('an inheriting agent, `inherit` and an unknown id keep the session effort, as before', async () => {
+    expect(startOf(OPUS, OPUS, false, IDS_BY_KEY).effort).toBeUndefined()
+    expect(isCallerPin(undefined)).toBe(false)
+    expect(isCallerPin('inherit')).toBe(false)
+    expect(isCallerPin('my-model')).toBe(false)
+    expect(isCallerPin('claude-fable-5-1')).toBe(false)
+    expect(isCallerPin('haiku')).toBe(true)
+  })
+})
+
+describe('execute needs a settled plan; opus delegates settled work (v0.10.0)', () => {
+  // WHY: 9 of 37 Sonnet main turns went to Opus at their first step. The wording read as execute ("add it to the PR",
+  // "cherry-pick it") while what to change still had to be worked out.
+  test('the classifier calls work execute only when what to change is visible', async () => {
+    const text = classifierSystem('en')
+    expect(text).toContain('already settled in the message or the context you can see')
+    expect(text).toContain('is execute only when the context shows exactly')
+    expect(text).toContain('porting a change to a branch whose version of the code differs')
+  })
+
+  test('opus is told to hand settled multi-file work to an unpinned subagent and verify it; other models are not', async () => {
+    expect(assignmentContext(routeFor('decide', ''))).toContain('delegate it to a general-purpose subagent without a model')
+    expect(assignmentContext(routeFor('decide', ''))).toContain('make small changes directly')
+    expect(assignmentContext(routeFor('execute', ''))).not.toContain('delegate it')
+  })
+})
+

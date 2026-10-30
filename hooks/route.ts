@@ -20,17 +20,21 @@ Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|fal
 lookup (fast model): pure retrieval or mechanical work with nothing to judge — find/grep/list files, read and report a value
   or status, run a command the user named and report the output, rename, fix a typo, format, translate a short text,
   look up a fact or a doc.
-execute (mid model): doing work whose "what" is already settled — implement a clearly specified change, fix a bug whose
-  cause is known, write tests, refactor to a stated target, write docs or a report from known material, extract or
+execute (mid model): doing work whose "what" is already settled in the message or the context you can see — a plan, a
+  spec or an exact instruction: implement a clearly specified change, fix a bug whose cause is known, write tests, refactor to a stated target, write docs or a report from known material, extract or
   transform data, explain how existing code works, carry out a plan that was already agreed.
 decide (top model): anything that needs judgment before acting — design or architecture, choosing between approaches,
   trade-offs, planning multi-step or multi-file work, finding the root cause of an unexplained failure, security or
   correctness review, research synthesis or recommendations, evaluating quality, ambiguous requests that need
-  interpreting, and anything irreversible or outward-facing (deploy, push, delete, money, production, messages to people).
+  interpreting, working out how a change to business rules, production data, stored procedures or queries should
+  behave, porting a change to a branch whose version of the code differs, and anything irreversible or outward-facing
+  (deploy, push, delete, money, production, messages to people).
 
 Rules:
 - A short reply that continues the previous turn ("做吧", "yes", "继续", "go on") keeps the previous tier,
   except: approving a plan that was just made ("照这个做", "开始吧") is execute.
+- "Implement it", "add it to the PR", "commit the fixes" or "cherry-pick it" is execute only when the context shows exactly
+  what to change. When what to change still has to be worked out, it is decide.
 - If a message mixes tiers, use the highest one it contains.
 - When unsure between two tiers, pick the higher one.
 - sure: set false when the message is ambiguous, could reasonably be read at two tiers, or depends on context you cannot
@@ -139,7 +143,7 @@ export function assignmentContext(r: Route): string {
   const head = `[model-router] This turn is assigned to ${r.model} at ${r.effort} effort (tier: ${r.tier}${r.reason ? ` — ${r.reason}` : ''}).`
   const opus =
     r.model === 'opus'
-      ? `You are on opus at ${r.effort} effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed. If it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work.`
+      ? `You are on opus at ${r.effort} effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed. If it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work. Once the plan is settled, if carrying it out spans several files or many steps, delegate it to a general-purpose subagent without a model (the router puts settled work on sonnet) with the plan, the paths and the checks to run, then verify the result yourself; make small changes directly.`
       : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews, anything irreversible) must be made on opus. If the task is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. If it fits, just start.`
   return `${head}\n${opus}\nEscalation only goes up within a turn; never call it to go down.`
 }

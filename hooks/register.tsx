@@ -32,6 +32,7 @@ import {
   effortCap,
   escalateAgent,
   familyOf,
+  isCallerPin,
   logDir,
   modelCap,
   needsClassifier,
@@ -403,7 +404,7 @@ function tallyLines(name: string, t: Tally): string {
   ].join('\n')
 }
 
-async function statsText($: EngineInterface): Promise<string> {
+async function statsText($: EngineInterface, compaction: string): Promise<string> {
   const now = await $.clock.now()
   const today = ((await $.store.get(`meter:${dayKey(now)}`)) as Tally | undefined) ?? EMPTY
   const all = ((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY
@@ -412,6 +413,8 @@ async function statsText($: EngineInterface): Promise<string> {
     .sort((a, b) => b[1] - a[1])
     .map(([why, n]) => `${why} ×${n}`)
   return [
+    compaction,
+    '',
     tallyLines('Today', today),
     '',
     tallyLines('All time', all),
@@ -443,10 +446,14 @@ async function compactMain($: EngineInterface, lang: Lang, kind: 'idle' | 'cap')
   let tokensAfter: number | undefined
   try {
     const r = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
-    if (r.skip !== undefined) return 'skipped'
+    if (r.skip !== undefined) {
+      await logEvent($, 'main', `compact ${kind}`, 'skipped', String(r.skip))
+      return 'skipped'
+    }
     tokensBefore = r.tokensBefore
     tokensAfter = r.tokensAfter
-  } catch {
+  } catch (err) {
+    await logEvent($, 'main', `compact ${kind}`, 'rejected', err instanceof Error ? err.message : String(err))
     return 'rejected'
   }
   // The session.compact observer does this too, but whether it is reached for the plugin's own call is not
@@ -457,6 +464,7 @@ async function compactMain($: EngineInterface, lang: Lang, kind: 'idle' | 'cap')
   )
   // The engine's own figures when it recorded them, else the last request's context.
   const size = tokensAfter === undefined ? fmtTokens(tokensBefore ?? before) : `${fmtTokens(tokensBefore ?? before)} → ${fmtTokens(tokensAfter)}`
+  await logEvent($, 'main', `compact ${kind}`, 'done', size)
   const str = STR[lang]
   try {
     $.ui.toast((kind === 'idle' ? str.idleCompacted : str.capCompacted)(size))
@@ -555,6 +563,11 @@ export const register: Register = (on, options) => {
   const capOn = Number.isFinite(compactAtContext) && compactAtContext >= CAP_MIN_CONTEXT
   const str = STR[lang]
   const guard: Guard = { lang, idleMs, minContext: compactMinContext }
+  // Options are read once, when the session's process loads the plugin: a session started before a settings change
+  // keeps the old values. Stats say what this process runs with, so a guard that is off by accident is visible.
+  const compactionText =
+    `Compaction in this session: idle ${idleMs > 0 ? `after ${idleMs / 60_000} min` : 'off'} · ` +
+    `cap ${capOn ? `at ${fmtTokens(compactAtContext)}` : 'off'}. Settings load when a session starts; restart it after changing them.`
 
   on('session.start', async ($, e, next) => {
     await restore($)
@@ -593,7 +606,7 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'model-router' }, async ($, e) => {
     const arg = e.args.trim()
-    if (arg === 'stats' || arg === '') return { text: await statsText($) }
+    if (arg === 'stats' || arg === '') return { text: await statsText($, compactionText) }
     if (arg !== 'on' && arg !== 'off') return { text: 'Usage: /model-router stats | on | off' }
     // setEnabled cancels a pending compaction when switching off.
     await setEnabled($, arg === 'on')
@@ -863,7 +876,7 @@ export const register: Register = (on, options) => {
             fableBlocked: c.fableBlocked + (d?.fable ? 1 : 0),
           }))
         }
-        const s = startOf(ran.model, e.parentModel, model !== undefined, ids)
+        const s = startOf(ran.model, e.parentModel, model !== undefined, ids, model === undefined && isCallerPin(e.model))
         agents.set(ran.agentId, s)
         // A failed classification keeps today's fallback (sonnet) and says why.
         const why = failureText !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failureText})`) : d?.reason
