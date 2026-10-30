@@ -1894,6 +1894,20 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(c.instructions).toEqual([])
     })
 
+    // 0.9.2: routing measured the cache from when a response ended, the same error 0.9.1 fixed for the idle guard.
+    test('routing also measures the cache from send time: 62 min after sending, a warm-Opus skip no longer applies', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      seen.stepMs = 6 * MIN
+      await mainTurn($, seen, 't1', 250_000)
+      seen.stepMs = 0
+      const classified = seen.asked.filter(m => m === 'haiku').length
+      // Ended 56 minutes ago but sent 62 minutes ago: the Opus cache has expired, so the classifier must run again
+      // rather than being skipped as "warm large context".
+      await seen.clock.advance(56 * MIN)
+      await $.prompt.submit({ text: 'next thing' } as never)
+      expect(seen.asked.filter(m => m === 'haiku').length).toBe(classified + 1)
+    })
+
     test('a short response still compacts at 55 minutes', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
       const { seen, c } = compactWorld($, on)
       seen.stepMs = 30_000

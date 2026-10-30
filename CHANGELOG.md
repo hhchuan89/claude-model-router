@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.9.2] - 2026-10-30
+
+### Fixed
+- Routing now measures the Opus cache from when a main request was sent, like the idle guard since 0.9.1. It used the
+  time the reply ended, so after a long reply it could treat an expired cache as warm and skip the classifier or keep
+  a turn on Opus for nothing.
+
 ## [0.9.1] - 2026-10-29
 
 Three fixes to the 0.9.0 compaction guards, found by a second adversarial review (Codex, `codex exec review`).
