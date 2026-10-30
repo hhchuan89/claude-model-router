@@ -23,7 +23,15 @@ export type Tally = {
   cost: number
   baseline: number
   byModel: Record<string, { tokens: number; cost: number }>
+  // Absent on records written before 1.0; those costs cannot be attributed after the fact.
+  byRole?: Partial<Record<SpendRole, { tokens: number; cost: number }>>
+  byUsage?: Partial<Record<SpendUsage, { tokens: number; cost: number }>>
+  peakMainContext?: number
+  compactions?: { at: number; before?: number; after?: number }[]
 }
+
+export type SpendRole = 'main' | 'subagents' | 'classifier' | 'reviewer' | 'compaction'
+export type SpendUsage = 'read' | 'write' | 'input' | 'output'
 
 declare module 'claude-code' {
   interface PluginState {

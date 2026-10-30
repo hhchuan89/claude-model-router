@@ -3,20 +3,63 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] - 2026-10-30
+
+1.0.0 hardens compaction guards against races and the cache deadline, makes the meter honest about its estimates,
+and puts context cost first in the UI. Task-boundary checkpoints and log/progress output reduction give you more
+control over token use; the new token-saving features, `checkpointHints` and `shrinkToolOutput`, are off by default.
+
+Implemented with Codex (gpt-6.1-sol), adversarially reviewed by Codex (gpt-6-astra)
+
+### Added
+
+- `/model-router checkpoint [note]` compacts at task boundaries, preserving continuation details and counting
+  checkpoints separately. Active turns or busy agents are refused; a new prompt cancels the immediate clock tick.
+- Optional `checkpointHints` (off by default): cost-based suggestions with a 50% growth / 30-minute cooldown.
+- Optional `shrinkToolOutput` (0 by default; active at 20,000–1,000,000 characters): deterministic reduction of Bash/MCP logs and
+  progress output only, with whole diagnostic blocks preserved, exact local archives, capped `fetch_output` retrieval
+  and reduction counters. Collapse and truncation require at least two thirds recognised log/progress lines;
+  unclassified repeats pass through unchanged. Collapsed progress shows its first and last state, and diagnostic
+  blocks retain stack frames and continuation lines.
+- `/model-router status` lists settings, pending work, deadlines, weekly usage and the last skip. `/model-router context`
+  reads the engine's local summary breakdown without token-count requests. New UI text supports English and Chinese.
+- Pending guard countdowns and busy-agent counts temporarily replace subagent event statuses. The latest event
+  returns when the guard ends or is cancelled. Terminal skips explain why in one toast per timer.
+
+### Changed
+
+Upgrading users see these changes without changing settings:
+
+- The prompt band leads with main context size, estimated cache-read cost per step, cold-resume write cost and time
+  to the send-time cache deadline. Expired caches show the estimated next rewrite; narrow bands keep context and
+  cold cost ahead of routing detail.
+- The status line adds weekly subscription usage and its local reset time when the engine supplies a weekly window,
+  alongside the existing subagent event statuses.
+- The band and stats say "difference" against the same work tokens at Opus prices, replacing "saved" claims.
+  Stats show session and daily spend by role and token category, compaction sizes, cold rewrites and peak main context.
+  Older unattributed spend stays visible; totals are labelled as the retained 30-day total plus legacy totals.
+- Reported compaction usage now contributes to estimated spend. Classifiers add cost without Opus baseline credit,
+  so the comparison can be less favourable than in earlier versions.
+- Explicit model pins win over the warm-cache guard; leaving a large Opus cache shows the estimated round-trip
+  rewrite cost. Resumed agents keep their escalation and error state without another classification or routed-agent count.
+
+Existing defaults are unchanged: main routing and Fable blocking remain on, the reviewer remains off, and idle and
+context-cap compaction remain off. Checkpoint hints and output reduction require opt-in; an explicit checkpoint
+command works without enabling either option.
 
 ### Fixed
-- Precomputed summaries no longer clear routing context or cancel pending compaction timers.
+
+- Session end, /clear and resume cancel pending guards, checkpoints and countdown ticks and reset routing and
+  context readings. Async results and accounting writes from the old session are discarded.
+- Plugin-started compactions have one accounting owner, whether or not the compaction observer is re-entered.
+- Reviewer availability probes contribute to estimated spend as overhead when a reviewer is configured.
+- Precomputed summaries no longer clear routing context or cancel pending compaction timers. A new prompt, turn,
+  or router-off action cancels pending work even across asynchronous checks; older completions cannot clear newer context.
 - Idle compaction and its single busy-agent recheck move forward to the cache deadline when needed, leaving at least
   a minute idle after completion. A deadline too close to allow that minute leaves the timer unarmed.
 - Context-cap compaction defers to the idle guard while agents are busy and is not armed after an aborted turn.
-- Resumed agents keep their escalation and error state, without another classification or routed-agent count.
-- Explicit model pins win over the warm-cache guard; abandoning a large Opus cache shows its estimated round-trip
-  rewrite cost in the routing reason and band.
-- Daily totals and counters use per-session records, aggregated on read and pruned after 30 calendar days. Legacy
-  totals are still read unchanged; stats label the bounded retained total.
-- The meter includes reported compaction usage and reviewer availability probes. Classifiers and probes add cost
-  without baseline credit. The band and stats describe a comparison with work tokens at Opus prices, not savings.
+- Concurrent sessions no longer overwrite each other's daily totals and counters: each writes its own records,
+  aggregated on read and pruned after 30 calendar days. Legacy totals are still read unchanged.
 
 ## [0.9.2] - 2026-10-30
 

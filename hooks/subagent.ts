@@ -98,6 +98,8 @@ export function decideSpawn(e: SpawnFacts, tier: Tier | null, sure = true, block
 // the session's.
 export type AgentTier = {
   tier: ModelKey
+  // Resolved at spawn, then observed on requests: accounting must not use the clamped policy tier for Fable.
+  family: Family
   model: string | undefined
   effort: Effort | undefined
   ceiling: ModelKey
@@ -113,6 +115,7 @@ export function startOf(resolved: string | undefined, parentModel: string, isPin
   const tier = clamp(familyOf(resolved) ?? ceiling, ceiling)
   return {
     tier,
+    family: familyOf(resolved) ?? tier,
     model: isPinned ? ids[tier] : undefined,
     effort: isPinned ? START_EFFORT[tier] : undefined,
     ceiling,

@@ -17,9 +17,15 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 ![The router's band above the Claude Code prompt](docs/band.png)
 
-The band above the prompt, from a real session: the route for this turn and why (here an ambiguous follow-up, so the
-router would not start it on Haiku), then this turn's and today's tokens with a price comparison against Opus.
-The numbers are one person's working day, not a typical result.
+The screenshot is from an earlier version. The current band leads with the main context's estimated cost:
+
+`Opus · ctx 221.0k · ≈$0.044/step │ cold resume ≈$1.77 · cache warm ~38m`
+
+After the cache deadline it says what the next prompt would rewrite. Narrow terminals keep context and cold cost,
+dropping routing detail first. The route and same-token Opus comparison follow when there is room. These are
+API-equivalent estimates at the rates in `hooks/meter.ts`, not subscription charges. A resumed session without a
+request timestamp shows an unknown cache deadline. Weekly subscription usage and its reset time (local time) come
+directly from the engine's rate-limit windows; API-key sessions without a weekly window show none.
 
 ## How a turn is routed
 
@@ -111,10 +117,11 @@ The numbers are one person's working day, not a typical result.
    thread's context, tracked for every model family including Fable:
    - `idleCompactMinutes` (1 to 55): after that many idle minutes at the prompt the router calls `/compact` itself,
      while the cache is still warm, so the eventual rewrite is of a summary, not the whole context. It runs only if
-     the last main request's context is at least `compactMinContext` (default 100,000 tokens), that request was at
-     least 3 minutes inside the cache TTL, and no subagent or teammate is pending, running or waiting. If one is,
+     freshest measured main context is at least `compactMinContext` (default 100,000 tokens), the last main request
+     is still at least 3 minutes inside the cache TTL, and no subagent or teammate is pending, running or waiting. If one is,
      the router checks once more after 5 minutes, or at the safe deadline if that is earlier, and otherwise skips.
-     A long final response brings the idle timer forward to that deadline, measured from when its request was sent.
+     A long final response brings the idle timer forward to that deadline, measured from when its request was sent,
+     leaving a 3-minute cache margin plus 30 seconds of scheduling headroom.
      It always leaves at least 1 minute at the prompt; if that would pass the deadline, it does not arm.
      Any new prompt or turn cancels the timer, so a person who comes back is never compacted under; so does turning
      the router off. Values outside 1 to 55 count as off (not clamped): 56 or more cannot fire safely inside the
@@ -128,12 +135,52 @@ The numbers are one person's working day, not a typical result.
    After any compaction (this plugin's, a manual `/compact`, or the engine's auto-compact) the router forgets its
    cached context figure, cancels any pending compaction, and stops treating the cache as warm for model switching.
    A `precompute` only prepares a summary and leaves that state and any pending timer alone.
-   A compaction another plugin vetoes, or one refused because a turn is running, is silently skipped and not counted.
+   A compaction another plugin vetoes, or one refused because a turn is running, is not counted; a guard that cannot
+   continue reports the reason once in a toast.
    Each compaction that happens shows a one-line toast with the size compacted (before and after, when the engine
-   reports both). `/model-router stats` counts both kinds, and also counts **cache rewrites after the TTL** (a main
+   reports both). `/model-router stats` counts idle, cap and checkpoint compactions separately, and also counts **cache rewrites after the TTL** (a main
    request after a gap over an hour, or the first request after `claude --resume`, that wrote 100k or more tokens of
-   cache and read almost none) with what those writes cost, whether or not a guard is on, so you can see what the
+   cache, with writes outweighing reads) with what those writes cost, whether or not a guard is on, so you can see what the
    guard would save.
+
+## Task-boundary checkpoints
+
+Run `/model-router checkpoint [note]` between tasks to compact now, keeping the goal, constraints and rules,
+decisions and their reasons, unresolved findings and questions, next steps, and the paths, commands and IDs needed
+to continue. The optional note is passed to the summariser. It refuses a running main turn or busy agents. The host
+requires compaction outside the command hook, so an accepted checkpoint runs on the next clock tick, rechecking
+agents; a new prompt or switching off cancels it. It never waits for active work to finish. Explicit checkpoints
+also work with routing off. The completion toast shows before → after when available; stats count checkpoints
+separately from idle and cap compactions.
+
+`checkpointHints` is **off by default**. When enabled, a completed main turn can suggest a checkpoint if the freshest
+context is at least `compactMinContext` and estimated read savings over 15 future steps exceed one cached read of the
+current context, 8k summariser output tokens and a 40k-token summary cache write. These are assumptions at the last
+observed model's prices. A hint never compacts anything. After one, another needs 50% context growth or 30 minutes;
+aborted turns and a context cap that will compact do not hint.
+
+## Large logs and progress output
+
+`shrinkToolOutput` is **off by default** (`0`); values outside 20,000–1,000,000 characters also count as off. When enabled, large
+Bash and MCP logs and progress output are reduced only after archiving the original verbatim under
+`<logDir>/outputs/<sessionId>/<tool_use_id>.txt`, beside the events log. A failed archive write leaves the output
+unchanged. The engine limits filesystem reads and writes to 4 MiB, so outputs beyond that limit also pass through.
+Archives remain local, contain the exact unmasked output, and are not automatically pruned.
+
+The reducer handles only output with at least two thirds of its nonblank lines recognised as logs/progress.
+It removes ANSI escapes and carriage-return progress redraws and collapses consecutive recognised log/progress
+lines differing solely in a leading timestamp or progress field, showing the first and last state; numbers, IDs and hashes in messages stay distinct. Only output with at least two thirds of its
+nonblank lines recognised as logs/progress can be truncated to the beginning, end and every
+error/warning/fail/exception/traceback block, including stack frames and continuation lines, with omission counts. Diagnostics take priority even when they exceed
+the threshold. Unclassified lines are also preserved. Other output, such as SQL, CSV, JSON, file listings and prose,
+passes through unchanged, including identical repeated lines. Read, Edit, Write,
+Grep and Glob are excluded; a conservative content check also leaves code and diffs alone. Media results are left alone.
+
+The reduced result names its archive and `mcp__model-router__fetch_output`. This tool is registered only when the
+option is enabled. Pass `id` (the tool-use id), optionally `startLine` / `endLine` (1-based, inclusive) or `pattern`
+(a literal, case-insensitive grep). Returned slices retain the original text and line endings. Each call is capped
+at `shrinkToolOutput` characters, including continuation instructions; use the returned `offset` with the same
+selection to page through long lines without losing characters. Stats count reductions and characters removed.
 
 ## Events log
 
@@ -180,16 +227,42 @@ own effort. `stats` covers routed subagents only.
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
   also sends a one-word probe to check the model exists. With `reviewModel` empty, none of this happens.
 
-## How much you saved
+## Cost comparison and commands
 
 Every model request (the router's own Haiku calls included) is priced at Anthropic API rates and added to the turn,
-the day and the all-time totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
-`/model-router stats` shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
+the day and the retained totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
+`/model-router stats` shows this session and today across sessions by main / subagents / classifier / reviewer /
+compaction and by cache reads / cache writes / uncached input / output. It also shows recorded compaction sizes,
+cold rewrites and peak main context. The band and stats label the comparison as a **difference**, not tokens or money
+saved: another model would not necessarily use the same tokens. Older records without these categories are labelled as unattributed spend.
+The retained total covers 30 days plus legacy totals. Stats also show turns per tier, escalations, warm-cache
 keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus, model mismatches (routed model not the one that answered),
 classifier failures by reason and escalations to max effort (main thread only, counted when effort moves to
 max from below).
 
 This is an estimate; see "Assumptions in the meter" below.
+
+| Command | What it shows |
+|---------|---------------|
+| `/model-router stats` | Session and daily spend, the same-token comparison and counters (also the default command) |
+| `/model-router status` | Every option's value, pending guard timer, cache and safe compaction deadlines, weekly window and last skipped action |
+| `/model-router checkpoint [note]` | Compact between tasks, preserving the information needed to continue |
+| `/model-router context` | Main context size and local category estimates, or an explicit unavailable message; makes no token-count requests |
+| `/model-router on` / `/model-router off` | Enable or disable routing and guards |
+
+With no argument, `/model-router` shows stats. Other arguments, including `help`, show the usage line.
+The engine's `/compact` also works; it is separate from the router's commands.
+
+The status line shows weekly subscription usage and the reset time in your local timezone when the engine supplies
+a weekly window, alongside the latest subagent event status. A pending guard temporarily takes that event slot.
+For example, with an idle guard enabled:
+
+`Weekly 76% · resets Fri 18:00 │ idle compact in 12m`
+
+An idle countdown becomes a busy-agent count when agents defer compaction. The pending guard text clears when the
+action ends or is cancelled, restoring the latest subagent event; weekly usage remains. API-key sessions without a weekly window omit that part.
+A skipped action gives one toast per armed timer; a successful compaction reports before → after sizes when the
+engine supplies them.
 
 ## Install
 
@@ -205,22 +278,29 @@ but leave your own conversation alone, turn `mainRouting` off instead (see Optio
 
 ## Options
 
-| Option | Default | Meaning |
-|--------|---------|---------|
-| `language` | `en` | Language of the reason line and the price comparison (`en` or `zh`) |
-| `mainRouting` | on | On: every turn you start is classified and routed. Off: **subagent-only mode, the low-risk way to start.** The main thread is never classified or rewritten (your session model and effort stay as they are, and no assignment text is added to your prompts), while subagent routing, subagent escalation and automatic escalation, Fable blocking for subagents and the meter keep working |
-| `blockFable` | on | On: Fable never runs on a subagent, and not on the main thread while `mainRouting` is on (those requests run on Opus); with `mainRouting` off your main model is left alone and only subagents are kept off Fable. Off: Fable is left alone everywhere, so Fable can be your main model; a subagent still never runs above its parent |
-| `haikuModel` / `sonnetModel` / `opusModel` | `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` | Model ids per tier |
-| `reviewModel` | empty (off) | A model id available on your account that reviews Opus decisions, only if it exists there; Fable 5.1 is never used. **The reviewer is sent your request and Opus's answer unmasked** (see Privacy) |
-| `idleCompactMinutes` | `0` (off) | 1 to 55: compact the main conversation after this many idle minutes, while the cache is still warm, the context is at least `compactMinContext` and no background agent is running. A new prompt cancels it. Out-of-range values (including 56 or more) count as off |
-| `compactMinContext` | `100000` | Tokens: the idle compact is skipped below this context size (a small context is cheap to rewrite) |
-| `compactAtContext` | `0` (off) | Tokens (e.g. `200000`): compact between turns when the main context reaches this, so every step does not re-read a huge cache. Below `100000` counts as off |
+| Option | Default | Range | Meaning |
+|--------|---------|-------|---------|
+| `language` | `en` | `en`, `zh` | Language of the UI, routing reason and price comparison (English or Simplified Chinese) |
+| `mainRouting` | `true` (on) | `true`, `false` | On: classify and route the turns you start, except when the warm-cache guard makes classification unnecessary. Off: **subagent-only mode, the low-risk way to start.** The main thread keeps your session model and effort, with no classification or assignment text, while subagent routing, escalation, Fable blocking for subagents and the meter keep working |
+| `blockFable` | `true` (on) | `true`, `false` | On: Fable never runs on a subagent, or on the main thread while `mainRouting` is on (those requests run on the Decision model); with `mainRouting` off your main model is left alone. Off: Fable is left alone everywhere; a subagent still never runs above its parent |
+| `haikuModel` | `claude-haiku-5-5` | Model-id string | Lookup model id available on your account |
+| `sonnetModel` | `claude-sonnet-5-5` | Model-id string | Execution model id available on your account |
+| `opusModel` | `claude-opus-5-5` | Model-id string | Decision model id available on your account |
+| `reviewModel` | `""` (off) | Empty string or a model id available on your account | Review Opus decisions only if the model exists there; Fable 5.1 is never used. **The reviewer is sent your request and Opus's answer unmasked** (see Privacy) |
+| `idleCompactMinutes` | `0` (off) | 0–55 minutes; active at 1–55 | Compact the main conversation after this many idle minutes, while the cache is warm, context is at least `compactMinContext` and no background agent is busy. A new prompt cancels it. Values outside 1–55 count as off |
+| `compactMinContext` | `100000` | Tokens ≥ 0; no configured maximum | Minimum context for idle compaction and checkpoint hints (a small context is cheap to rewrite) |
+| `checkpointHints` | `false` (off) | `true`, `false` | Suggest a task-boundary checkpoint when estimated savings exceed its cost; never compacts automatically |
+| `shrinkToolOutput` | `0` (off) | 0–1,000,000 characters; active at 20,000–1,000,000 | Reduce large Bash/MCP logs and progress output, archive originals and fetch capped slices. Values outside the active range count as off |
+| `compactAtContext` | `0` (off) | Tokens ≥ 0; active at ≥ 100,000; no configured maximum | Compact between turns when main context reaches this size (e.g. `200000`), so every step does not re-read a huge cache. Below `100000` counts as off |
+
+`checkpointHints` and `shrinkToolOutput` require opt-in. Existing option defaults are unchanged in 1.0.0.
 
 ## Assumptions in the meter
 
 The dollar figures are **estimates**, computed from the price table in `hooks/meter.ts` (Anthropic first-party API
 rates, as of 2026-10). They may differ from your actual pricing or plan: on a subscription you pay in usage limits, not
-dollars, and another model would not have used exactly the same tokens. **The percentage is the more useful number.**
+dollars, and another model would not have used exactly the same tokens. The dollar difference and percentage are
+same-token comparisons, not measured savings.
 
 Classification and reviewer availability probes are overhead: they add actual cost without an Opus baseline credit.
 The plugin's own compactions are metered when the engine reports usage. That usage has no model id, so their cost
