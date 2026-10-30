@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Precomputed summaries no longer clear routing context or cancel pending compaction timers.
+- Idle compaction and its single busy-agent recheck move forward to the cache deadline when needed, leaving at least
+  a minute idle after completion. A deadline too close to allow that minute leaves the timer unarmed.
+- Context-cap compaction defers to the idle guard while agents are busy and is not armed after an aborted turn.
+- Resumed agents keep their escalation and error state, without another classification or routed-agent count.
+- Explicit model pins win over the warm-cache guard; abandoning a large Opus cache shows its estimated round-trip
+  rewrite cost in the routing reason and band.
+- Daily totals and counters use per-session records, aggregated on read and pruned after 30 calendar days. Legacy
+  totals are still read unchanged; stats label the bounded retained total.
+- The meter includes reported compaction usage and reviewer availability probes. Classifiers and probes add cost
+  without baseline credit. The band and stats describe a comparison with work tokens at Opus prices, not savings.
+
 ## [0.9.2] - 2026-10-30
 
 ### Fixed

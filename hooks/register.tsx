@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { ModelKey, Route, Tally, Tier } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, PRICES, priceKey, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, saved, tokensOf } from './meter'
 import { isPersonOrigin } from './origin'
 import { redact } from './redact'
 import type { Lang } from './route'
@@ -65,7 +65,9 @@ let turnOutput = 0
 // The main thread's last request of ANY model family, Fable included (`last` skips Fable, which keepWarm never
 // routes). The compaction guards and the cache-expiry counter read this one. Null after a compaction: the context is
 // small now, so the old figure must not trigger again, and the next request is not a cache rewrite.
-let lastMain: { at: number; context: number } | null = null
+let lastMain: { at: number; context: number; model: keyof typeof PRICES } | null = null
+// Moves only when a main request is recorded: a completed compaction must not clear a newer request's context.
+let mainRequestSequence = 0
 // True from a compaction this process saw until the next main request: that request reads a fresh summary, so its
 // big cache write is not an expiry rewrite even though lastMain is null.
 let justCompacted = false
@@ -73,14 +75,18 @@ let justCompacted = false
 // a callback that is already awaiting when the person comes back compares it and stands down.
 let compactTimer: Timer | null = null
 let timerEpoch = 0
+// Off takes effect before its state/store writes finish.
+let compactEnabled = true
 // A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
 const REWRITE_MIN_TOKENS = 100_000
 // A cache read below this on a request with no earlier one in this process means the cache was cold.
 const COLD_READ_TOKENS = 1000
 // Idle compaction only makes sense inside the cache TTL, and with a margin: the summary request itself takes a while and
 // a clock a few minutes off must not let it land on an expired cache. 55 minutes is the longest setting; the margin is
-// 3 minutes, not 5, so a 55-minute timer, which fires a few seconds after the last step was stamped, still passes.
+// 3 minutes, not 5. A long response brings the timer forward inside the deadline, with at least a minute at the prompt.
 const SAFE_MARGIN_MS = 3 * 60_000
+// Arm timers before the validation cutoff so timer delays and the agent lookup have time to finish.
+const IDLE_HEADROOM_MS = 30_000
 const IDLE_MIN_MINUTES = 1
 const IDLE_MAX_MINUTES = 55
 // The engine's own autoCompactWindow range starts here; a smaller cap would compact every turn.
@@ -96,6 +102,8 @@ const COMPACT_INSTRUCTIONS =
   'Keep the current task and its goal, the decisions made and why, open items and next steps, and the file paths and identifiers in play. Drop finished exploration and tool output.'
 // What each tiered subagent is on now, by agent id.
 const agents = new Map<string, AgentTier>()
+// Resumes after a reload resolve their effort on the first step, not in the spawn result.
+const resumed = new Set<string>()
 // Per session: what changed and what each tiered subagent cost per model and effort. Written to
 // ~/.claude/model-router/, one file per session, for your own analysis.
 const log: EventLog = { sessionId: '', events: [], stats: {} }
@@ -106,14 +114,15 @@ const STR = {
     sessionModel: (why: string) => `分类失败（${why}）：用会话模型`,
     inherited: '沿用上一轮路由',
     forced: '你在消息里指定了模型',
+    abandoned: (cost: string) => `放弃 Opus 热缓存，预计往返重写 ${cost}`,
     warmSkip: '大上下文缓存仍热：跳过分类',
     off: 'Model router 已关闭',
     review: '决策审查',
     kept: '保缓存',
     turn: '本轮',
     today: '今日',
-    save: '省',
-    vs: '对比全用 Opus',
+    save: '差额',
+    vs: '对比工作 token 按 Opus 计价（含切换调整）',
     idleCompacted: (size: string) => `空闲压缩：已压缩 ${size} 上下文（缓存仍热）`,
     capCompacted: (size: string) => `上下文达到上限：已压缩 ${size}`,
   },
@@ -122,14 +131,15 @@ const STR = {
     sessionModel: (why: string) => `classifier failed (${why}): session model`,
     inherited: 'continues previous route',
     forced: 'model pinned in your message',
+    abandoned: (cost: string) => `warm Opus cache abandoned, estimated round-trip rewrite ${cost}`,
     warmSkip: 'warm large context: classifier skipped',
     off: 'Model router is off',
     review: 'Decision review',
     kept: 'cache kept',
     turn: 'turn',
     today: 'today',
-    save: 'saved',
-    vs: 'vs all on Opus',
+    save: 'difference',
+    vs: 'vs work tokens at Opus prices (switch-adjusted)',
     idleCompacted: (size: string) => `Idle compact: compacted ${size} of context while the cache was warm`,
     capCompacted: (size: string) => `Context cap reached: compacted ${size}`,
   },
@@ -192,19 +202,76 @@ function forgetContext() {
   last = null
   lastMain = null
   justCompacted = true
-  cancelCompact()
 }
 
 async function setEnabled($: EngineInterface, isOn: boolean) {
   // Off must also stop a compaction already scheduled.
+  compactEnabled = isOn
   if (!isOn) cancelCompact()
   await update($, enabled, () => isOn)
   await $.store.set('enabled', isOn)
 }
 
-// $.store has no compare-and-set, and steps of parallel subagents land at once: every read-modify-write
-// goes through one chain so no increment is lost.
+// Each session owns its daily keys. The chain also keeps parallel subagent increments in this process in order.
 let writes: Promise<void> = Promise.resolve()
+const RETAIN_DAYS = 30
+let prunedDay = ''
+
+function oldestDay(now: number): string {
+  const d = new Date(now)
+  d.setDate(d.getDate() - RETAIN_DAYS + 1)
+  return dayKey(d.getTime())
+}
+
+async function prune($: EngineInterface, now: number) {
+  const day = dayKey(now)
+  if (prunedDay === day) return
+  const oldest = oldestDay(now)
+  for (const key of await $.store.keys()) {
+    const day = /^(?:meter|counts):(\d{8}):/.exec(key)?.[1]
+    if (day !== undefined && day < oldest) await $.store.delete(key)
+  }
+  prunedDay = day
+}
+
+async function totals($: EngineInterface, now: number, todayOnly = false): Promise<{ today: Tally; all: Tally; counts: Counts }> {
+  const day = dayKey(now)
+  const oldest = oldestDay(now)
+  let today = ((await $.store.get(`meter:${day}`)) as Tally | undefined) ?? EMPTY
+  let all = todayOnly ? EMPTY : ((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY
+  let counts = todayOnly ? NO_COUNTS : { ...NO_COUNTS, ...((await $.store.get('counts')) as Counts | undefined) }
+  for (const key of await $.store.keys()) {
+    const m = /^(meter|counts):(\d{8}):/.exec(key)
+    if (!m || m[2]! < oldest || m[2]! > day || (todayOnly && (m[1] !== 'meter' || m[2] !== day))) continue
+    if (m[1] === 'meter') {
+      const t = (await $.store.get(key)) as Tally | undefined
+      if (!t) continue
+      all = merge(all, t)
+      if (m[2] === day) today = merge(today, t)
+    } else {
+      const c = (await $.store.get(key)) as Counts | undefined
+      if (!c) continue
+      counts = mergeCounts(counts, c)
+    }
+  }
+  return { today, all, counts }
+}
+
+function mergeCounts(a: Counts, b: Counts): Counts {
+  const out = { ...a }
+  for (const key of Object.keys(NO_COUNTS) as (keyof Counts)[]) {
+    if (typeof NO_COUNTS[key] === 'number') {
+      Object.assign(out, { [key]: ((a[key] as number) ?? 0) + ((b[key] as number) ?? 0) })
+    } else {
+      const left = a[key] as Record<string, number> | undefined
+      const right = b[key] as Record<string, number> | undefined
+      const sum = { ...left }
+      for (const [k, v] of Object.entries(right ?? {})) sum[k] = (sum[k] ?? 0) + v
+      Object.assign(out, { [key]: sum })
+    }
+  }
+  return out
+}
 
 function serial($: EngineInterface, job: () => Promise<void>): Promise<void> {
   writes = writes.then(job).catch(err => $.ui.log(`model-router: store write failed: ${String(err)}`))
@@ -213,20 +280,24 @@ function serial($: EngineInterface, job: () => Promise<void>): Promise<void> {
 
 function count($: EngineInterface, change: (c: Counts) => Counts): Promise<void> {
   return serial($, async () => {
-    const c = ((await $.store.get('counts')) as Counts | undefined) ?? NO_COUNTS
-    await $.store.set('counts', change(c))
+    const now = await $.clock.now()
+    await prune($, now)
+    const key = `counts:${dayKey(now)}:${await $.session.id()}`
+    const c = ((await $.store.get(key)) as Counts | undefined) ?? NO_COUNTS
+    await $.store.set(key, change(c))
   })
 }
 
 // Every model call this session pays for, the router's own included, goes on the turn, the day and the total.
 // switched: a main-thread step that changed model family within the cache TTL (see baselineOf).
-function record($: EngineInterface, modelId: string, u: Usage, switched = false): Promise<void> {
+function record($: EngineInterface, modelId: string, u: Usage, switched = false, overhead = false): Promise<void> {
   return serial($, async () => {
-    const day = `meter:${dayKey(await $.clock.now())}`
-    const today = add(((await $.store.get(day)) as Tally | undefined) ?? EMPTY, modelId, u, switched)
-    await $.store.set(day, today)
-    await $.store.set('meter:all', add(((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY, modelId, u, switched))
-    await update($, meter, m => ({ turn: add((m ?? { turn: EMPTY }).turn, modelId, u, switched), today }))
+    const now = await $.clock.now()
+    await prune($, now)
+    const key = `meter:${dayKey(now)}:${await $.session.id()}`
+    await $.store.set(key, add(((await $.store.get(key)) as Tally | undefined) ?? EMPTY, modelId, u, switched, overhead))
+    const { today } = await totals($, now, true)
+    await update($, meter, m => ({ turn: add((m ?? { turn: EMPTY }).turn, modelId, u, switched, overhead), today }))
   })
 }
 
@@ -300,7 +371,7 @@ async function classifyTier($: EngineInterface, lang: Lang, text: string, previo
       effort: 'low',
       timeoutMs: CLASSIFY_MS,
     })
-    await record($, 'claude-haiku-5-5', r.usage)
+    await record($, 'claude-haiku-5-5', r.usage, false, true)
     if (!r.isAnswered) {
       if (r.reason === 'aborted') return { ok: false, why: 'timeout' }
       if (r.reason === 'api-error') return { ok: false, why: `api-error ${r.status ?? 'none'}` }
@@ -358,6 +429,7 @@ async function reviewerAvailable($: EngineInterface, reviewModel: string): Promi
   let ok = false
   try {
     const r = await $.model.complete({ model: reviewModel, prompt: 'Reply with OK.', maxTokens: 5, timeoutMs: 15000 })
+    await record($, reviewModel, r.usage, false, true)
     ok = r.isAnswered
   } catch {
     ok = false
@@ -395,7 +467,7 @@ function tallyLines(name: string, t: Tally): string {
     .sort((a, b) => b[1].cost - a[1].cost)
     .map(([m, v]) => `| ${m} | ${fmtTokens(v.tokens)} | ${fmtUsd(v.cost)} |`)
   return [
-    `**${name}**: ${fmtTokens(t.tokens)} tokens, ${fmtUsd(t.cost)} API-equivalent; all on Opus would be ${fmtUsd(t.baseline)}, so ≈ ${fmtUsd(s.usd)} (${s.pct}%) saved.`,
+    `**${name}**: ${fmtTokens(t.tokens)} tokens, ${fmtUsd(t.cost)} API-equivalent; same work tokens at Opus prices (switch-adjusted): ${fmtUsd(t.baseline)}, difference ≈ ${fmtUsd(s.usd)} (${s.pct}%).`,
     '',
     '| model | tokens | cost |',
     '|---|---|---|',
@@ -405,16 +477,14 @@ function tallyLines(name: string, t: Tally): string {
 
 async function statsText($: EngineInterface): Promise<string> {
   const now = await $.clock.now()
-  const today = ((await $.store.get(`meter:${dayKey(now)}`)) as Tally | undefined) ?? EMPTY
-  const all = ((await $.store.get('meter:all')) as Tally | undefined) ?? EMPTY
-  const c = ((await $.store.get('counts')) as Counts | undefined) ?? NO_COUNTS
+  const { today, all, counts: c } = await totals($, now)
   const failures = Object.entries(c.classifierFailures ?? {})
     .sort((a, b) => b[1] - a[1])
     .map(([why, n]) => `${why} ×${n}`)
   return [
     tallyLines('Today', today),
     '',
-    tallyLines('All time', all),
+    tallyLines('Retained total (30 days + legacy)', all),
     '',
     `Turns routed: lookup ${c.turns.lookup} · execute ${c.turns.execute} · decide ${c.turns.decide}. ` +
       `Escalations: ${c.escalations}. Kept on a warm cache: ${c.cacheKeeps}. ` +
@@ -428,30 +498,41 @@ async function statsText($: EngineInterface): Promise<string> {
       `Compactions at the context cap: ${c.capCompactions ?? 0}. ` +
       `Cache rewrites after the TTL (100k+ tokens): ${c.cacheExpiryRewrites ?? 0}, costing ${fmtUsd(c.cacheExpiryRewriteCost ?? 0)}.`,
     '',
-    '_API-equivalent prices; the baseline prices the same tokens on Opus, so it is an estimate: another model would not use exactly the same tokens._',
+    '_API-equivalent prices; work tokens are priced on Opus with switch writes priced as warm reads. Classification and availability probes add cost only. Another model would not use exactly the same tokens. Session records are retained for 30 days; legacy totals are included unchanged._',
   ].join('\n')
 }
 
+// Timer paths keep the entry epoch across every await; only a current, enabled path may arm or start compacting,
+// with no await after its last check.
+// A completed compaction forgets context even while off, unless a newer main request was recorded.
+// Its timer cleanup still requires the current, enabled epoch.
 type CompactOutcome = 'done' | 'skipped' | 'rejected'
 
 // Compacts the main conversation between turns while the cache is warm. $.session.compact rejects while a turn
 // runs ('rejected') and resolves { skip } when a hook vetoed it ('skipped'): neither is a compaction, so neither is
 // counted. Never throws.
 async function compactMain($: EngineInterface, lang: Lang, kind: 'idle' | 'cap'): Promise<CompactOutcome> {
+  const epoch = timerEpoch
+  const request = mainRequestSequence
   const before = lastMain?.context ?? 0
+  // Compact usage has no model id: estimate it at the last main request's rates, including Fable.
+  const model = lastMain?.model ?? 'opus'
   let tokensBefore: number | undefined
   let tokensAfter: number | undefined
   try {
     const r = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
     if (r.skip !== undefined) return 'skipped'
+    // The compact has already happened. Do not clear a newer turn's context while accounting for it.
+    if (request === mainRequestSequence) {
+      forgetContext()
+      if (!stale(epoch)) cancelCompact()
+    }
     tokensBefore = r.tokensBefore
     tokensAfter = r.tokensAfter
+    if (r.usage) await record($, model, r.usage)
   } catch {
     return 'rejected'
   }
-  // The session.compact observer does this too, but whether it is reached for the plugin's own call is not
-  // guaranteed ("every hook but the calling one"), so it is done here as well; it is idempotent.
-  forgetContext()
   await count($, c =>
     kind === 'idle' ? { ...c, idleCompactions: (c.idleCompactions ?? 0) + 1 } : { ...c, capCompactions: (c.capCompactions ?? 0) + 1 },
   )
@@ -481,50 +562,72 @@ async function agentsBusy($: EngineInterface): Promise<boolean> {
 }
 
 // What the timer callbacks need from the options.
-type Guard = { lang: Lang; idleMs: number; minContext: number }
+type Guard = { lang: Lang; idleMs: number; minContext: number; completedAt?: number }
 
-// Whether a timer callback armed at `epoch` still stands: cancelCompact moved the epoch, or the router was turned off.
-// The epoch is compared after the read too: a cancel that lands while the read is pending must still win.
-async function stale($: EngineInterface, epoch: number): Promise<boolean> {
-  if (epoch !== timerEpoch) return true
-  const on = await read($, enabled)
-  return epoch !== timerEpoch || !on
+// Synchronous so a prompt or off cannot slip between the last check and arming or compacting.
+function stale(epoch: number): boolean {
+  return epoch !== timerEpoch || !compactEnabled
 }
 
 // The idle compaction, a single re-check later while background agents run, never past the safe window.
 async function runIdle($: EngineInterface, g: Guard, epoch: number, rechecked: boolean): Promise<void> {
+  if (stale(epoch)) return
   compactTimer = null
-  if (await stale($, epoch)) return
+  const isOn = await read($, enabled)
+  if (stale(epoch) || !isOn) return
   const now = await $.clock.now()
+  if (stale(epoch)) return
   if (!idleDue(now, g.minContext)) return
-  if (await agentsBusy($)) {
-    if (await stale($, epoch)) return
-    if (!rechecked && lastMain !== null && now + AGENT_RECHECK_MS - lastMain.at <= CACHE_TTL_MS - SAFE_MARGIN_MS) {
-      compactTimer = $.clock.after(AGENT_RECHECK_MS, () => void runIdle($, g, epoch, true).catch(() => {}))
+  const busy = await agentsBusy($)
+  if (stale(epoch)) return
+  if (busy) {
+    const checkedAt = await $.clock.now()
+    if (stale(epoch)) return
+    const deadline = lastMain === null ? 0 : lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS - IDLE_HEADROOM_MS
+    if (!rechecked && checkedAt < deadline) {
+      compactTimer = $.clock.after(Math.min(AGENT_RECHECK_MS, deadline - checkedAt), () => void runIdle($, g, epoch, true).catch(() => {}))
     }
     return
   }
-  if (await stale($, epoch)) return
+  const checkedAt = await $.clock.now()
+  if (stale(epoch)) return
+  if (!idleDue(checkedAt, g.minContext)) return
   await compactMain($, g.lang, 'idle')
 }
 
-function armIdle($: EngineInterface, g: Guard) {
-  if (g.idleMs <= 0) return
-  const epoch = timerEpoch
-  compactTimer = $.clock.after(g.idleMs, () => void runIdle($, g, epoch, false).catch(() => {}))
+async function armIdle($: EngineInterface, g: Guard, epoch: number) {
+  if (g.idleMs <= 0 || lastMain === null) return
+  const isOn = await read($, enabled)
+  if (stale(epoch) || !isOn) return
+  const now = await $.clock.now()
+  if (stale(epoch) || lastMain === null) return
+  const completedAt = g.completedAt ?? now
+  const deadline = lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS - IDLE_HEADROOM_MS
+  const earliest = Math.max(now, completedAt + IDLE_MIN_MINUTES * 60_000)
+  if (earliest > deadline) return
+  const at = Math.max(earliest, Math.min(completedAt + g.idleMs, deadline))
+  compactTimer = $.clock.after(at - now, () => void runIdle($, g, epoch, false).catch(() => {}))
 }
 
 // The cap compaction, retried when refused; if it never lands, the idle guard takes over for this turn.
 async function runCap($: EngineInterface, g: Guard, epoch: number, attempt: number): Promise<void> {
+  if (stale(epoch)) return
   compactTimer = null
-  if (await stale($, epoch)) return
+  const isOn = await read($, enabled)
+  if (stale(epoch) || !isOn) return
+  const busy = await agentsBusy($)
+  if (stale(epoch)) return
+  if (busy) {
+    await armIdle($, g, epoch)
+    return
+  }
   const outcome = await compactMain($, g.lang, 'cap')
-  if (outcome === 'done') return
+  if (stale(epoch) || outcome === 'done') return
   if (outcome === 'rejected' && attempt < CAP_RETRIES) {
     compactTimer = $.clock.after(CAP_RETRY_MS, () => void runCap($, g, epoch, attempt + 1).catch(() => {}))
     return
   }
-  if (epoch === timerEpoch) armIdle($, g)
+  await armIdle($, g, epoch)
 }
 
 export const register: Register = (on, options) => {
@@ -560,7 +663,7 @@ export const register: Register = (on, options) => {
     await restore($)
     await $.command.register({
       name: 'model-router',
-      description: 'Model router: "stats" for tokens and savings, "on" / "off" to toggle',
+      description: 'Model router: "stats" for tokens and price comparison, "on" / "off" to toggle',
       argumentHint: '[stats|on|off]',
     })
     await $.tool.register({
@@ -585,8 +688,11 @@ export const register: Register = (on, options) => {
       },
     })
     const stored = await $.store.get('enabled')
-    await update($, enabled, () => stored !== false)
-    const today = ((await $.store.get(`meter:${dayKey(await $.clock.now())}`)) as Tally | undefined) ?? EMPTY
+    compactEnabled = stored !== false
+    await update($, enabled, () => compactEnabled)
+    const now = await $.clock.now()
+    await prune($, now)
+    const { today } = await totals($, now, true)
     await update($, meter, () => ({ turn: EMPTY, today }))
     return next(e)
   })
@@ -603,8 +709,14 @@ export const register: Register = (on, options) => {
   // Every compaction of the main conversation: the plugin's own, a manual /compact and the engine's auto-compact. The
   // old context figures are stale after any of them, and a pending timer would compact a summary.
   on('session.compact', async ($, e, next) => {
+    const epoch = timerEpoch
+    const request = mainRequestSequence
     const result = await next(e)
-    if (e.agentId === undefined && result.skip === undefined) forgetContext()
+    if (request !== mainRequestSequence) return result
+    if (e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined) {
+      forgetContext()
+      if (!stale(epoch)) cancelCompact()
+    }
     return result
   })
 
@@ -631,7 +743,13 @@ export const register: Register = (on, options) => {
       return entered
     }
     const shape = ((await $.store.get('shape')) as Shape | undefined) ?? { steps: 3, output: 800 }
-    const model = keepWarm(r.model, last, await $.clock.now(), shape)
+    const now = await $.clock.now()
+    const pinned = forcedModel(e.text) !== null
+    if (pinned && r.model !== 'opus' && isWarmOpus(last, now)) {
+      const cost = fmtUsd((last!.context * (PRICES[r.model].write + PRICES.opus.write)) / 1e6)
+      r = { ...r, reason: `${r.reason}; ${str.abandoned(cost)}` }
+    }
+    const model = pinned ? r.model : keepWarm(r.model, last, now, shape)
     if (model !== r.model) {
       r = { ...r, keptFrom: r.model, model, effort: TIER_ROUTE[r.tier].effort }
       await count($, c => ({ ...c, cacheKeeps: c.cacheKeeps + 1 }))
@@ -687,7 +805,11 @@ export const register: Register = (on, options) => {
     let effort = e.effort
     const r = await read($, route)
     const isMain = e.agentId === undefined
-    const sub = e.agentId === undefined ? undefined : agents.get(e.agentId)
+    let sub = e.agentId === undefined ? undefined : agents.get(e.agentId)
+    if (sub && e.agentId !== undefined && resumed.delete(e.agentId) && sub.effort === undefined) {
+      sub = { ...sub, effort: typeof effort === 'string' ? capSent(effort) : undefined }
+      agents.set(e.agentId, sub)
+    }
     if (isMain && mainRouting && r && r.turnId === e.turnId && !r.sessionModel) {
       model = withSuffixOf(ids[r.model], e.model)
       effort = r.effort
@@ -738,7 +860,8 @@ export const register: Register = (on, options) => {
           }))
         }
         justCompacted = false
-        lastMain = { at: sentAt, context: tokensOf(u) - u.output_tokens }
+        mainRequestSequence += 1
+        lastMain = { at: sentAt, context: tokensOf(u) - u.output_tokens, model: key }
         if (key !== 'fable') last = { model: key, at: sentAt, context: tokensOf(u) - u.output_tokens }
         turnSteps += 1
         turnOutput += u.output_tokens
@@ -844,6 +967,15 @@ export const register: Register = (on, options) => {
   // inherits the parent. Never above the parent, never Fable; forks and workflow agents are left alone.
   on('agent.spawn', async ($, e, next) => {
     if (!(await read($, enabled)) || e.fork || e.workflow !== undefined) return next(e)
+    if (e.resume !== undefined) {
+      const ran = await next(e)
+      // A reload loses tracking, but a resume must keep the engine's model and effort and any entry still here.
+      if (ran.deny === undefined && ran.agentId !== undefined && !agents.has(ran.agentId)) {
+        agents.set(ran.agentId, { ...startOf(ran.model, e.parentModel, false, ids), model: ran.model })
+        resumed.add(ran.agentId)
+      }
+      return ran
+    }
     const verdict = needsClassifier(e) ? await classifyTier($, lang, e.prompt, null, false) : null
     const failure = verdict && !verdict.ok ? verdict.why : undefined
     if (failure !== undefined) await countFailure($, failure)
@@ -878,25 +1010,37 @@ export const register: Register = (on, options) => {
     .catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
-    const r = await read($, route)
+    const epoch = timerEpoch
+    // Completion still reaches the engine when the compaction path has been cancelled.
     const done = await next(e)
+    if (stale(epoch)) return done
+    const r = await read($, route)
+    if (stale(epoch)) return done
     if (e.agentId === undefined && r && r.turnId === e.turnId && turnSteps > 0) {
       // A slow average of the turn's shape feeds the warm-cache decision.
       const prev = ((await $.store.get('shape')) as Shape | undefined) ?? { steps: 3, output: 800 }
+      if (stale(epoch)) return done
       const output = turnOutput / turnSteps
       await $.store.set('shape', { steps: prev.steps * 0.8 + turnSteps * 0.2, output: prev.output * 0.8 + output * 0.2 })
+      if (stale(epoch)) return done
     }
-    if (e.agentId === undefined && !e.isAborted && r && r.turnId === e.turnId && r.model === 'opus' && (await read($, enabled))) {
+    const isOn = await read($, enabled)
+    if (stale(epoch) || !isOn) return done
+    if (e.agentId === undefined && !e.isAborted && r && r.turnId === e.turnId && r.model === 'opus') {
       void maybeReview($, lang, reviewModel, pendingPrompt, e.answer)
     }
-    if (e.agentId === undefined && (capOn || idleMs > 0) && (await read($, enabled))) {
-      cancelCompact()
-      if (capOn && lastMain !== null && lastMain.context >= compactAtContext) {
+    if (e.agentId === undefined && (capOn || idleMs > 0)) {
+      const completedAt = await $.clock.now()
+      if (stale(epoch)) return done
+      const g = { ...guard, completedAt }
+      // Replace an earlier timer without moving past a cancel that landed during this completion.
+      compactTimer?.cancel()
+      compactTimer = null
+      if (!e.isAborted && capOn && lastMain !== null && lastMain.context >= compactAtContext) {
         // The hook runs as the turn ends and compact rejects while a turn runs, so it goes on the next tick of the clock.
-        const epoch = timerEpoch
-        compactTimer = $.clock.after(0, () => void runCap($, guard, epoch, 0).catch(() => {}))
+        compactTimer = $.clock.after(0, () => void runCap($, g, epoch, 0).catch(() => {}))
       } else {
-        armIdle($, guard)
+        await armIdle($, g, epoch)
       }
     }
     return done

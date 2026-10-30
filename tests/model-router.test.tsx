@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Tally } from '../types'
 
-import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
+import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
 import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
@@ -97,7 +98,7 @@ const BAND_PROPS = {
   view: {},
 } as never
 
-type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; maxTokens: (number | undefined)[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string>; stepMs?: number }
+type Seen = { clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; maxTokens: (number | undefined)[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string>; store: Record<string, unknown>; stepMs?: number; tally?: Tally }
 
 const IDS: Record<string, string> = { haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' }
 
@@ -108,10 +109,23 @@ function world(
   $: any,
   on: any,
   classifier: Reply | Reply[],
-  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown> } = {},
+  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally } = {},
 ): Seen {
-  mock.store(on, opts.store)
-  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {} }
+  const seen: Seen = { clock: mock.clock(on), submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {}, store: { ...opts.store } }
+  on('store.set', { key: /.*/ }, async (_$: unknown, e: any, next: any) => {
+    const result = await next(e)
+    seen.store[e.key] = e.value
+    return result
+  })
+  on('store.delete', { key: /.*/ }, async (_$: unknown, e: any, next: any) => {
+    const result = await next(e)
+    delete seen.store[e.key]
+    return result
+  })
+  on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+    seen.tally = e.value.today
+    return next(e)
+  })
   on('session.messages', async () => ({ value: (opts.messages ?? []).map(m => ({ ...m, toolUses: [] })) }))
   on('model.complete', async (_$: unknown, e: { model: string; prompt: string; maxTokens?: number }) => {
     seen.asked.push(e.model)
@@ -154,10 +168,10 @@ function world(
   })
   // As the engine does: the alias resolves to an id, no model means the parent's.
   let spawned = 0
-  on('agent.spawn', async (_$: unknown, e: { model?: string; parentModel: string }) => {
+  on('agent.spawn', async (_$: unknown, e: { model?: string; parentModel: string; resume?: { agentId: string } }) => {
     seen.agents.push(e.model)
     const id = e.model === undefined ? e.parentModel : (IDS[e.model] ?? e.model)
-    return { model: id, agentId: `agent-${++spawned}` }
+    return { model: id, agentId: e.resume?.agentId ?? `agent-${++spawned}` }
   })
   on('ui.status', async () => ({ value: undefined }))
   on('session.id', async () => ({ value: 'sess-1' }))
@@ -170,6 +184,27 @@ function world(
     const { Text } = $$.ui.resolve(e)
     return <Text>other mods</Text>
   })
+  if (opts.competing) {
+    let competing: Tally | undefined = opts.competing
+    on('store.get', async (_$: unknown, e: { key: string }) => ({ value: seen.store[e.key] }))
+    on('store.set', async (_$: unknown, e: { key: string; value: unknown }) => {
+      if (competing && /^meter:\d{8}/.test(e.key)) {
+        // Another process writes after this process has read its own previous total.
+        const day = e.key.split(':')[1]
+        seen.store[e.key === `meter:${day}` ? e.key : `meter:${day}:sess-2`] = competing
+        competing = undefined
+      }
+      seen.store[e.key] = e.value
+      return { value: undefined }
+    })
+    on('store.keys', async () => ({ value: Object.keys(seen.store) }))
+    on('store.delete', async (_$: unknown, e: { key: string }) => {
+      delete seen.store[e.key]
+      return { value: undefined }
+    })
+  } else {
+    mock.store(on, opts.store)
+  }
   return seen
 }
 
@@ -363,10 +398,10 @@ test('each step goes on the meter, shown in the band and in /model-router stats'
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /本轮 21\.2k token · / })).toBeDefined()
-  expect(await ui.find({ text: /省 ≈/ })).toBeDefined()
+  expect(await ui.find({ text: /差额 ≈/ })).toBeDefined()
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('haiku')
-  expect(r.text).toContain('saved')
+  expect(r.text).toContain('same work tokens at Opus prices')
 })
 
 test('a warm Opus cache on a long context keeps the next execute turn on Opus', { options: { language: 'zh' } }, async ($, on) => {
@@ -767,8 +802,8 @@ test('the band speaks English by default', async ($, on) => {
   expect(await ui.find({ text: /Haiku · medium — find files/ })).toBeDefined()
   expect(await ui.find({ text: /turn 21\.2k token · / })).toBeDefined()
   expect(await ui.find({ text: /today 21\.2k token · / })).toBeDefined()
-  expect(await ui.find({ text: /saved ≈/ })).toBeDefined()
-  expect(await ui.find({ text: /vs all on Opus/ })).toBeDefined()
+  expect(await ui.find({ text: /difference ≈/ })).toBeDefined()
+  expect(await ui.find({ text: /vs work tokens at Opus prices/ })).toBeDefined()
 })
 
 // Changed from v0.6 ("classifier failed, defaulted to Sonnet"): the band names the reason and what happened instead.
@@ -1043,13 +1078,12 @@ test('the meter flags exactly the main steps that changed family, going down and
     seen.usage.push(u)
     await step($, `t${i + 1}`)
   }
-  const classifier = 4 * costOf({ input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, 'opus')
-  const flagged = classifier + costOf(u1, 'opus') + baselineOf(u2, true) + costOf(u3, 'opus') + baselineOf(u4, true)
-  const unflagged = classifier + turns.reduce((sum, u) => sum + costOf(u, 'opus'), 0)
+  const flagged = costOf(u1, 'opus') + baselineOf(u2, true) + costOf(u3, 'opus') + baselineOf(u4, true)
+  const unflagged = turns.reduce((sum, u) => sum + costOf(u, 'opus'), 0)
   expect(fmtUsd(flagged)).not.toBe(fmtUsd(unflagged))
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
-  expect(r.text).toContain(`all on Opus would be ${fmtUsd(flagged)}`)
-  expect(r.text).not.toContain(`all on Opus would be ${fmtUsd(unflagged)}`)
+  expect(r.text).toContain(`same work tokens at Opus prices (switch-adjusted): ${fmtUsd(flagged)}`)
+  expect(r.text).not.toContain(`same work tokens at Opus prices (switch-adjusted): ${fmtUsd(unflagged)}`)
 })
 
 describe('mainRouting off (subagent-only mode)', () => {
@@ -1310,6 +1344,231 @@ describe('subagent caps (v0.8.1)', () => {
 
 const statsOf = async ($: any): Promise<string> => ((await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }).text
 
+describe('phase 1 routing and meter fixes', () => {
+  const lookup = '{"tier":"lookup","sure":true,"reason":"find"}'
+  for (const effort of ['low', 'medium'] as const) {
+    test(`a resumed agent at ${effort} can explicitly raise effort to high`, async ($, on) => {
+      const seen = world($, on, lookup)
+      const id = await spawnAgent($, { model: 'sonnet', resume: { agentId: 'resumed' } })
+      await step($, 'sub', 'claude-sonnet-5-5[1m]', id, effort)
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort })
+      const up = await call($, { agentId: id, effort: 'high', reason: 'harder' })
+      expect(up.result).toBe('Escalated to sonnet/high from your next step.')
+      await step($, 'sub', OPUS, id, effort)
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+      expect(seen.asked).toEqual([])
+      expect(await statsOf($)).toContain('Subagents routed: haiku 0 · sonnet 0 · opus 0')
+    })
+
+    test(`three errors on a resumed agent at ${effort} raise effort before model`, async ($, on) => {
+      const seen = world($, on, lookup)
+      on('tool.call', async () => ({ result: 'failed', isError: true }))
+      const id = await spawnAgent($, { model: 'haiku', resume: { agentId: 'resumed' } })
+      await step($, 'sub', 'claude-haiku-5-5', id, effort)
+      for (let i = 0; i < 3; i++) await $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
+      await step($, 'sub', OPUS, id, effort)
+      const raised = effort === 'low' ? 'medium' : 'high'
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: raised })
+      expect(eventsOf(seen).filter(ev => ev.event === 'auto-escalated')).toMatchObject([
+        { agentId: id, to: `haiku/${raised}`, reason: '3 tool errors in a row: more effort on the same model' },
+      ])
+      expect(seen.asked).toEqual([])
+      expect(await statsOf($)).toContain('Subagents routed: haiku 0 · sonnet 0 · opus 0')
+    })
+
+    test(`a resumed agent at ${effort} reports the ceiling only after reaching it`, async ($, on) => {
+      const seen = world($, on, lookup)
+      on('tool.call', async () => ({ result: 'failed', isError: true }))
+      const model = 'claude-sonnet-5-5'
+      const id = await spawnAgent($, { model: 'sonnet', parentModel: model, resume: { agentId: 'resumed' } })
+      await step($, 'sub', model, id, effort)
+      const bad = () => $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never) as Promise<{ context?: string[] }>
+      const climbs = effort === 'low' ? 2 : 1
+      for (let i = 0; i < climbs * 3; i++) expect((await bad()).context).toBeUndefined()
+      await step($, 'sub', model, id, effort)
+      expect(seen.steps.at(-1)).toMatchObject({ model, effort: 'high' })
+      expect(eventsOf(seen).filter(ev => ev.event === 'ceiling reached')).toEqual([])
+      await bad()
+      await bad()
+      expect((await bad()).context?.[0]).toContain('subagent ceiling (sonnet/high)')
+      expect(eventsOf(seen).filter(ev => ev.event === 'ceiling reached')).toMatchObject([{ agentId: id, to: 'sonnet/high' }])
+      expect(seen.asked).toEqual([])
+      expect(await statsOf($)).toContain('Subagents routed: haiku 0 · sonnet 0 · opus 0')
+    })
+  }
+
+  test('a resumed agent missing from memory keeps its resolved model and effort and can escalate', async ($, on) => {
+    const seen = world($, on, lookup)
+    const id = await spawnAgent($, { model: 'sonnet', resume: { agentId: 'resumed' } })
+    await step($, 'sub', 'claude-sonnet-5-5', id, 'medium')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+    const up = await call($, { agentId: id, model: 'opus', reason: 'harder' })
+    expect(up.result).toBe('Escalated to opus/medium from your next step.')
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps.at(-1)).toMatchObject({ model: OPUS, effort: 'medium' })
+    expect(seen.asked).toEqual([])
+    expect(await statsOf($)).toContain('Subagents routed: haiku 0 · sonnet 0 · opus 0')
+  })
+
+  test('a resumed agent missing from memory gets the error ladder', async ($, on) => {
+    const seen = world($, on, lookup)
+    on('tool.call', async () => ({ result: 'failed', isError: true }))
+    const id = await spawnAgent($, { model: 'haiku', resume: { agentId: 'resumed' } })
+    await step($, 'sub', 'claude-haiku-5-5', id)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+    for (let i = 0; i < 3; i++) await $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
+    await step($, 'sub', 'claude-haiku-5-5', id)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+    expect(seen.asked).toEqual([])
+    expect(await statsOf($)).toContain('Subagents routed: haiku 0 · sonnet 0 · opus 0')
+  })
+
+  test('a resumed agent missing from memory cannot send effort above high', async ($, on) => {
+    const seen = world($, on, lookup)
+    const id = await spawnAgent($, { resume: { agentId: 'resumed' } })
+    await step($, 'sub', OPUS, id, 'max')
+    expect(seen.steps.at(-1)).toMatchObject({ model: OPUS, effort: 'high' })
+  })
+
+  test('a resumed agent keeps its escalation and is not classified or counted again', async ($, on) => {
+    const seen = world($, on, lookup)
+    const id = await spawnAgent($)
+    await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'sonnet', effort: 'high', reason: 'harder' } as never)
+    const resumed = await spawnAgent($, { resume: { agentId: id } })
+    expect(resumed).toBe(id)
+    expect(seen.asked).toEqual(['haiku'])
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+    expect(await statsOf($)).toContain('Subagents routed: haiku 1 · sonnet 0 · opus 0')
+  })
+
+  test('a resumed agent keeps its consecutive tool errors', async ($, on) => {
+    const seen = world($, on, null)
+    on('tool.call', async () => ({ result: 'failed', isError: true }))
+    const id = await spawnAgent($, { subagentType: 'Explore' })
+    await $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
+    await $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
+    await spawnAgent($, { subagentType: 'Explore', resume: { agentId: id } })
+    await $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
+    await step($, 'sub', OPUS, id)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+    expect(await statsOf($)).toContain('Subagents routed: haiku 1 · sonnet 0 · opus 0')
+  })
+
+  for (const model of ['haiku', 'sonnet'] as const) {
+    test(`an explicit #${model} pin leaves a warm Opus context and reports the rewrite estimate`, async ($, on) => {
+      const seen = world($, on, decide)
+      await $.prompt.submit({ text: 'choose' } as never)
+      seen.usage.push(U(1000, 500, 299_000))
+      await step($, 't1')
+      await $.prompt.submit({ text: `next #${model}` } as never)
+      await step($, 't2')
+      const cost = fmtUsd(300_000 * (PRICES[model].write + PRICES.opus.write) / 1e6)
+      expect(seen.steps.at(-1)!.model).toContain(model)
+      expect(seen.asked).toEqual(['haiku'])
+      expect(seen.submits.at(-1)!.context?.[0]).toContain(`warm Opus cache abandoned, estimated round-trip rewrite ${cost}`)
+      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await ui.find({ text: `warm Opus cache abandoned, estimated round-trip rewrite ${cost}` })).toBeDefined()
+      expect(await statsOf($)).toContain('Kept on a warm cache: 0')
+    })
+  }
+
+  test('classifier usage is pure overhead with no hypothetical Opus credit', async ($, on) => {
+    const seen = world($, on, lookup)
+    await $.prompt.submit({ text: 'find' } as never)
+    const t = seen.tally!
+    expect(t.tokens).toBe(2)
+    expect(t.cost).toBe(costOf(U(1, 1), 'haiku'))
+    expect(t.baseline).toBe(0)
+    expect(saved(t).usd).toBeLessThan(0)
+    expect(await statsOf($)).not.toContain('saved')
+  })
+
+  for (const available of [true, false]) {
+    test(`a reviewer availability probe is metered when availability is ${available}`, { options: { reviewModel: 'claude-fable-5-5' } }, async ($, on) => {
+      mock.session(on)
+      const seen = world($, on, decide, { reviewer: available })
+      await $.prompt.submit({ text: 'choose #opus' } as never)
+      await $.turn.complete({ answer: 'choice', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'completed' } as never)
+      await seen.clock.advance(0)
+      const t = seen.tally!
+      expect(t.tokens).toBe(available ? 4 : 2)
+      expect(near(t.cost, costOf(U(1, 1), 'fable') * (available ? 2 : 1))).toBe(true)
+      expect(near(t.baseline, available ? costOf(U(1, 1), 'opus') : 0)).toBe(true)
+      await $.turn.complete({ answer: 'choice', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'completed' } as never)
+      await seen.clock.advance(0)
+      expect(seen.prompts.filter(p => p === 'Reply with OK.')).toHaveLength(1)
+    })
+  }
+
+  test('concurrent sessions own separate totals and a competing write survives', async ($, on) => {
+    const day = storeDay(0)
+    const other = add(EMPTY, OPUS, U(1e6, 0))
+    const seen = world($, on, lookup, { competing: other })
+    await $.prompt.submit({ text: 'find' } as never)
+    seen.usage.push(U(1000, 500))
+    await step($, 't1')
+    const expected = 4 + costOf(U(1, 1), 'haiku') + costOf(U(1000, 500), 'opus')
+    const text = await statsOf($)
+    expect(text).toContain(`${fmtUsd(expected)} API-equivalent`)
+    expect(seen.store[`meter:${day}:sess-2`]).toEqual(other)
+    expect(seen.store[`meter:${day}`]).toBeUndefined()
+    expect(seen.store['meter:all']).toBeUndefined()
+  })
+
+  test('legacy daily and all-time totals are read once alongside session records', async ($, on) => {
+    const day = storeDay(0)
+    const legacy = add(EMPTY, OPUS, U(1e6, 0))
+    const older = add(legacy, OPUS, U(1e6, 0))
+    const other = add(EMPTY, 'sonnet', U(1e6, 0))
+    const seen = world($, on, lookup, { store: { [`meter:${day}`]: legacy, 'meter:all': older, [`meter:${day}:sess-2`]: other } })
+    await $.prompt.submit({ text: 'find' } as never)
+    const text = await statsOf($)
+    expect(text).toContain('**Today**: 2.0M tokens, $6.00 API-equivalent')
+    expect(text).toContain('**Retained total (30 days + legacy)**: 3.0M tokens, $10.00 API-equivalent')
+    expect(seen.store[`meter:${day}`]).toEqual(legacy)
+    expect(seen.store['meter:all']).toEqual(older)
+    expect(seen.tally!.tokens).toBe(2e6 + 2)
+  })
+
+  test('session counters aggregate without writing the shared legacy counts', async ($, on) => {
+    const seen = world($, on, lookup, { store: {
+      [`counts:${storeDay(0)}:sess-2`]: { turns: { lookup: 2, execute: 0, decide: 0 } },
+    } })
+    await $.prompt.submit({ text: 'find' } as never)
+    const key = `counts:${storeDay(0)}:sess-1`
+    const own = seen.store[key] as any
+    expect(own.turns.lookup).toBe(1)
+    expect(await statsOf($)).toContain('Turns routed: lookup 3 · execute 0 · decide 0')
+    expect(seen.store['counts']).toBeUndefined()
+  })
+
+  test('session records expire after 30 calendar days and legacy totals survive', async ($, on) => {
+    const t = add(EMPTY, OPUS, U(1e6, 0))
+    const today = new Date(2026, 9, 30).getTime()
+    const old = new Date(2026, 8, 30).getTime()
+    const edge = new Date(2026, 9, 1).getTime()
+    const seen = world($, on, lookup, { store: {
+      [`meter:${storeDay(old)}:old`]: t,
+      [`counts:${storeDay(old)}:old`]: {},
+      [`meter:${storeDay(edge)}:edge`]: t,
+      'meter:all': t,
+    } })
+    await seen.clock.advance(today)
+    await $.prompt.submit({ text: 'find' } as never)
+    expect(seen.store[`meter:${storeDay(old)}:old`]).toBeUndefined()
+    expect(seen.store[`counts:${storeDay(old)}:old`]).toBeUndefined()
+    expect(seen.store[`meter:${storeDay(edge)}:edge`]).toEqual(t)
+    expect(seen.store['meter:all']).toEqual(t)
+    expect(await statsOf($)).toContain('**Retained total (30 days + legacy)**: 2.0M tokens, $8.00 API-equivalent')
+  })
+})
+
+function storeDay(ms: number): string {
+  const d = new Date(ms)
+  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+}
+
 describe('blockFable (v0.8.2)', () => {
   // WHY: a user who runs Fable as the main model could not use even subagent-only mode, because the rewrite ran
   // unconditionally. Off must mean off, on the main thread and on subagents.
@@ -1480,22 +1739,26 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     const seen = world($, on, '{"tier":"execute","reason":"x"}', { drop })
     const c = {
       instructions: [] as (string | undefined)[],
+      triggers: [] as string[],
       toasts: [] as string[],
       agents: [] as string[],
       rejects: how === 'reject' ? Infinity : 0,
-      sizes: {} as { tokensBefore?: number; tokensAfter?: number },
+      sizes: {} as { tokensBefore?: number; tokensAfter?: number; usage?: ReturnType<typeof U> },
+      beforeAgents: undefined as (() => Promise<void>) | undefined,
     }
-    on('session.compact', async (_$: unknown, e: { instructions?: string }) => {
+    on('session.compact', async (_$: unknown, e: { instructions?: string; trigger: string }) => {
       c.instructions.push(e.instructions)
+      c.triggers.push(e.trigger)
       if (c.rejects > 0) {
         c.rejects -= 1
         throw new Error('a turn is running')
       }
       return how === 'skip' ? { skip: 'vetoed' } : { messages: [{ role: 'user', text: 'summary', toolUses: [] }], ...c.sizes }
     })
-    on('agent.list', async () => ({
-      value: c.agents.map((status, i) => ({ id: `agent-${i}`, description: 'd', type: 'general-purpose', status })),
-    }))
+    on('agent.list', async () => {
+      await c.beforeAgents?.()
+      return { value: c.agents.map((status, i) => ({ id: `agent-${i}`, description: 'd', type: 'general-purpose', status })) }
+    })
     on('ui.toast', async (_$: unknown, e: { text: string }) => {
       c.toasts.push(e.text)
       return { value: undefined }
@@ -1510,6 +1773,369 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     await step($, turnId, model === 'claude-opus-5-5' ? undefined : `${model}[1m]`)
     await $.turn.complete(done(turnId))
   }
+
+  describe('cancellation at every await', () => {
+    type Boundary = { at: string; event: string; key?: string; nth?: number }
+    const enabledRead = { at: 'enabled', event: 'state.get', key: 'enabled' }
+    const clockRead = { at: 'clock', event: 'clock.now' }
+    const agentRead = { at: 'agents', event: 'agent.list' }
+    const compact = { at: 'compact', event: 'session.compact' }
+    const completion: Boundary[] = [
+      { at: 'route', event: 'state.get', key: 'route' },
+      { at: 'next', event: 'turn.complete' },
+      { at: 'shape get', event: 'store.get', key: 'shape' },
+      { at: 'shape set', event: 'store.set', key: 'shape' },
+      enabledRead,
+      clockRead,
+    ]
+    const idle: Boundary[] = [enabledRead, clockRead, agentRead, { ...clockRead, at: 'final clock', nth: 2 }]
+    const paths: { path: string; boundaries: Boundary[] }[] = [
+      { path: 'turn.complete cap', boundaries: completion },
+      { path: 'turn.complete idle', boundaries: completion },
+      { path: 'armIdle completion', boundaries: [{ ...enabledRead, nth: 2 }, { ...clockRead, nth: 2 }] },
+      { path: 'armIdle busy cap', boundaries: [{ ...enabledRead, nth: 2 }, clockRead] },
+      { path: 'armIdle skipped cap', boundaries: [{ ...enabledRead, nth: 2 }, clockRead] },
+      { path: 'armIdle exhausted cap', boundaries: [{ ...enabledRead, nth: 2 }, clockRead] },
+      { path: 'runIdle', boundaries: idle },
+      { path: 'runIdle busy', boundaries: idle.map(b => b.at === 'final clock' ? { ...b, at: 're-check clock' } : b) },
+      { path: 'runIdle re-check', boundaries: idle },
+      { path: 'runCap', boundaries: [enabledRead, agentRead] },
+      { path: 'runCap retry', boundaries: [compact] },
+      { path: 'runCap fallback', boundaries: [compact] },
+    ]
+
+    for (const { path, boundaries } of paths) {
+      for (const boundary of boundaries) {
+        for (const cancel of ['prompt', 'off']) {
+          test(`${path}: ${cancel} during ${boundary.at} stops the path`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+            const how = path === 'runCap retry' || path === 'armIdle exhausted cap' ? 'reject'
+              : path === 'runCap fallback' || path === 'armIdle skipped cap' ? 'skip' : 'ok'
+            // Only the cancelling prompt is held: the first turn still binds a route and updates its shape.
+            on('prompt.submit', { text: 'back' }, async () => ({ drop: 'held' }))
+            let active = false
+            let hit = false
+            let reads = 0
+            const later: string[] = []
+            const delays: number[] = []
+            const events = ['state.get', 'store.get', 'store.set', 'clock.now', 'agent.list', 'session.compact', 'turn.complete']
+            for (const event of events) {
+              on(event as never, (event === 'state.get' ? { plugin: 'model-router' } : event === 'store.get' || event === 'store.set' ? { key: 'shape' } : {}) as never, async (_$: unknown, e: any, next: any) => {
+                // Restrict bookkeeping to this path, excluding the cancelling prompt/command itself.
+                const relevant = event === 'state.get' ? e.key === 'enabled' || e.key === 'route'
+                  : event === 'store.get' || event === 'store.set' ? e.key === 'shape' : true
+                if (active && relevant) {
+                  if (hit) later.push(`${event}:${e.key ?? ''}`)
+                  if (!hit && event === boundary.event && (boundary.key === undefined || e.key === boundary.key) && ++reads === (boundary.nth ?? 1)) {
+                    active = false
+                    if (cancel === 'prompt') await $.prompt.submit({ text: 'back' } as never)
+                    else await $.command.run({ command: 'model-router', args: 'off' } as never)
+                    hit = true
+                    active = true
+                  }
+                }
+                return next(e)
+              })
+            }
+            on('clock.after', {}, async (_$: unknown, e: any, next: any) => {
+              if (active && hit) delays.push(e.ms)
+              return next(e)
+            })
+            const { seen, c } = compactWorld($, on, how)
+            const completing = path.startsWith('turn.complete') || path === 'armIdle completion'
+            const context = path === 'turn.complete cap' || !completing ? 250_000 : 150_000
+            await $.prompt.submit({ text: 'work on it' } as never)
+            seen.usage.push(U(1000, 500, context - 1000, 0, 'claude-opus-5-5'))
+            await step($, 't1')
+            if (completing) {
+              active = true
+              await $.turn.complete(done('t1'))
+            } else {
+              // The idle paths start after a busy cap has handed over to idle; the others run on the first tick.
+              if (path.startsWith('runIdle') || path === 'armIdle busy cap') c.agents = ['running']
+              await $.turn.complete(done('t1'))
+              if (path.startsWith('runIdle')) {
+                await seen.clock.advance(0)
+                if (path === 'runIdle re-check') await seen.clock.advance(20 * MIN)
+                if (path !== 'runIdle busy') c.agents = []
+              }
+              if (path === 'armIdle exhausted cap') {
+                await seen.clock.advance(0)
+                await seen.clock.advance(4000)
+              }
+              active = true
+              await seen.clock.advance(path === 'runIdle re-check' ? 5 * MIN : path.startsWith('runIdle') ? 20 * MIN : path === 'armIdle exhausted cap' ? 2000 : 0)
+            }
+            expect(hit).toBe(true)
+            // An early guard must stop work immediately, even if a later guard would also catch the cancel.
+            expect(later).toEqual([])
+            expect(delays).toEqual([])
+            const attempts = path === 'runCap retry' || path === 'runCap fallback' || path === 'armIdle skipped cap' ? 1 : path === 'armIdle exhausted cap' ? 4 : 0
+            expect(c.instructions).toHaveLength(attempts)
+            c.agents = []
+            await seen.clock.advance(30 * MIN)
+            expect(c.instructions).toHaveLength(attempts)
+            expect(c.toasts).toEqual([])
+          })
+        }
+      }
+    }
+    for (const path of ['session.compact observer', 'compactMain']) {
+      for (const cancel of ['prompt', 'off']) {
+        test(`${path}: ${cancel} during compact preserves the newer idle timer`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+          let active = false
+          let hit = false
+          on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+            if (active) {
+              active = false
+              hit = true
+              if (cancel === 'off') {
+                await $.command.run({ command: 'model-router', args: 'off' } as never)
+                await $.command.run({ command: 'model-router', args: 'on' } as never)
+              }
+              // A new prompt, request and completion all land before the old compact resolves.
+              await mainTurn($, seen, 't2', 150_000)
+            }
+            return next(e)
+          })
+          const { seen, c } = compactWorld($, on)
+          await mainTurn($, seen, 't1', path === 'compactMain' ? 250_000 : 150_000)
+          active = true
+          if (path === 'compactMain') await seen.clock.advance(0)
+          else await $.session.compact({ messages: [{ role: 'user', text: 'work', toolUses: [] }] } as never)
+          expect(hit).toBe(true)
+          expect(c.instructions).toHaveLength(1)
+          await seen.clock.advance(20 * MIN)
+          // The old completion must not forget the newer context or cancel its timer.
+          expect(c.instructions).toHaveLength(2)
+          expect(c.toasts.at(-1)).toContain('150.0k')
+        })
+      }
+    }
+
+    for (const kind of ['idle', 'cap']) {
+      test(`setEnabled off: switching back on never revives the ${kind} timer`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+        const { seen, c } = compactWorld($, on)
+        await mainTurn($, seen, 't1', kind === 'cap' ? 250_000 : 150_000)
+        await $.command.run({ command: 'model-router', args: 'off' } as never)
+        await $.command.run({ command: 'model-router', args: 'on' } as never)
+        await seen.clock.advance(30 * MIN)
+        expect(c.instructions).toEqual([])
+      })
+    }
+
+    for (const kind of ['idle', 'cap']) {
+      for (const boundary of ['enabled get', 'enabled set', 'store set']) {
+        test(`setEnabled off: ${kind} stays cancelled during ${boundary}`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+          let active = false
+          let hit = false
+          const delays: number[] = []
+          let completing = false
+          const later: string[] = []
+          on('state.get', { plugin: 'model-router', key: 'route' }, async (_$: unknown, e: any, next: any) => {
+            if (completing) later.push('route')
+            return next(e)
+          })
+          const event = boundary === 'enabled get' ? 'state.get' : boundary === 'enabled set' ? 'state.set' : 'store.set'
+          on(event as never, (event === 'store.set' ? { key: 'enabled' } : { plugin: 'model-router', key: 'enabled' }) as never, async (_$: unknown, e: any, next: any) => {
+            if (active) {
+              active = false
+              hit = true
+              await $.prompt.submit({ text: 'back' } as never)
+              // A completion which starts while off is persisting sees the new epoch, but must still stand down.
+              completing = true
+              await $.turn.complete(done('t1'))
+              completing = false
+              await seen.clock.advance(kind === 'cap' ? 0 : 20 * MIN)
+            }
+            return next(e)
+          })
+          on('prompt.submit', { text: 'back' }, async () => ({ drop: 'held' }))
+          on('clock.after', {}, async (_$: unknown, e: any, next: any) => {
+            if (hit) delays.push(e.ms)
+            return next(e)
+          })
+          const { seen, c } = compactWorld($, on)
+          await mainTurn($, seen, 't1', kind === 'cap' ? 250_000 : 150_000)
+          active = true
+          await $.command.run({ command: 'model-router', args: 'off' } as never)
+          expect(hit).toBe(true)
+          expect(delays).toEqual([])
+          expect(later).toEqual([])
+          await $.command.run({ command: 'model-router', args: 'on' } as never)
+          await seen.clock.advance(30 * MIN)
+          expect(c.instructions).toEqual([])
+          expect(c.toasts).toEqual([])
+        })
+      }
+    }
+
+  })
+
+  describe('phase 1 compaction fixes', () => {
+    test('precompute passes through without cancelling the idle timer', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await $.session.compact({ trigger: 'precompute', messages: [{ role: 'user', text: 'work', toolUses: [] }] } as never)
+      expect(c.instructions).toHaveLength(1)
+      expect(c.triggers).toEqual(['precompute'])
+      await seen.clock.advance(20 * MIN)
+      expect(c.instructions).toHaveLength(2)
+      expect(await statsOf($)).toContain('Compactions at idle (cache warm): 1')
+    })
+
+    test('precompute preserves the warm main request for routing', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await $.session.compact({ trigger: 'precompute', messages: [{ role: 'user', text: 'work', toolUses: [] }] } as never)
+      await $.prompt.submit({ text: 'next' } as never)
+      expect(seen.asked).toEqual(['haiku'])
+      await step($, 't2')
+      expect(seen.steps.at(-1)!.model).toContain('opus')
+    })
+
+    test('less than a minute before the deadline leaves the idle timer unarmed', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
+      const delays: number[] = []
+      on('clock.after', { ms: 55 * MIN }, async (_$: unknown, e: any, next: any) => {
+        delays.push(e.ms)
+        return next(e)
+      })
+      const { seen, c } = compactWorld($, on)
+      seen.stepMs = 56.5 * MIN
+      await mainTurn($, seen, 't1', 250_000)
+      expect(delays).toEqual([])
+      await seen.clock.advance(60 * MIN)
+      expect(c.instructions).toEqual([])
+    })
+
+    test('exactly a minute before the scheduling cutoff still arms the idle timer', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      seen.stepMs = 55.5 * MIN
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(MIN - 1)
+      expect(c.instructions).toEqual([])
+      await seen.clock.advance(1)
+      expect(c.instructions).toHaveLength(1)
+    })
+
+    for (const path of ['long response', 'busy re-check']) {
+      test(`the ${path} leaves time for an agent lookup before the idle cutoff`, { options: { idleCompactMinutes: path === 'long response' ? 55 : 53 } }, async ($, on) => {
+        const { seen, c } = compactWorld($, on)
+        if (path === 'long response') seen.stepMs = 6 * MIN
+        if (path === 'busy re-check') c.agents = ['running']
+        let finishLookup: (() => void) | undefined
+        const lookup = () => new Promise<void>(resolve => { finishLookup = resolve })
+        if (path === 'long response') c.beforeAgents = lookup
+        await mainTurn($, seen, 't1', 250_000)
+        await seen.clock.advance(path === 'long response' ? 50.5 * MIN : 53 * MIN + 1000)
+        if (path === 'busy re-check') {
+          expect(c.instructions).toEqual([])
+          c.agents = []
+          c.beforeAgents = lookup
+          await seen.clock.advance(3.5 * MIN - 1000)
+        }
+        expect(finishLookup).toBeDefined()
+        await seen.clock.advance(1)
+        finishLookup!()
+        await seen.clock.advance(0)
+        expect(c.instructions).toHaveLength(1)
+        expect(await statsOf($)).toContain('Compactions at idle (cache warm): 1')
+      })
+    }
+
+    test('an agent lookup that crosses the real idle cutoff still skips compaction', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      let finishLookup: (() => void) | undefined
+      c.beforeAgents = () => new Promise<void>(resolve => { finishLookup = resolve })
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(55 * MIN)
+      expect(finishLookup).toBeDefined()
+      await seen.clock.advance(3 * MIN)
+      finishLookup!()
+      await seen.clock.advance(0)
+      expect(c.instructions).toEqual([])
+    })
+
+    for (const status of ['pending', 'running', 'waiting']) {
+      test(`a ${status} agent defers the cap to the idle guard`, { options: { compactAtContext: 200_000, idleCompactMinutes: 20 } }, async ($, on) => {
+        const { seen, c } = compactWorld($, on)
+        c.agents = [status]
+        await mainTurn($, seen, 't1', 250_000)
+        await seen.clock.advance(0)
+        expect(c.instructions).toEqual([])
+        c.agents = ['completed']
+        await seen.clock.advance(20 * MIN)
+        expect(c.instructions).toHaveLength(1)
+        expect(await statsOf($)).toContain('Compactions at idle (cache warm): 1')
+        expect(await statsOf($)).toContain('Compactions at the context cap: 0')
+      })
+    }
+
+    test('an aborted turn arms only the idle guard', { options: { compactAtContext: 200_000, idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await $.prompt.submit({ text: 'work' } as never)
+      seen.usage.push(U(1000, 500, 249_000))
+      await step($, 't1')
+      await $.turn.complete({ ...done('t1') as any, isAborted: true, reason: 'aborted' } as never)
+      await seen.clock.advance(0)
+      expect(c.instructions).toEqual([])
+      await seen.clock.advance(20 * MIN)
+      expect(c.instructions).toHaveLength(1)
+      expect(await statsOf($)).toContain('Compactions at idle (cache warm): 1')
+      expect(await statsOf($)).toContain('Compactions at the context cap: 0')
+    })
+
+    test('a prompt during the cap agent lookup still cancels compaction', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.beforeAgents = async () => {
+        await $.prompt.submit({ text: 'back' } as never)
+      }
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      expect(c.instructions).toEqual([])
+    })
+
+    for (const cancel of ['held prompt', 'router off']) {
+      test(`${cancel} during the final idle clock read still cancels compaction`, { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+        let reads = -1
+        on('clock.now', {}, async (_$: unknown, e: any, next: any) => {
+          // The second clock read is after the agent lookup, just before compacting.
+          if (reads >= 0 && ++reads === 2) {
+            if (cancel === 'held prompt') await $.prompt.submit({ text: 'back' } as never)
+            else await $.command.run({ command: 'model-router', args: 'off' } as never)
+          }
+          return next(e)
+        })
+        const { seen, c } = compactWorld($, on, 'ok', true)
+        await mainTurn($, seen, 't1', 250_000)
+        reads = 0
+        await seen.clock.advance(20 * MIN)
+        expect(reads).toBeGreaterThanOrEqual(2)
+        expect(c.instructions).toEqual([])
+        expect(c.toasts).toEqual([])
+        expect(await statsOf($)).toContain('Compactions at idle (cache warm): 0')
+      })
+    }
+
+    for (const kind of ['idle', 'cap']) {
+      test(`the plugin's ${kind} compaction usage is metered once`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+        const { seen, c } = compactWorld($, on)
+        const usage = U(1000, 500, 200_000, 0)
+        c.sizes = { usage }
+        if (kind === 'idle') c.agents = ['running']
+        await mainTurn($, seen, 't1', 250_000)
+        await seen.clock.advance(0)
+        c.agents = []
+        const before = seen.tally!
+        await seen.clock.advance(kind === 'idle' ? 20 * MIN : 0)
+        const after = seen.tally!
+        // The cap has already run at the first tick; compare with the known main and classifier usage instead.
+        const mainCost = costOf(U(1000, 500, 249_000), 'opus') + costOf(U(1, 1), 'haiku')
+        expect(near(after.cost, mainCost + costOf(usage, 'opus'))).toBe(true)
+        if (kind === 'idle') expect(after.tokens - before.tokens).toBe(201_500)
+        expect(c.instructions).toHaveLength(1)
+      })
+    }
+  })
 
   test('off by default: no timer is set and nothing compacts, however long the idle', async ($, on) => {
     const { seen, c } = compactWorld($, on)
@@ -1717,6 +2343,97 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
   })
 
   describe('compaction resets routing state (fix 1)', () => {
+    for (const kind of ['idle', 'cap']) {
+      for (const cancel of ['prompt', 'off']) {
+        test(`${cancel} during the plugin's ${kind} compaction without a newer request: the next prompt within the TTL is classified`, { options: { idleCompactMinutes: 20, compactAtContext: kind === 'cap' ? 200_000 : 0 } }, async ($, on) => {
+          let active = false
+          let hit = false
+          on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+            if (active) {
+              active = false
+              hit = true
+              if (cancel === 'off') await $.command.run({ command: 'model-router', args: 'off' } as never)
+              else await $.prompt.submit({ text: 'back' } as never)
+            }
+            return next(e)
+          })
+          const { seen, c } = compactWorld($, on)
+          c.sizes = { tokensBefore: 250_000, tokensAfter: 10_000 }
+          await mainTurn($, seen, 't1', 250_000)
+          active = true
+          await seen.clock.advance(kind === 'idle' ? 20 * MIN : 0)
+          expect(hit).toBe(true)
+          expect(c.instructions).toHaveLength(1)
+          if (cancel === 'off') await $.command.run({ command: 'model-router', args: 'on' } as never)
+          await seen.clock.advance(MIN)
+          await $.prompt.submit({ text: 'rename a variable' } as never)
+          expect(seen.asked).toEqual(['haiku', 'haiku'])
+          await step($, cancel === 'prompt' ? 't3' : 't2')
+          expect(seen.steps.at(-1)!.model).toContain('sonnet')
+          // Neither a prompt nor switching on revives the discarded context's timer.
+          await seen.clock.advance(20 * MIN)
+          expect(c.instructions).toHaveLength(1)
+        })
+      }
+    }
+
+    for (const off of ['before', 'during']) {
+      test(`router disabled ${off} /compact: re-enabling within the TTL classifies the next prompt`, { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+        let active = false
+        on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+          if (active && off === 'during') await $.command.run({ command: 'model-router', args: 'off' } as never)
+          return next(e)
+        })
+        const { seen, c } = compactWorld($, on)
+        c.sizes = { tokensBefore: 250_000, tokensAfter: 10_000 }
+        await mainTurn($, seen, 't1', 250_000)
+        if (off === 'before') await $.command.run({ command: 'model-router', args: 'off' } as never)
+        active = true
+        await $.session.compact({ messages: [{ role: 'user', text: 'hi', toolUses: [] }] } as never)
+        active = false
+        await $.command.run({ command: 'model-router', args: 'on' } as never)
+        await seen.clock.advance(20 * MIN)
+        // Switching back on must not revive the old timer or keep the discarded Opus context warm.
+        expect(c.instructions).toHaveLength(1)
+        await $.prompt.submit({ text: 'rename a variable' } as never)
+        expect(seen.asked).toEqual(['haiku', 'haiku'])
+        await step($, 't2')
+        expect(seen.steps.at(-1)!.model).toContain('sonnet')
+      })
+    }
+
+    for (const path of ['session.compact observer', 'compactMain idle', 'compactMain cap']) {
+      test(`${path}: a newer main request without a new prompt is not cleared`, { options: { idleCompactMinutes: 20, compactAtContext: path === 'compactMain cap' ? 200_000 : 0 } }, async ($, on) => {
+        let active = false
+        let hit = false
+        on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+          if (active) {
+            active = false
+            hit = true
+            // Another step records fresh context without a prompt moving the timer epoch.
+            seen.usage.push(U(1000, 500, 149_000, 0, 'claude-opus-5-5'))
+            await step($, 't1')
+            await $.turn.complete(done('t1'))
+          }
+          return next(e)
+        })
+        const { seen, c } = compactWorld($, on)
+        await mainTurn($, seen, 't1', 250_000)
+        active = true
+        if (path.startsWith('compactMain')) await seen.clock.advance(path === 'compactMain cap' ? 0 : 20 * MIN)
+        else await $.session.compact({ messages: [{ role: 'user', text: 'hi', toolUses: [] }] } as never)
+        expect(hit).toBe(true)
+        await $.prompt.submit({ text: 'next' } as never)
+        expect(seen.asked).toEqual(['haiku'])
+        await step($, 't2')
+        expect(seen.steps.at(-1)!.model).toContain('opus')
+        await $.turn.complete(done('t2'))
+        await seen.clock.advance(20 * MIN)
+        expect(c.instructions).toHaveLength(2)
+        expect(c.toasts.at(-1)).toContain('150.0k')
+      })
+    }
+
     test('a manual /compact clears the warm-cache memory: the next prompt is classified and not kept on Opus', async ($, on) => {
       const { seen } = compactWorld($, on)
       await mainTurn($, seen, 't1', 250_000)
@@ -1780,14 +2497,16 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       })
     }
 
-    test('no re-check when it would fall outside the safe window', { options: { idleCompactMinutes: 53 } }, async ($, on) => {
+    test('the single busy-agent re-check moves forward to the deadline', { options: { idleCompactMinutes: 53 } }, async ($, on) => {
       const { seen, c } = compactWorld($, on)
       c.agents = ['running']
       await mainTurn($, seen, 't1', 250_000)
       await seen.clock.advance(53 * MIN + 1000)
       c.agents = []
-      await seen.clock.advance(10 * MIN)
+      await seen.clock.advance(3 * MIN)
       expect(c.instructions).toEqual([])
+      await seen.clock.advance(MIN)
+      expect(c.instructions).toHaveLength(1)
     })
   })
 
@@ -1884,14 +2603,15 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
   })
 
   describe('second review (v0.9.1)', () => {
-    test('the TTL is measured from when the request was sent, not from when a long response ended', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
+    test('a long response moves idle compaction forward to the send-time deadline', { options: { idleCompactMinutes: 55 } }, async ($, on) => {
       const { seen, c } = compactWorld($, on)
       seen.stepMs = 6 * MIN
       await mainTurn($, seen, 't1', 250_000)
       seen.stepMs = 0
-      await seen.clock.advance(55 * MIN)
-      // Sent 61 minutes ago: past the safe window, so compacting now would pay the cold rewrite it means to avoid.
+      await seen.clock.advance(50 * MIN)
       expect(c.instructions).toEqual([])
+      await seen.clock.advance(MIN)
+      expect(c.instructions).toHaveLength(1)
     })
 
     // 0.9.2: routing measured the cache from when a response ended, the same error 0.9.1 fixed for the idle guard.
@@ -1930,11 +2650,10 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
 
     test('a prompt that lands while the timer reads the enabled state still cancels it', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
       const { seen, c } = compactWorld($, on)
-      // Armed after the turn. runIdle reads the enabled state twice; the prompt lands during the second read, the last
-      // check before compacting.
+      // Armed after the turn. The prompt lands during runIdle's enabled-state read.
       let reads = -1
       on('state.get', { plugin: 'model-router' }, async (_$: unknown, e: any, next: any) => {
-        if (reads >= 0 && e.key === 'enabled' && ++reads === 2) {
+        if (reads >= 0 && e.key === 'enabled' && ++reads === 1) {
           await $.prompt.submit({ text: 'back' } as never)
         }
         return next(e)

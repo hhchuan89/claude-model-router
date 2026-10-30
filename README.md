@@ -1,8 +1,8 @@
 # claude-model-router
 
 A local, private model router for [Claude Code](https://claude.com/claude-code). Every turn you start runs on the
-cheapest Claude model that can do it well, and a meter shows roughly how much that saved compared with running
-everything on Opus.
+cheapest Claude model that can do it well, and a meter compares its estimated cost with the same work tokens at
+Opus prices, adjusted for cache switches and router overhead.
 
 It does what [Jev](https://www.pulumi.com/blog/route-every-claude-code-message-to-the-right-model-with-jev/) and
 `jev-router` do, with one difference that matters at work: **nothing leaves your Anthropic account.** Jev classifies
@@ -18,8 +18,8 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 ![The router's band above the Claude Code prompt](docs/band.png)
 
 The band above the prompt, from a real session: the route for this turn and why (here an ambiguous follow-up, so the
-router would not start it on Haiku), then this turn's and today's tokens with an estimated saving against running
-everything on Opus. The numbers are one person's working day, not a typical result.
+router would not start it on Haiku), then this turn's and today's tokens with a price comparison against Opus.
+The numbers are one person's working day, not a typical result.
 
 ## How a turn is routed
 
@@ -62,7 +62,8 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    is **50,000 tokens or more** (`WARM_CONTEXT_KEEP` in `hooks/meter.ts`), the router never moves the main thread to
    a lower model: it keeps the model that is warm (shown as `→ Opus (cache kept)`). Below 50,000 tokens the router
    still compares the two costs over the turn's expected steps and stays only if switching would cost more. Moving
-   *up* is never blocked, and after the TTL the cache is cold, so a downgrade is allowed.
+   *up* is never blocked, and after the TTL the cache is cold, so a downgrade is allowed. An explicit `#model` pin
+   always wins; leaving a warm large Opus context shows the estimated round-trip cache rewrite cost in the reason.
    Turns that start without a person prompt (a background task's notification, an agent message, a scheduled prompt)
    are never classified; while the previous route's cache is warm they **continue that route** ("continues previous
    route") instead of running on the session model. After the TTL, or with no previous route, they stay unrouted.
@@ -71,7 +72,8 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    execute → Sonnet · medium, decide → inherits the parent's model, never a pinned Opus; if classification fails,
    Sonnet). Pinned subagents start at medium on every model, because effort can be raised later, by the agent or by
    the automatic ladder below. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
-   workflow agents. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
+   workflow agents. A resumed agent keeps its tracked model, effort and error state without being classified or
+   counted again. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
    capped at the parent's tier.
 6. **Subagents can escalate, are escalated, and have a ceiling.** The same `escalate` tool works inside a subagent: it
    may raise its own model or effort from its next step, but on its own never above **Opus at medium** (haiku and
@@ -111,7 +113,9 @@ everything on Opus. The numbers are one person's working day, not a typical resu
      while the cache is still warm, so the eventual rewrite is of a summary, not the whole context. It runs only if
      the last main request's context is at least `compactMinContext` (default 100,000 tokens), that request was at
      least 3 minutes inside the cache TTL, and no subagent or teammate is pending, running or waiting. If one is,
-     the router checks once more 5 minutes later (only while still inside that safe window) and otherwise skips.
+     the router checks once more after 5 minutes, or at the safe deadline if that is earlier, and otherwise skips.
+     A long final response brings the idle timer forward to that deadline, measured from when its request was sent.
+     It always leaves at least 1 minute at the prompt; if that would pass the deadline, it does not arm.
      Any new prompt or turn cancels the timer, so a person who comes back is never compacted under; so does turning
      the router off. Values outside 1 to 55 count as off (not clamped): 56 or more cannot fire safely inside the
      cache window.
@@ -119,10 +123,11 @@ everything on Opus. The numbers are one person's working day, not a typical resu
      compacted between turns, while the cache is warm, so later steps do not each re-read a huge cache. A value
      below 100,000 counts as off (the engine's own auto-compact window starts there). If the compaction is refused
      because the turn still counts as running, it is retried up to 3 times, 2 seconds apart; if it never lands the
-     idle guard (if set) takes over.
+     idle guard (if set) takes over. Busy agents defer it to the idle guard too. Aborted turns arm only the idle guard.
 
    After any compaction (this plugin's, a manual `/compact`, or the engine's auto-compact) the router forgets its
    cached context figure, cancels any pending compaction, and stops treating the cache as warm for model switching.
+   A `precompute` only prepares a summary and leaves that state and any pending timer alone.
    A compaction another plugin vetoes, or one refused because a turn is running, is silently skipped and not counted.
    Each compaction that happens shows a one-line toast with the size compacted (before and after, when the engine
    reports both). `/model-router stats` counts both kinds, and also counts **cache rewrites after the TTL** (a main
@@ -202,8 +207,8 @@ but leave your own conversation alone, turn `mainRouting` off instead (see Optio
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `language` | `en` | Language of the reason line and the savings line (`en` or `zh`) |
-| `mainRouting` | on | On: every turn you start is classified and routed. Off: **subagent-only mode, the low-risk way to start.** The main thread is never classified or rewritten (your session model and effort stay as they are, and no assignment text is added to your prompts), while subagent routing, subagent escalation and automatic escalation, Fable blocking for subagents and the savings meter keep working |
+| `language` | `en` | Language of the reason line and the price comparison (`en` or `zh`) |
+| `mainRouting` | on | On: every turn you start is classified and routed. Off: **subagent-only mode, the low-risk way to start.** The main thread is never classified or rewritten (your session model and effort stay as they are, and no assignment text is added to your prompts), while subagent routing, subagent escalation and automatic escalation, Fable blocking for subagents and the meter keep working |
 | `blockFable` | on | On: Fable never runs on a subagent, and not on the main thread while `mainRouting` is on (those requests run on Opus); with `mainRouting` off your main model is left alone and only subagents are kept off Fable. Off: Fable is left alone everywhere, so Fable can be your main model; a subagent still never runs above its parent |
 | `haikuModel` / `sonnetModel` / `opusModel` | `claude-haiku-5-5` / `claude-sonnet-5-5` / `claude-opus-5-5` | Model ids per tier |
 | `reviewModel` | empty (off) | A model id available on your account that reviews Opus decisions, only if it exists there; Fable 5.1 is never used. **The reviewer is sent your request and Opus's answer unmasked** (see Privacy) |
@@ -216,6 +221,15 @@ but leave your own conversation alone, turn `mainRouting` off instead (see Optio
 The dollar figures are **estimates**, computed from the price table in `hooks/meter.ts` (Anthropic first-party API
 rates, as of 2026-10). They may differ from your actual pricing or plan: on a subscription you pay in usage limits, not
 dollars, and another model would not have used exactly the same tokens. **The percentage is the more useful number.**
+
+Classification and reviewer availability probes are overhead: they add actual cost without an Opus baseline credit.
+The plugin's own compactions are metered when the engine reports usage. That usage has no model id, so their cost
+is estimated at the last main request's model rates. Missing usage cannot be priced.
+
+Daily tallies and counters are stored separately per session so concurrent sessions cannot overwrite each other's
+increments. Records are kept for 30 calendar days. Stats aggregate those records and continue reading older versions'
+daily and all-time totals unchanged; the retained total includes the legacy all-time figure once. Legacy baseline
+figures cannot be corrected retrospectively because they do not separate classifier usage.
 
 Prices per million tokens in the table: Opus 5.5 $4 in / $20 out, Sonnet 5.5 $2 / $10, Haiku 5.5 $0.10 / $0.50; cache
 reads $0.20 (Haiku assumed at 10% of input); cache writes at 2× input (Claude Code's 1-hour cache TTL). Change

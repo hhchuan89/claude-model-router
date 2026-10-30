@@ -22,7 +22,7 @@ export type Usage = {
   cache_creation_input_tokens: number
 }
 
-// Tally.baseline: what the same tokens would have cost on Opus, the "everything on Opus" baseline.
+// Tally.baseline: the same work tokens at Opus prices; classification and probes are pure overhead.
 export const EMPTY: Tally = { tokens: 0, cost: 0, baseline: 0, byModel: {} }
 
 export function priceKey(modelId: string): keyof typeof PRICES {
@@ -62,7 +62,7 @@ export function isSwitchStep(prev: LastRequest | null, key: keyof typeof PRICES,
   return prev !== null && prev.model !== key && now - prev.at <= CACHE_TTL_MS
 }
 
-export function add(t: Tally, modelId: string, u: Usage, switched = false): Tally {
+export function add(t: Tally, modelId: string, u: Usage, switched = false, overhead = false): Tally {
   const key = priceKey(modelId)
   const cost = costOf(u, key)
   const tokens = tokensOf(u)
@@ -70,9 +70,18 @@ export function add(t: Tally, modelId: string, u: Usage, switched = false): Tall
   return {
     tokens: t.tokens + tokens,
     cost: t.cost + cost,
-    baseline: t.baseline + baselineOf(u, switched),
+    baseline: t.baseline + (overhead ? 0 : baselineOf(u, switched)),
     byModel: { ...t.byModel, [key]: { tokens: prev.tokens + tokens, cost: prev.cost + cost } },
   }
+}
+
+export function merge(a: Tally, b: Tally): Tally {
+  const byModel = { ...a.byModel }
+  for (const [key, v] of Object.entries(b.byModel)) {
+    const prev = byModel[key] ?? { tokens: 0, cost: 0 }
+    byModel[key] = { tokens: prev.tokens + v.tokens, cost: prev.cost + v.cost }
+  }
+  return { tokens: a.tokens + b.tokens, cost: a.cost + b.cost, baseline: a.baseline + b.baseline, byModel }
 }
 
 export function saved(t: Tally): { usd: number; pct: number } {
