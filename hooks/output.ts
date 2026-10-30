@@ -91,16 +91,13 @@ export function reduceOutput(original: string, limit: number, omitted: (n: numbe
   // Delimited exports stay exact, including their separators, line endings and repeated records.
   if (tabular(rows)) return original
   let diagnostic = false
+  // Redraws use the same payload comparisons below, keeping the first and last states.
   const entries = rows.flatMap(line => {
-    const redraws = line.split('\r').map(part => {
+    return line.split('\r').map(part => {
       const { message, important } = diagnosticLine(part)
-      // Classify the whole block before deciding which progress redraws can go.
       diagnostic = important || (diagnostic && (!message.trim() || CONTINUATION.test(message)))
-      const progress = PROGRESS_BAR.test(message) || PROGRESS_PERCENT.test(message) || PROGRESS_COUNT.test(message)
-      return { line: part, diagnostic, progress }
+      return { line: part, diagnostic }
     })
-    const lastProgress = redraws.map(part => part.progress).lastIndexOf(true)
-    return redraws.filter((part, i) => part.diagnostic || !part.progress || i === lastProgress)
   })
   const lines = entries.map(part => part.line)
   const keys = lines.map(lineKey)

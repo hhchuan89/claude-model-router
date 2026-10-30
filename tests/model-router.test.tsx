@@ -1,11 +1,13 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { FsEntry, FsStat } from 'claude-code'
 import type { Tally } from '../types'
+import { Backoff, EventLogs, mergeLogs } from '../hooks/log'
 
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
 import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
-import { applyEscalation, assignmentContext, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
-import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
+import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
   test('parses the classifier reply and rejects junk', async () => {
@@ -182,7 +184,17 @@ function world(
   on('session.id', async () => ({ value: seen.sessionId }))
   on('session.end', async (_$: unknown, e: { sessionId: string }) => ({ sessionId: e.sessionId }))
   on('session.measure', async (_$: unknown, e: any) => ({ changed: e.changed }))
-  on('fs.read', async (_$: unknown, e: { path: string }) => ({ deny: `no file ${e.path}` }))
+  on('fs.read', async (_$: unknown, e: { path: string }) => seen.files[e.path] === undefined ? { deny: `no file ${e.path}` } : { value: seen.files[e.path] })
+  on('fs.list', async (_$: unknown, e: { path: string }) => {
+    const entries = new Map<string, FsEntry['kind']>()
+    for (const path of Object.keys(seen.files)) {
+      if (!path.startsWith(`${e.path}/`)) continue
+      const tail = path.slice(e.path.length + 1)
+      entries.set(tail.split('/')[0]!, tail.includes('/') ? 'dir' : 'file')
+    }
+    return { value: [...entries].map(([name, kind]): FsEntry => ({ name, kind, size: 0, mtimeMs: 0, isLink: false })) }
+  })
+  on('fs.stat', async () => ({ value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } satisfies FsStat }))
   on('fs.write', async (_$: unknown, e: { path: string; text: string }) => {
     seen.files[e.path] = e.text
     return { value: undefined }
@@ -699,8 +711,7 @@ test('the second run of three errors raises the model; the log says which stage 
   await step($, 'sub', OPUS, id)
   expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
   expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
-  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-router/events-sess-1.json'))
-  const log = JSON.parse(seen.files[file!]!) as { events: { event: string; to: string; reason: string }[] }
+  const log = historyOf(seen) as { events: { event: string; to: string; reason: string }[] }
   expect(log.events.filter(ev => ev.event === 'auto-escalated')).toMatchObject([
     { to: 'haiku/high', reason: '3 tool errors in a row: more effort on the same model' },
     { to: 'sonnet/medium', reason: '3 tool errors in a row again: next model' },
@@ -778,8 +789,7 @@ test('main routes and subagent changes land in the events file in ~/.claude/mode
   seen.usage.push(U(10, 1, 0, 0, 'claude-haiku-5-5'))
   await step($, 'sub', OPUS, id)
   await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'sonnet', reason: 'contradiction' } as never)
-  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-router/events-sess-1.json'))
-  const log = JSON.parse(seen.files[file!]!) as { sessionId: string; events: { agentId: string; event: string; to: string; reason: string }[]; stats: Record<string, unknown> }
+  const log = historyOf(seen) as { sessionId: string; events: { agentId: string; event: string; to: string; reason: string }[]; stats: Record<string, unknown> }
   expect(log.sessionId).toBe('sess-1')
   expect(log.events).toMatchObject([
     { agentId: 'main', event: 'turn route', to: 'haiku/medium', reason: '找文件' },
@@ -832,9 +842,15 @@ test('language zh gives the Chinese band', { options: { language: 'zh' } }, asyn
 
 // ---- v0.7: round trips, notification turns, classifier failures, honest baseline, mainRouting ----
 
-function eventsOf(seen: Seen): { agentId: string; event: string; to: string; reason: string }[] {
-  const file = Object.keys(seen.files).find(k => k.replaceAll('\\', '/').endsWith('/model-router/events-sess-1.json'))
-  return (JSON.parse(seen.files[file!]!) as { events: { agentId: string; event: string; to: string; reason: string }[] }).events
+function historyOf(seen: Seen, id = 'sess-1') {
+  const batches = Object.entries(seen.files)
+    .filter(([path]) => path.replaceAll('\\', '/').endsWith(`/model-router/events-${id}.json`) || path.replaceAll('\\', '/').includes(`/model-router/${id}/`))
+    .map(([, text]) => JSON.parse(text))
+  return mergeLogs(id, batches)
+}
+
+function eventsOf(seen: Seen, id = 'sess-1') {
+  return historyOf(seen, id).events
 }
 
 const decide = '{"tier":"decide","sure":true,"reason":"选方案"}'
@@ -2143,7 +2159,708 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     seen.sessionId = 'sess-2'
   }
 
+  describe('retryable bookkeeping (merge review #1)', () => {
+    for (const failed of ['history', 'totals']) {
+      test(`100 hook entries with failed ${failed} make one history scan and one totals attempt, then recover independently`, async ($, on) => {
+        let failing = true
+        let scans = 0
+        let lists = 0
+        let totals = 0
+        let diagnostics = 0
+        on('fs.read', { path: /events-sess-1\.json$/ }, async (_$: unknown, e: any, next: any) => {
+          scans++
+          return failing && failed === 'history' ? { deny: 'history unavailable' } : next(e)
+        })
+        on('store.get', { key: /^meter:\d{8}$/ }, async (_$: unknown, e: any, next: any) => {
+          totals++
+          return failing && failed === 'totals' ? { deny: 'totals unavailable' } : next(e)
+        })
+        on('fs.list', { path: /\/model-router\/sess-1$/ }, async (_$: unknown, e: any, next: any) => { lists++; return next(e) })
+        on('ui.log', {}, async () => { diagnostics++; return { value: undefined } })
+        const seen = world($, on, null, { store: { [`meter:${storeDay(0)}`]: add(EMPTY, 'haiku', U(1_000_000, 0)) } })
+        const measure = () => $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
+        for (let i = 0; i < 100; i++) expect(await measure()).toMatchObject({ changed: ['context'] })
+        expect(scans).toBe(1)
+        expect(lists).toBe(failed === 'history' ? 0 : 1)
+        expect(totals).toBe(1)
+        expect(diagnostics).toBe(1)
+        if (failed === 'totals') {
+          await $.prompt.submit({ text: 'work during backoff #sonnet' } as never)
+          seen.usage.push(U(100, 50))
+          await step($, 't1')
+          expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+          expect(totals).toBe(1)
+          expect(scans).toBe(1)
+        }
+        failing = false
+        await new Promise(resolve => setTimeout(resolve, 1100))
+        await measure()
+        expect(scans).toBe(failed === 'history' ? 2 : 1)
+        expect(lists).toBe(1)
+        expect(totals).toBe(failed === 'totals' ? 2 : 1)
+        const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+        expect(await ui.find({ text: /today 1.0M token/ })).toBeDefined()
+        await measure()
+        expect(scans).toBe(failed === 'history' ? 2 : 1)
+        expect(totals).toBe(failed === 'totals' ? 2 : 1)
+        expect(diagnostics).toBe(1)
+      })
+    }
+
+    test('bookkeeping backoff doubles from one second to five minutes and resets after recovery', async () => {
+      const retry = new Backoff()
+      let now = 0
+      expect(retry.waiting(now)).toBe(false)
+      retry.fail(now)
+      for (const delay of [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 300000, 300000]) {
+        expect(retry.delay).toBe(delay)
+        now += delay - 1
+        expect(retry.waiting(now)).toBe(true)
+        now++
+        expect(retry.waiting(now)).toBe(false)
+        retry.fail(now)
+      }
+      retry.reset()
+      expect(retry.waiting(now)).toBe(false)
+      retry.fail(now)
+      expect(retry.delay).toBe(1000)
+    })
+
+    test('100 stats entries bound failed store scans to five independent readers, then recover', async ($, on) => {
+      let failing = true
+      let attempts = 0
+      let diagnostics = 0
+      on('store.keys', {}, async (_$: unknown, e: any, next: any) => {
+        attempts++
+        return failing ? { deny: 'store unavailable' } : next(e)
+      })
+      on('ui.log', {}, async () => { diagnostics++; return { value: undefined } })
+      const seen = world($, on, null, { store: { [`meter:${storeDay(0)}`]: add(EMPTY, 'haiku', U(1_000_000, 0)) } })
+      for (let i = 0; i < 100; i++) expect(await statsOf($)).toContain('Compaction in this session:')
+      expect(attempts).toBe(5) // Initialization, retained totals, session tally, and the two rewrite counts.
+      expect(diagnostics).toBe(5)
+      failing = false
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      expect(await statsOf($)).toContain('**Today**: 1.0M tokens')
+      expect(attempts).toBe(10)
+      expect(diagnostics).toBe(5)
+    })
+
+    test('100 prompts with failed store reads try daily totals, shape and counters once each, then recover', async ($, on) => {
+      let failing = true
+      let attempts = 0
+      let diagnostics = 0
+      on('store.get', {}, async (_$: unknown, e: any, next: any) => {
+        attempts++
+        return failing ? { deny: 'store unavailable' } : next(e)
+      })
+      on('ui.log', {}, async () => { diagnostics++; return { value: undefined } })
+      const seen = world($, on, null)
+      for (let i = 0; i < 100; i++) await $.prompt.submit({ text: 'keep routing #haiku' } as never)
+      expect(attempts).toBe(3)
+      expect(diagnostics).toBe(3)
+      expect(seen.submits).toHaveLength(100)
+      expect(eventsOf(seen)).toHaveLength(100)
+      failing = false
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      await $.prompt.submit({ text: 'recovered #sonnet' } as never)
+      expect(attempts).toBe(6)
+      expect(diagnostics).toBe(3)
+      await step($, 't101')
+      expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+    })
+
+    test('100 failed session-id lookups make one attempt and never reuse the previous identity', async ($, on) => {
+      let failing = false
+      let attempts = 0
+      let diagnostics = 0
+      on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+        if (!failing) return next(e)
+        attempts++
+        return { deny: 'identity unavailable' }
+      })
+      on('ui.log', {}, async () => { diagnostics++; return { value: undefined } })
+      const seen = world($, on, null)
+      await $.prompt.submit({ text: 'first #haiku' } as never)
+      failing = true
+      seen.sessionId = 'sess-2'
+      for (let i = 0; i < 100; i++) await $.prompt.submit({ text: 'pass through #sonnet' } as never)
+      expect(attempts).toBe(1)
+      expect(diagnostics).toBe(1)
+      expect(seen.submits).toHaveLength(101)
+      expect(eventsOf(seen, 'sess-2')).toHaveLength(0)
+      failing = false
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      await $.prompt.submit({ text: 'recovered #sonnet' } as never)
+      await step($, 't102')
+      expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+      expect(eventsOf(seen, 'sess-2')).toContainEqual(expect.objectContaining({ event: 'turn route', to: 'sonnet/medium' }))
+    })
+
+    // A denial rejects the SDK call; a thrown test hook is skipped by the host instead.
+    for (const operation of ['get', 'set']) {
+      test(`prompt.submit still classifies and routes when the meter's state.${operation} throws`, async ($, on) => {
+        let failures = 0
+        let resets = 0
+        on(`state.${operation}` as never, { plugin: 'model-router', key: 'meter' }, async () => {
+          failures++
+          if (seen.asked.length === 0) resets++
+          return { deny: 'meter unavailable' }
+        })
+        const { seen } = compactWorld($, on)
+        await $.prompt.submit({ text: 'work on it' } as never)
+        expect(resets).toBe(1)
+        expect(failures).toBeGreaterThan(0)
+        expect(seen.asked).toEqual(['haiku'])
+        expect(seen.submits).toHaveLength(1)
+        expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet at medium effort')
+        await step($, 't1')
+        expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+      })
+
+      test(`turn.step returns the engine's answer when the meter's state.${operation} throws`, async ($, on) => {
+        let failing = false
+        let failures = 0
+        on(`state.${operation}` as never, { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+          if (failing) { failures++; return { deny: 'meter unavailable' } }
+          return next(e)
+        })
+        const { seen } = compactWorld($, on)
+        await $.prompt.submit({ text: 'find it #haiku' } as never)
+        failing = true
+        seen.usage.push(U(100, 50))
+        const stream = $.turn.step({ turnId: 't1', index: 0, model: `${OPUS}[1m]`, effort: 'high', messageCount: 3 } as never)
+        let result
+        while (true) {
+          const part = await stream.next()
+          if (part.done) { result = part.value; break }
+        }
+        expect(failures).toBe(1)
+        expect(result).toMatchObject({ turnId: 't1', stopReason: 'end_turn', usage: U(100, 50) })
+        expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+        failing = false
+        const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+        expect(await ui.find({ text: /ctx 100/ })).toBeDefined()
+      })
+
+      test(`turn.complete returns normally when shape store.${operation} throws`, { options: { checkpointHints: true } }, async ($, on) => {
+        let failing = false
+        let failures = 0
+        on(`store.${operation}` as never, { key: 'shape' }, async (_$: unknown, e: any, next: any) => {
+          if (failing) { failures++; return { deny: 'shape unavailable' } }
+          return next(e)
+        })
+        const { seen, c } = compactWorld($, on)
+        await $.prompt.submit({ text: 'find it #haiku' } as never)
+        seen.usage.push(U(100, 50, 150_000, 0, 'claude-haiku-5-5'))
+        await step($, 't1')
+        failing = true
+        expect(await $.turn.complete(done('t1'))).toMatchObject({ text: 'ok' })
+        expect(failures).toBe(1)
+        expect(c.toasts).toHaveLength(1)
+        expect(c.toasts[0]).toContain('/model-router checkpoint')
+      })
+    }
+
+    test('turn.start reaches the engine when its turn counter write throws', async ($, on) => {
+      let failures = 0
+      let starts = 0
+      on('store.set', { key: /^counts:/ }, async () => { failures++; return { deny: 'counters unavailable' } })
+      on('turn.start', {}, async (_$: unknown, e: any, next: any) => { starts++; return next(e) })
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'find it #haiku' } as never)
+      expect(failures).toBe(1)
+      expect(starts).toBe(1)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ event: 'turn route', to: 'haiku/medium' }))
+      await step($, 't1')
+      expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+    })
+
+    test('agent.spawn returns the routed agent when its counter write throws', async ($, on) => {
+      let failures = 0
+      on('store.set', { key: /^counts:/ }, async () => { failures++; return { deny: 'counters unavailable' } })
+      const { seen } = compactWorld($, on)
+      const id = await spawnAgent($, { subagentType: 'Explore' })
+      expect(failures).toBe(1)
+      expect(id).toBe('agent-1')
+      expect(seen.agents).toEqual(['haiku'])
+      await step($, 'a1', `${OPUS}[1m]`, id)
+      expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium', agentId: id })
+    })
+
+    test('tool.call replies with the new route when its escalation counter write throws', async ($, on) => {
+      let failing = false
+      let failures = 0
+      on('store.set', { key: /^counts:/ }, async (_$: unknown, e: any, next: any) => {
+        if (failing) { failures++; return { deny: 'counters unavailable' } }
+        return next(e)
+      })
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'find it #haiku' } as never)
+      failing = true
+      const result = await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)
+      expect(result.result).toContain('runs on opus at medium effort')
+      expect(failures).toBe(1)
+      await step($, 't1')
+      expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+    })
+
+    test('session.compact returns the engine sizes when its detail and usage writes throw', async ($, on) => {
+      let failures = 0
+      on('store.set', { key: /^meter:/ }, async () => { failures++; return { deny: 'meter unavailable' } })
+      const { c } = compactWorld($, on)
+      c.sizes = { tokensBefore: 150_000, tokensAfter: 20_000, usage: U(100, 50) }
+      expect(await $.session.compact({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] } as never)).toMatchObject(c.sizes)
+      expect(failures).toBe(2)
+      expect(c.instructions).toHaveLength(1)
+    })
+
+    test('command.run replies with stats when retained totals cannot be read and logging fails too', async ($, on) => {
+      let failing = false
+      let failures = 0
+      let logs = 0
+      on('store.keys', {}, async (_$: unknown, e: any, next: any) => {
+        if (failing) { failures++; return { deny: 'totals unavailable' } }
+        return next(e)
+      })
+      on('ui.log', {}, async () => { logs++; return { deny: 'log unavailable' } })
+      compactWorld($, on)
+      await $.prompt.submit({ text: 'find it #haiku' } as never)
+      failing = true
+      expect(await statsOf($)).toContain('**This session**: 0 tokens')
+      expect(failures).toBe(4)
+      expect(logs).toBe(4)
+    })
+
+    test('session.measure reaches the engine when loading the daily meter throws', async ($, on) => {
+      let failures = 0
+      on('store.get', { key: /^meter:/ }, async () => { failures++; return { deny: 'totals unavailable' } })
+      compactWorld($, on)
+      const changed = ['context'] as const
+      const result = await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed } as never)
+      expect(result).toMatchObject({ changed })
+      expect(failures).toBe(1)
+      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await ui.find({ text: /ctx 60.0k/ })).toBeDefined()
+      expect(await ui.find({ text: /other mods/ })).toBeDefined()
+    })
+
+    for (const key of ['meter', 'route']) {
+      test(`ui.render keeps the band and other mods when the ${key} read throws`, async ($, on) => {
+        let failing = false
+        let failures = 0
+        on('state.get', { plugin: 'model-router', key }, async (_$: unknown, e: any, next: any) => {
+          if (failing) { failures++; return { deny: 'display state unavailable' } }
+          return next(e)
+        })
+        compactWorld($, on)
+        await $.prompt.submit({ text: 'find it #haiku' } as never)
+        failing = true
+        const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+        expect(failures).toBe(1)
+        expect(await ui.find({ text: /turn 0 token/ })).toBeDefined()
+        expect(await ui.find({ text: /other mods/ })).toBeDefined()
+      })
+    }
+
+    test('turn.complete returns the engine result when its route read for accounting throws', { options: { checkpointHints: true } }, async ($, on) => {
+      let failing = false
+      let failures = 0
+      on('state.get', { plugin: 'model-router', key: 'route' }, async (_$: unknown, e: any, next: any) => {
+        if (failing) { failures++; return { deny: 'route unavailable' } }
+        return next(e)
+      })
+      const { seen, c } = compactWorld($, on)
+      await $.prompt.submit({ text: 'find it #haiku' } as never)
+      seen.usage.push(U(100, 50, 150_000, 0, 'claude-haiku-5-5'))
+      await step($, 't1')
+      failing = true
+      expect(await $.turn.complete(done('t1'))).toMatchObject({ text: 'ok' })
+      expect(failures).toBe(1)
+      expect(c.toasts).toHaveLength(1)
+      expect(c.toasts[0]).toContain('/model-router checkpoint')
+    })
+
+    for (const failure of ['get', 'keys', 'set']) {
+      test(`store.${failure} failures leave commands and routing usable, then recover`, async ($, on) => {
+        let failing = false
+        let failures = 0
+        on(`store.${failure}` as never, {}, async (_$: unknown, e: any, next: any) => {
+          if (failing) { failures++; throw new Error('temporarily unavailable') }
+          return failure === 'get' ? { value: seen.store[e.key] } : failure === 'keys' ? { value: Object.keys(seen.store) } : next(e)
+        })
+        if (failure !== 'get') on('store.get', {}, async (_$: unknown, e: any) => ({ value: seen.store[e.key] }))
+        if (failure !== 'keys') on('store.keys', {}, async () => ({ value: Object.keys(seen.store) }))
+        on('fs.read', {}, async (_$: unknown, e: any, next: any) => seen.files[e.path] === undefined ? next(e) : { value: seen.files[e.path] })
+        on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+        on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
+        on('tool.register', async () => ({ value: { tool: 'mcp__model-router__escalate' } }))
+        on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
+        on('session.model', async () => ({ value: 'opus' }))
+        const { seen } = compactWorld($, on)
+        await mainTurn($, seen, 't1', 150_000)
+        await replaceSession($, seen, 'clear')
+        const other = add(EMPTY, 'haiku', U(1_000_000, 0))
+        // Read from the same store as the engine, including a second session's retained total.
+        seen.store[`meter:${storeDay(0)}:other`] = other
+        failing = true
+        await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+        expect((await $.command.run({ command: 'model-router', args: 'stats' } as never)).text).toContain('Compaction in this session:')
+        await $.command.run({ command: 'model-router', args: 'off' } as never)
+        await $.command.run({ command: 'model-router', args: 'on' } as never)
+        await $.prompt.submit({ text: 'continue #sonnet' } as never)
+        seen.usage.push(U(100, 50))
+        await step($, 't2')
+        expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+        await $.turn.complete(done('t2'))
+        expect(failures).toBeGreaterThan(0)
+        failing = false
+        await new Promise(resolve => setTimeout(resolve, 1100))
+        const text = await statsOf($)
+        expect(text).toContain('**Today**: 1.')
+        expect(eventsOf(seen, seen.sessionId).some(e => e.event === 'turn route' && e.to === 'sonnet/medium')).toBe(true)
+        // A retry must not clear the route chosen while initialization was unavailable.
+        await step($, 't2')
+        expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+      })
+    }
+
+    test('a totals retry preserves restored history and events added while log writes fail', async ($, on) => {
+      let failing = true
+      let restores = 0
+      const history = { sessionId: 'sess-1', events: [{ at: '1969-12-31T12:00:00Z', agentId: 'old-agent', event: 'Explore start', to: 'haiku/medium', reason: 'old work' }], stats: {} }
+      on('fs.read', { path: /events-.*\.json$/ }, async (_$: unknown, e: any) => { restores++; seen.files[e.path] = JSON.stringify(history); return { value: seen.files[e.path] } })
+      on('fs.write', { path: /\/model-router\/[^/]+\/[^/]+\.json$/ }, async (_$: unknown, e: any, next: any) => {
+        if (failing) throw new Error('disk unavailable')
+        return next(e)
+      })
+      on('store.get', {}, async (_$: unknown, e: any, next: any) => {
+        if (failing && e.key.startsWith('meter:')) throw new Error('store unavailable')
+        return next(e)
+      })
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'new work #haiku' } as never)
+      failing = false
+      // Event-log retry deadlines use wall time; the engine's mock clock only controls hook timers.
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      await statsOf($)
+      await spawnAgent($, { subagentType: 'Explore' })
+      expect(restores).toBeGreaterThan(0)
+      const events = eventsOf(seen)
+      expect(events).toContainEqual(history.events[0])
+      expect(events).toContainEqual(expect.objectContaining({ event: 'turn route', to: 'haiku/medium' }))
+      expect(events).toHaveLength(3)
+    })
+
+    test('a failed history load never stops new batches, then reads legacy events and agent usage on retry', async ($, on) => {
+      let failing = true
+      let restores = 0
+      const lengths: number[] = []
+      const model = 'claude-haiku-5-5[1m]'
+      const usage = U(100, 50, 0, 0, model)
+      const history = {
+        sessionId: 'sess-1',
+        events: [{ at: '1969-12-31T12:00:00Z', agentId: 'agent-1', event: 'Explore start', to: 'haiku/medium', reason: 'old work' }],
+        stats: { 'agent-1': addUsage(undefined, model, 'medium', usage) },
+      }
+      on('fs.read', { path: /events-.*\.json$/ }, async (_$: unknown, e: any) => {
+        restores++
+        if (failing) return { deny: 'disk unavailable' }
+        seen.files[e.path] = JSON.stringify(history)
+        return { value: seen.files[e.path] }
+      })
+      on('fs.write', { path: /\/model-router\/[^/]+\/[^/]+\.json$/ }, async (_$: unknown, e: any, next: any) => {
+        lengths.push(JSON.parse(e.text).events.length)
+        return next(e)
+      })
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'new work #haiku' } as never)
+      const agentId = await spawnAgent($, { subagentType: 'Explore' })
+      seen.usage.push(usage)
+      await step($, 'a1', model, agentId, 'medium')
+      expect(lengths).toEqual([1, 1, 0])
+      failing = false
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      await statsOf($)
+      await spawnAgent($, { subagentType: 'Explore' })
+      expect(restores).toBeGreaterThan(1)
+      const events = eventsOf(seen)
+      expect(events[0]).toEqual(history.events[0])
+      expect(events).toHaveLength(4)
+      expect(historyOf(seen).stats['agent-1']).toEqual(addUsage(history.stats['agent-1'], model, 'medium', usage))
+      // A successful restore is never applied a second time, even on further hooks and writes.
+      await statsOf($)
+      await spawnAgent($, { subagentType: 'Explore' })
+      expect(eventsOf(seen)).toHaveLength(5)
+      expect(lengths).toEqual([1, 1, 0, 1, 1])
+    })
+
+    test('session.start preserves a route and turn spend established during registration', async ($, on) => {
+      let turnTokens = 0
+      on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+        const result = await next(e)
+        turnTokens = e.value.turn.tokens
+        return result
+      })
+      on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+      on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
+      on('tool.register', async () => {
+        await $.prompt.submit({ text: 'new work #haiku' } as never)
+        seen.usage.push(U(100, 50))
+        await step($, 't1')
+        return { value: { tool: 'mcp__model-router__escalate' } }
+      })
+      on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
+      on('session.model', async () => ({ value: 'opus' }))
+      const { seen } = compactWorld($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      expect(turnTokens).toBe(150)
+      await step($, 't1')
+      expect(seen.steps.at(-1)!.model).toBe('claude-haiku-5-5[1m]')
+      expect(turnTokens).toBe(150)
+    })
+
+    test('route load failures through prompt and turn start cannot erase the assigned route on retry', async ($, on) => {
+      let clears = 0
+      on('state.set', { plugin: 'model-router', key: 'route' }, async (_$: unknown, e: any, next: any) => {
+        if (e.value === null && ++clears <= 2) return { deny: 'initialization unavailable' }
+        return next(e)
+      })
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'continue #haiku' } as never)
+      await step($, 't1')
+      expect(seen.steps.at(-1)!.model).toBe('claude-haiku-5-5[1m]')
+      await statsOf($)
+      await step($, 't1')
+      expect(seen.steps.at(-1)!.model).toBe('claude-haiku-5-5[1m]')
+    })
+
+    test('a meter load retry keeps spend recorded after its failed initialization', async ($, on) => {
+      let fail = true
+      let turnTokens = 0
+      on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+        if (fail && e.value.turn.tokens === 0) { fail = false; return { deny: 'initialization unavailable' } }
+        const result = await next(e)
+        turnTokens = e.value.turn.tokens
+        return result
+      })
+      const { seen } = compactWorld($, on)
+      seen.usage.push(U(100, 50))
+      await step($, 't1')
+      expect(turnTokens).toBe(150)
+      await statsOf($)
+      expect(turnTokens).toBe(150)
+      seen.usage.push(U(100, 50))
+      await step($, 't1')
+      expect(turnTokens).toBe(300)
+    })
+  })
+
   describe('session lifetime (final review #1)', () => {
+
+    for (const lookup of [1, 2]) {
+      test(`the minute tick retries identity failure at lookup ${lookup} without retiring the route or idle guard`, { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+        let remaining = 0
+        let failures = 0
+        on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+          if (remaining > 0 && --remaining === 0) { failures++; return { deny: 'identity unavailable' } }
+          return next(e)
+        })
+        const { seen, c } = compactWorld($, on)
+        await mainTurn($, seen, 't1', 150_000)
+        remaining = lookup
+        await seen.clock.advance(MIN)
+        expect(failures).toBe(1)
+        // The repeating tick stays alive during backoff, as does the not-yet-fired idle timer.
+        await seen.clock.advance(MIN)
+        expect(failures).toBe(1)
+        await new Promise(resolve => setTimeout(resolve, 1100))
+        await seen.clock.advance(MIN)
+        expect(seen.statuses.at(-1)).toBe('idle compact in 17m')
+        const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+        expect(await ui.find({ text: /Sonnet · medium/ })).toBeDefined()
+        await seen.clock.advance(17 * MIN)
+        expect(c.instructions).toHaveLength(1)
+        expect(c.toasts.at(-1)).toContain('150.0k')
+      })
+    }
+
+    for (const path of ['idle', 'cap', 'checkpoint']) {
+      test(`${path} skips an unavailable identity and recovers without a new session`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+        on('clock.every', {}, async (_$: unknown, e: any, next: any) => next({ ...e, ms: 24 * 60 * MIN }))
+        let failing = false
+        let failures = 0
+        on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+          if (failing) { failures++; return { deny: 'identity unavailable' } }
+          return next(e)
+        })
+        const { seen, c } = compactWorld($, on)
+        await mainTurn($, seen, 't1', path === 'cap' ? 250_000 : 150_000)
+        if (path === 'checkpoint') {
+          const r = await $.command.run({ command: 'model-router', args: 'checkpoint first' } as never)
+          expect(r.text).toContain('Creating checkpoint')
+        }
+        failing = true
+        await seen.clock.advance(path === 'idle' ? 20 * MIN : 0)
+        expect(failures).toBe(1)
+        expect(c.instructions).toHaveLength(0)
+        // Backoff is wall time; advancing mock timers must neither compact nor retire this lifetime.
+        await seen.clock.advance(MIN)
+        expect(failures).toBe(1)
+        failing = false
+        await new Promise(resolve => setTimeout(resolve, 1100))
+        if (path === 'checkpoint') {
+          const r = await $.command.run({ command: 'model-router', args: 'checkpoint recovered' } as never)
+          expect(r.text).toContain('Creating checkpoint')
+          await seen.clock.advance(0)
+          expect(c.instructions).toHaveLength(1)
+          expect(c.instructions[0]).toContain('Checkpoint note: recovered')
+        } else {
+          // The old route and accounting still work, then a fresh completion can arm the next guard.
+          seen.usage.push(U(100, 50, 149_900))
+          await step($, 't1')
+          expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+          expect(seen.tally!.tokens).toBeGreaterThan(150_500)
+          await $.turn.complete(done('t1'))
+          await seen.clock.advance(20 * MIN)
+          expect(c.instructions).toHaveLength(1)
+        }
+      })
+    }
+
+    test('checkpoint validation keeps its running lock after releasing the fired handle, then unlocks on identity failure', async ($, on) => {
+      let checking = false
+      let checked = false
+      on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+        if (checking) {
+          checking = false
+          checked = true
+          const duplicate = await $.command.run({ command: 'model-router', args: 'checkpoint duplicate' } as never)
+          expect(duplicate.text).toContain('already running')
+          return { deny: 'identity unavailable' }
+        }
+        return next(e)
+      })
+      const { seen, c } = compactWorld($, on)
+      const first = await $.command.run({ command: 'model-router', args: 'checkpoint first' } as never)
+      expect(first.text).toContain('Creating checkpoint')
+      checking = true
+      await seen.clock.advance(0)
+      expect(checked).toBe(true)
+      expect(c.instructions).toHaveLength(0)
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      const recovered = await $.command.run({ command: 'model-router', args: 'checkpoint recovered' } as never)
+      expect(recovered.text).toContain('Creating checkpoint')
+      await seen.clock.advance(0)
+      expect(c.instructions).toHaveLength(1)
+    })
+
+    test('a routing hook passes through an unavailable identity, then uses its existing route and meter after recovery', async ($, on) => {
+      let remaining = 0
+      let failures = 0
+      on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+        if (remaining > 0 && --remaining === 0) { failures++; return { deny: 'identity unavailable' } }
+        return next(e)
+      })
+      const { seen } = compactWorld($, on)
+      await $.prompt.submit({ text: 'continue #sonnet' } as never)
+      remaining = 2 // useSession succeeds, then the route's stillHere check fails.
+      await step($, 't1')
+      expect(failures).toBe(1)
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+      await step($, 't1')
+      expect(failures).toBe(1)
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      seen.usage.push(U(100, 50))
+      await step($, 't1')
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+      expect(seen.tally!.tokens).toBe(150)
+    })
+
+    test('an ordinary routing hook starts a fresh lifetime for an ended id', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 150_000)
+      await $.session.end({ reason: 'resume', sessionId: seen.sessionId, resume: { id: seen.sessionId } } as never)
+      await $.prompt.submit({ text: 'fresh work #haiku' } as never)
+      seen.usage.push(U(100, 50))
+      await step($, 't2')
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await ui.find({ text: /turn 150 token/ })).toBeDefined()
+      await seen.clock.advance(20 * MIN)
+      expect(c.instructions).toHaveLength(0)
+    })
+
+    test('a confirmed id change on the minute tick retires the old lifetime even if that id returns', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 150_000)
+      seen.sessionId = 'sess-2'
+      await seen.clock.advance(MIN)
+      seen.sessionId = 'sess-1'
+      // No session.start: the old object is ended, so the ordinary hook must replace it.
+      await $.prompt.submit({ text: 'fresh work #haiku' } as never)
+      await step($, 't2')
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+      await seen.clock.advance(20 * MIN)
+      expect(c.instructions).toHaveLength(0)
+    })
+
+    describe('host state across module activations', () => {
+      // Each test loads the hooks in a fresh module environment. Keep the host's state and store across that reload.
+      const retained = new Map<string, { value: unknown; version: number }>()
+      let store: Record<string, unknown> = {}
+      const members = new Set<string>()
+      function retainState(on: any) {
+        on('state.get', { plugin: 'model-router' }, async (_$: unknown, e: any) => {
+          const key = `${e.key}:${e.id ?? ''}`
+          return { value: retained.get(key) ?? { value: undefined, version: 0 } }
+        })
+        on('state.set', { plugin: 'model-router' }, async (_$: unknown, e: any) => {
+          const key = `${e.key}:${e.id ?? ''}`
+          const version = (retained.get(key)?.version ?? 0) + 1
+          retained.set(key, { value: e.value, version })
+          if (e.id) members.add(e.id)
+          return { value: { isSet: true, version } }
+        })
+      }
+
+      test('retains an older route and meter after a same-id resume advances the current lifetime', async ($, on) => {
+        retainState(on)
+        on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
+        on('tool.register', async () => ({ value: { tool: 'mcp__model-router__escalate' } }))
+        on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+        on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
+        on('session.model', async () => ({ value: 'opus' }))
+        const seen = world($, on, null)
+        await $.prompt.submit({ text: 'old work #haiku' } as never)
+        seen.usage.push(U(100, 50))
+        await step($, 't1')
+        await $.session.end({ reason: 'resume', sessionId: seen.sessionId, resume: { id: seen.sessionId } } as never)
+        await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+        await $.prompt.submit({ text: 'current work #sonnet' } as never)
+        seen.usage.push(U(200, 100))
+        await step($, 't2')
+        expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+        expect(members.size).toBe(2)
+        expect([...retained.values()].map(state => state.value)).toContainEqual(expect.objectContaining({ turn: expect.objectContaining({ tokens: 150 }) }))
+        store = { ...seen.store }
+      })
+
+      test('a reload starts with fresh route, effort and turn spend while the host retains earlier lifetimes', async ($, on) => {
+        const earlier = new Set(members)
+        expect(earlier.size).toBe(2)
+        retainState(on)
+        const seen = world($, on, null, { store })
+        const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+        expect(await ui.find({ text: /turn 0 token.*today 450 token/ })).toBeDefined()
+        await $.prompt.submit({ text: 'work after reload' } as never)
+        expect(seen.prompts[0]).toContain('<previous_tier>none</previous_tier>')
+        await step($, 't3')
+        expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+        expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'session model' })
+        expect(members.size).toBe(earlier.size + 1)
+      })
+    })
     for (const path of ['session.start', 'command.run', 'session.measure', 'session.measure resumed', 'session.compact', 'prompt.submit', 'turn.start', 'turn.step', 'session.append', 'fetch_output', 'escalate', 'tool.call', 'agent.spawn', 'turn.complete', 'ui.render', 'stillHere', 'UI tick']) {
       test(`a stale ${path} lookup cannot reset a newer session (third review #1)`, { options: { idleCompactMinutes: 20, shrinkToolOutput: 20_000 } }, async ($, on) => {
         let remaining = 0
@@ -2235,9 +2952,9 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
       expect(ending).toBe(false)
       expect(registrations).toBe(0)
-      // An ordinary hook cannot revive the ended lifetime; only a fresh session.start may do so.
+      // An ordinary hook starts a fresh lifetime; it must never reuse the ended object.
       const r = await $.command.run({ command: 'model-router', args: 'status' } as never)
-      expect(r.text).toContain('cancelled')
+      expect(r.text).toContain('Current settings')
     })
 
     for (const change of ['clear', 'resume', 'id change']) {
@@ -2259,10 +2976,10 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         })
         const { seen } = compactWorld($, on)
         await mainTurn($, seen, 't1', 150_000)
-        const path = Object.keys(seen.files).find(path => path.endsWith('/events-sess-1.json'))!.replace('events-sess-1.json', 'events-sess-2.json')
+        const path = `${Object.keys(seen.files)[0]!.split('/model-router/')[0]}/model-router/events-sess-2.json`
         const history = {
           sessionId: 'sess-2',
-          events: Array.from({ length: 5 }, (_, i) => ({ at: '2026-10-29T12:00:00Z', agentId: 'old-agent', event: 'Explore start', to: 'haiku/medium', reason: `find files ${i}` })),
+          events: Array.from({ length: 5 }, (_, i) => ({ at: '1969-12-31T12:00:00Z', agentId: 'old-agent', event: 'Explore start', to: 'haiku/medium', reason: `find files ${i}` })),
           stats: { 'old-agent': addUsage(undefined, 'haiku', 'medium', U(100, 50, 200, 300)) },
         }
         seen.files[path] = JSON.stringify(history)
@@ -2276,7 +2993,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(JSON.parse(seen.files[path]!)).toEqual(history)
         release!()
         await Promise.all([activating, prompt, agent])
-        const restored = JSON.parse(seen.files[path]!)
+        expect(JSON.parse(seen.files[path]!)).toEqual(history)
+        const restored = historyOf(seen, 'sess-2')
         expect(restored.events.slice(0, history.events.length)).toEqual(history.events)
         expect(restored.events).toHaveLength(7)
         expect(restored.stats).toEqual(history.stats)
@@ -2284,13 +3002,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
 
       for (const first of ['stats', 'band']) {
         test(`${change} reloads today's aggregate with ${first} first and resets only the turn in the band (second review #5)`, async ($, on) => {
-          const meters: any[] = []
           on('store.get', {}, async (_$: unknown, e: any) => ({ value: seen.store[e.key] }))
           on('store.keys', {}, async () => ({ value: Object.keys(seen.store) }))
-          on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
-            meters.push(e.value)
-            return next(e)
-          })
           const { seen } = compactWorld($, on)
           await mainTurn($, seen, 't1', 150_000)
           const other = add(EMPTY, 'haiku', U(1_000_000, 0))
@@ -2300,11 +3013,10 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
           seen.store[`meter:${storeDay(0)}`] = legacy
           await replaceSession($, seen, change)
           if (first === 'stats') {
-            await $.command.run({ command: 'model-router', args: 'stats' } as never)
-            expect(meters.at(-1).turn).toEqual(EMPTY)
-            expect(meters.at(-1).today.tokens).toBe(today.tokens)
-            expect(near(meters.at(-1).today.cost, today.cost)).toBe(true)
-            expect(near(meters.at(-1).today.baseline, today.baseline)).toBe(true)
+            const text = await statsOf($)
+            const day = text.split('**Today**')[1]!.split('**Retained total')[0]!
+            expect(day).toContain(`${fmtUsd(today.cost)} API-equivalent`)
+            expect(day).toContain(`same work tokens at Opus prices (switch-adjusted): ${fmtUsd(today.baseline)}`)
           }
           const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
           expect(await ui.find({ text: new RegExp(`turn 0 token.*today .*${fmtUsd(today.cost).replace('$', '\\$')}`) })).toBeDefined()
@@ -2971,6 +3683,127 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     }
   })
 
+  describe('fresh clock after identity checks (merge review #3)', () => {
+    for (const path of ['idle', 'idle re-check', 'idle arming', 'cap', 'cap arming', 'cap retry', 'checkpoint command', 'checkpoint tick']) {
+      test(`${path} has no identity await between its final clock and action`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+        on('clock.every', {}, async (_$: unknown, e: any, next: any) => next({ ...e, ms: 24 * 60 * MIN }))
+        let audit = false
+        let wallTime = 0
+        const calls: string[] = []
+        const actions: { previous: string | undefined; at: number; kind: string }[] = []
+        on('clock.now', {}, async (_$: unknown, e: any, next: any) => {
+          const result = await next(e)
+          if (!audit) return result
+          calls.push('clock')
+          return { value: wallTime }
+        })
+        on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+          const result = await next(e)
+          if (audit) { wallTime += MIN; calls.push('id') }
+          return result
+        })
+        on('clock.after', {}, async (_$: unknown, e: any, next: any) => {
+          if (audit) actions.push({ previous: calls.at(-1), at: wallTime, kind: 'timer' })
+          return next(e)
+        })
+        on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+          if (audit) actions.push({ previous: calls.at(-1), at: wallTime, kind: 'compact' })
+          try { return await next(e) } finally {
+            if (path === 'cap retry') { audit = true; wallTime = 55.5 * MIN }
+          }
+        })
+        let enabledReads = 0
+        let completing = false
+        on('state.get', { plugin: 'model-router', key: 'enabled' }, async (_$: unknown, e: any, next: any) => {
+          const result = await next(e)
+          if (completing && ++enabledReads === (path === 'idle arming' ? 2 : 1)) {
+            audit = true
+            wallTime = path === 'idle arming' ? 55.5 * MIN : 55 * MIN
+          }
+          return result
+        })
+        const { seen, c } = compactWorld($, on, path === 'cap retry' ? 'skip' : 'ok')
+        // A rejection is needed for a retry; unlike skip, this must use the engine's rejection path.
+        if (path === 'cap retry') c.rejects = 1
+        if (path.endsWith('arming')) {
+          await $.prompt.submit({ text: 'work' } as never)
+          seen.usage.push(U(1000, 500, path === 'cap arming' ? 249_000 : 149_000))
+          await step($, 't1')
+          completing = true
+          await $.turn.complete(done('t1'))
+        } else {
+          await mainTurn($, seen, 't1', path.startsWith('cap') ? 250_000 : 150_000)
+          if (path.startsWith('checkpoint')) {
+            c.beforeAgents = async () => { audit = true; wallTime = 56.5 * MIN }
+            await $.command.run({ command: 'model-router', args: 'checkpoint' } as never)
+            if (path === 'checkpoint tick') {
+              actions.length = 0
+              calls.length = 0
+              await seen.clock.advance(0)
+            }
+          } else {
+            audit = path !== 'cap retry'
+            wallTime = 53 * MIN
+            if (path === 'idle re-check') c.agents = ['running']
+            await seen.clock.advance(path.startsWith('idle') ? 20 * MIN : 0)
+          }
+        }
+        expect(actions.length).toBeGreaterThan(0)
+        expect(actions.every(action => action.previous === 'clock')).toBe(true)
+        if (!path.startsWith('checkpoint')) expect(actions.every(action => action.at <= 57 * MIN)).toBe(true)
+        else expect(actions[0]!.at).toBeGreaterThan(57 * MIN) // Explicit checkpoints also work cold.
+      })
+    }
+
+    for (const path of ['idle', 'cap', 'idle arming', 'cap arming', 'cap retry']) {
+      test(`${path} refuses after a slow identity lookup crosses its deadline`, { options: { idleCompactMinutes: 20, compactAtContext: 200_000 } }, async ($, on) => {
+        on('clock.every', {}, async (_$: unknown, e: any, next: any) => next({ ...e, ms: 24 * 60 * MIN }))
+        let slow = false
+        let wallTime: number | undefined
+        let armed = 0
+        on('clock.now', {}, async (_$: unknown, e: any, next: any) => wallTime === undefined ? next(e) : { value: wallTime })
+        on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+          const result = await next(e)
+          if (slow) wallTime = 57.5 * MIN
+          return result
+        })
+        on('clock.after', {}, async (_$: unknown, e: any, next: any) => {
+          if (slow) armed++
+          return next(e)
+        })
+        let completing = false
+        let reads = 0
+        on('state.get', { plugin: 'model-router', key: 'enabled' }, async (_$: unknown, e: any, next: any) => {
+          const result = await next(e)
+          if (completing && ++reads === (path === 'idle arming' ? 2 : 1)) { slow = true; wallTime = 56 * MIN }
+          return result
+        })
+        on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+          try { return await next(e) } finally {
+            if (path === 'cap retry') { slow = true; wallTime = 56 * MIN }
+          }
+        })
+        const { seen, c } = compactWorld($, on)
+        if (path === 'cap retry') c.rejects = 1
+        if (path.endsWith('arming')) {
+          await $.prompt.submit({ text: 'work' } as never)
+          seen.usage.push(U(1000, 500, path === 'cap arming' ? 249_000 : 149_000))
+          await step($, 't1')
+          completing = true
+          await $.turn.complete(done('t1'))
+        } else {
+          await mainTurn($, seen, 't1', path.startsWith('cap') ? 250_000 : 150_000)
+          if (path !== 'cap retry') c.beforeAgents = async () => { slow = true; wallTime = 56 * MIN }
+          await seen.clock.advance(path === 'idle' ? 20 * MIN : 0)
+        }
+        expect(slow).toBe(true)
+        expect(armed).toBe(0)
+        expect(c.instructions).toHaveLength(path === 'cap retry' ? 1 : 0)
+        expect(c.toasts.at(-1)).toBe('Compaction skipped: cache deadline passed')
+      })
+    }
+  })
+
   describe('cancellation at every await', () => {
     type Boundary = { at: string; event: string; key?: string; nth?: number }
     const enabledRead = { at: 'enabled', event: 'state.get', key: 'enabled' }
@@ -2991,8 +3824,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       { path: 'turn.complete idle', boundaries: completion },
       { path: 'armIdle completion', boundaries: [{ ...enabledRead, nth: 2 }, { ...clockRead, nth: 2 }] },
       { path: 'armIdle busy cap', boundaries: [{ ...enabledRead, nth: 2 }, clockRead] },
-      { path: 'armIdle skipped cap', boundaries: [{ ...enabledRead, nth: 2 }, clockRead] },
-      { path: 'armIdle exhausted cap', boundaries: [{ ...enabledRead, nth: 2 }, clockRead] },
+      { path: 'armIdle skipped cap', boundaries: [{ ...enabledRead, nth: 2 }, { ...clockRead, nth: 3 }] },
+      { path: 'armIdle exhausted cap', boundaries: [{ ...enabledRead, nth: 2 }, { ...clockRead, nth: 3 }] },
       { path: 'runIdle', boundaries: idle },
       { path: 'runIdle busy', boundaries: idle.map(b => b.at === 'final clock' ? { ...b, at: 're-check clock' } : b) },
       { path: 'runIdle re-check', boundaries: idle },
@@ -3066,7 +3899,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
             }
             expect(hit).toBe(true)
             // An early guard must stop work immediately, even if a later guard would also catch the cancel.
-            expect(later).toEqual([])
+            // An issued attempt still reads the clock to log its outcome after cancellation.
+            expect(later).toEqual(boundary.event === 'session.compact' ? ['clock.now:'] : [])
             expect(delays).toEqual([])
             const attempts = path === 'runCap retry' || path === 'runCap fallback' || path === 'armIdle skipped cap' ? 1 : path === 'armIdle exhausted cap' ? 4 : 0
             expect(c.instructions).toHaveLength(attempts)
@@ -4203,6 +5037,341 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     expect(seen).toBeDefined()
     expect(await statsOf($)).toContain('Compactions at idle (cache warm): 0')
   })
+
+  // ---- v0.10.0 ----
+
+  describe('compaction is visible (v0.10.0)', () => {
+    // WHY: a session started before the settings changed ran all day at 950k with the guard off, and nothing said so.
+    test('stats name the compaction settings this session loaded, and say off when they are off', async ($, on) => {
+      compactWorld($, on)
+      expect(await statsOf($)).toContain('Compaction in this session: router on · idle off · cap off · min context 100.0k.')
+    })
+
+    test('stats show loaded idle minutes and cap', { options: { idleCompactMinutes: 50, compactAtContext: 300_000 } }, async ($, on) => {
+      compactWorld($, on)
+      const text = await statsOf($)
+      expect(text).toContain('Compaction in this session: router on · idle after 50 min · cap at 300.0k · min context 100.0k.')
+      expect(text).toContain('Changing plugin options reloads the plugin with the new values.')
+      expect(text).not.toContain('restart the session')
+    })
+
+    // WHY: off stops both guards; a line that still lists thresholds reads as if compaction ran.
+    test('with the router off the line says no compaction runs', { options: { compactAtContext: 300_000 } }, async ($, on) => {
+      compactWorld($, on)
+      await $.command.run({ command: 'model-router', args: 'off' } as never)
+      expect(await statsOf($)).toContain('Compaction in this session: router off, so no automatic compaction runs · idle off · cap at 300.0k')
+    })
+
+    for (const command of ['stats', 'status']) {
+      for (const enabled of [true, false]) {
+        test(`${command} shows effective compaction settings and automatic options reload, router ${enabled ? 'on' : 'off'}`, { options: { idleCompactMinutes: 12, compactAtContext: 300_000, compactMinContext: 150_000 } }, async ($, on) => {
+          compactWorld($, on)
+          if (!enabled) await $.command.run({ command: 'model-router', args: 'off' } as never)
+          const r = await $.command.run({ command: 'model-router', args: command } as never)
+          const state = enabled ? 'router on' : 'router off, so no automatic compaction runs'
+          expect(r.text).toContain(`Compaction in this session: ${state} · idle after 12 min · cap at 300.0k · min context 150.0k.`)
+          expect(r.text).toContain('Changing plugin options reloads the plugin with the new values.')
+          expect(r.text).not.toContain('restart the session')
+          if (!enabled) expect(r.text).toContain('Explicit checkpoints remain available when the router is off.')
+        })
+      }
+
+      test(`${command} shows disabled guards and follows the session router toggle`, async ($, on) => {
+        compactWorld($, on)
+        const text = async () => (await $.command.run({ command: 'model-router', args: command } as never)).text
+        expect(await text()).toContain('router on · idle off · cap off · min context 100.0k.')
+        await $.command.run({ command: 'model-router', args: 'off' } as never)
+        expect(await text()).toContain('router off, so no automatic compaction runs · idle off · cap off')
+        await $.command.run({ command: 'model-router', args: 'on' } as never)
+        expect(await text()).toContain('router on · idle off · cap off')
+      })
+    }
+
+    for (const kind of ['idle', 'cap', 'checkpoint']) {
+      for (const how of ['ok', 'skip', 'reject'] as const) {
+        test(`${kind} logs ${how === 'ok' ? 'done with engine sizes' : how === 'skip' ? 'skipped with veto' : 'rejected with engine error'}`, { options: { idleCompactMinutes: 20, compactAtContext: kind === 'cap' ? 200_000 : 0 } }, async ($, on) => {
+          const { seen, c } = compactWorld($, on, how)
+          c.sizes = { tokensBefore: 240_000, tokensAfter: 30_000 }
+          await mainTurn($, seen, 't1', 250_000)
+          if (kind === 'checkpoint') await $.command.run({ command: 'model-router', args: 'checkpoint task boundary' } as never)
+          await seen.clock.advance(kind === 'idle' ? 20 * MIN : 0)
+          const attempts = eventsOf(seen).filter(e => e.event === `compact ${kind}`)
+          expect(attempts).toHaveLength(1)
+          expect(attempts[0]).toMatchObject({
+            agentId: 'main',
+            to: how === 'ok' ? 'done' : how === 'skip' ? 'skipped' : 'rejected',
+            // The test kit converts a thrown compact hook into this engine rejection. Keep its text,
+            // rather than replacing it with the generic reason used for the user toast.
+            reason: how === 'ok' ? '240.0k → 30.0k' : how === 'skip' ? 'vetoed' : 'test: next() passed an argument with messages that are not a list',
+          })
+        })
+      }
+    }
+
+    test('a checkpoint without engine sizes logs the last measured context', async ($, on) => {
+      const { seen } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await $.command.run({ command: 'model-router', args: 'checkpoint' } as never)
+      await seen.clock.advance(0)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ event: 'compact checkpoint', to: 'done', reason: '250.0k' }))
+    })
+
+    for (const how of ['ok', 'skip', 'reject'] as const) {
+      test(`a ${how} compact result from an ended session cannot log into the replacement`, async ($, on) => {
+        on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+          try {
+            return await next(e)
+          } finally {
+            await replaceSession($, seen, 'clear')
+          }
+        })
+        const { seen, c } = compactWorld($, on, how)
+        await mainTurn($, seen, 't1', 250_000)
+        await $.command.run({ command: 'model-router', args: 'checkpoint' } as never)
+        await seen.clock.advance(0)
+        expect(c.instructions).toHaveLength(1)
+        await $.command.run({ command: 'model-router', args: 'status' } as never)
+        const attempts = eventsOf(seen).filter(e => e.event.startsWith('compact '))
+        expect(attempts).toHaveLength(1)
+        expect(attempts[0]!.to).toBe(how === 'ok' ? 'done' : how === 'skip' ? 'skipped' : 'rejected')
+        expect(eventsOf(seen, 'sess-2').filter(e => e.event.startsWith('compact '))).toEqual([])
+        expect(c.toasts.some(text => text.startsWith('Checkpoint: compacted'))).toBe(false)
+      })
+    }
+
+    for (const kind of ['idle', 'cap', 'checkpoint']) {
+      for (const how of ['ok', 'skip', 'reject'] as const) {
+        for (const cancel of ['prompt', 'off']) {
+          test(`${kind} ${how} outcome survives ${cancel} after issuance (merge review #4)`, { options: { idleCompactMinutes: 20, compactAtContext: kind === 'cap' ? 200_000 : 0 } }, async ($, on) => {
+            on('prompt.submit', { text: 'back' }, async () => ({ drop: 'held' }))
+            on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+              try { return await next(e) } finally {
+                if (cancel === 'prompt') await $.prompt.submit({ text: 'back' } as never)
+                else await $.command.run({ command: 'model-router', args: 'off' } as never)
+              }
+            })
+            const { seen, c } = compactWorld($, on, how)
+            c.sizes = { tokensBefore: 250_000, tokensAfter: 30_000, usage: U(100, 50) }
+            await mainTurn($, seen, 't1', 250_000)
+            if (kind === 'checkpoint') await $.command.run({ command: 'model-router', args: 'checkpoint' } as never)
+            const before = seen.tally!.tokens
+            await seen.clock.advance(kind === 'idle' ? 20 * MIN : 0)
+            const attempts = eventsOf(seen).filter(e => e.event === `compact ${kind}`)
+            expect(attempts).toHaveLength(1)
+            expect(attempts[0]!.to).toBe(how === 'ok' ? 'done' : how === 'skip' ? 'skipped' : 'rejected')
+            expect(c.toasts.some(text => /^(?:Idle compact:|Context cap reached:|Checkpoint: compacted)/.test(text))).toBe(false)
+            const tally = seen.store[`meter:${storeDay(0)}:sess-1`] as Tally
+            expect(tally.compactions ?? []).toHaveLength(how === 'ok' ? 1 : 0)
+            expect(seen.tally!.tokens - before).toBe(how === 'ok' ? 150 : 0)
+            await seen.clock.advance(60 * MIN)
+            expect(c.instructions).toHaveLength(1)
+          })
+        }
+      }
+    }
+
+    for (const how of ['ok', 'skip', 'reject'] as const) {
+      for (const ended of [false, true]) {
+        test(`a ${how} outcome joins a same-id resume${ended ? ' that has ended' : ''} without overwriting its new events`, async ($, on) => {
+          on('fs.read', {}, async (_$: unknown, e: any, next: any) => seen.files[e.path] === undefined ? next(e) : { value: seen.files[e.path] })
+          on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+          on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
+          on('tool.register', async () => ({ value: { tool: 'mcp__model-router__escalate' } }))
+          on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
+          on('session.model', async () => ({ value: 'opus' }))
+          on('session.compact', {}, async (_$: unknown, e: any, next: any) => {
+            try { return await next(e) } finally {
+              await $.session.end({ reason: 'resume', sessionId: seen.sessionId, resume: { id: seen.sessionId } } as never)
+              await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+              await spawnAgent($, { subagentType: 'Explore' })
+              if (ended) await $.session.end({ reason: 'resume', sessionId: seen.sessionId, resume: { id: seen.sessionId } } as never)
+            }
+          })
+          const { seen, c } = compactWorld($, on, how)
+          await mainTurn($, seen, 't1', 250_000)
+          const history = eventsOf(seen)
+          await $.command.run({ command: 'model-router', args: 'checkpoint' } as never)
+          await seen.clock.advance(0)
+          const events = eventsOf(seen)
+          expect(events.slice(0, history.length)).toEqual(history)
+          expect(events).toHaveLength(history.length + 2)
+          expect(events).toContainEqual(expect.objectContaining({ event: 'Explore start' }))
+          expect(events).toContainEqual(expect.objectContaining({ event: 'compact checkpoint', to: how === 'ok' ? 'done' : how === 'skip' ? 'skipped' : 'rejected' }))
+          expect(c.toasts).toEqual([])
+          expect((seen.store[`meter:${storeDay(0)}:sess-1`] as Tally).compactions ?? []).toEqual([])
+        })
+      }
+    }
+
+    test('a slow event-log write cannot delay the checkpoint result, the next route or subagent result', async ($, on) => {
+      let release: (() => void) | undefined
+      on('fs.write', { path: /\/model-router\/[^/]+\/[^/]+\.json$/ }, async (_$: unknown, e: any, next: any) => {
+        if (JSON.parse(e.text).events.some((event: any) => event.event === 'compact checkpoint')) {
+          await new Promise<void>(resolve => { release = resolve })
+        }
+        return next(e)
+      })
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await $.command.run({ command: 'model-router', args: 'checkpoint' } as never)
+      await seen.clock.advance(0)
+      try {
+        expect(release).toBeDefined()
+        expect(c.toasts).toContain('Checkpoint: compacted 250.0k')
+        await $.prompt.submit({ text: 'next work #haiku' } as never)
+        expect(seen.submits.at(-1)!.text).toBe('next work #haiku')
+        const id = await spawnAgent($, { subagentType: 'Explore' })
+        seen.usage.push(U(100, 50))
+        await step($, 'a1', OPUS, id)
+        expect(seen.steps.at(-1)).toMatchObject({ agentId: id, model: 'claude-haiku-5-5', effort: 'medium' })
+      } finally {
+        release?.()
+      }
+      await seen.clock.advance(0)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ event: 'compact checkpoint', to: 'done' }))
+    })
+
+    test('a failed event-log write does not change a successful checkpoint outcome', async ($, on) => {
+      on('fs.write', { path: /\/model-router\/[^/]+\/[^/]+\.json$/ }, async (_$: unknown, e: any, next: any) => {
+        if (JSON.parse(e.text).events.some((event: any) => event.event === 'compact checkpoint')) throw new Error('disk full')
+        return next(e)
+      })
+      const { seen, c } = compactWorld($, on)
+      await mainTurn($, seen, 't1', 250_000)
+      await $.command.run({ command: 'model-router', args: 'checkpoint' } as never)
+      await seen.clock.advance(0)
+      expect(c.toasts).toContain('Checkpoint: compacted 250.0k')
+      expect(await statsOf($)).toContain('Task-boundary checkpoints: 1')
+    })
+
+    test('every compaction attempt lands in the events log with its outcome', { options: { compactAtContext: 200_000 } }, async ($, on) => {
+      const { seen, c } = compactWorld($, on)
+      c.sizes = { tokensBefore: 250_000, tokensAfter: 20_000 }
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(0)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: 'main', event: 'compact cap', to: 'done', reason: '250.0k → 20.0k' }))
+    })
+
+    test('a rejected compaction is logged with the engine error', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen } = compactWorld($, on, 'reject')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(30 * 60_000)
+      // The reason is the engine's error text, which the test kit words its own way.
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: 'main', event: 'compact idle', to: 'rejected' }))
+    })
+
+    test('a vetoed compaction is logged as skipped with the veto', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
+      const { seen } = compactWorld($, on, 'skip')
+      await mainTurn($, seen, 't1', 250_000)
+      await seen.clock.advance(30 * 60_000)
+      expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ event: 'compact idle', to: 'skipped', reason: 'vetoed' }))
+    })
+  })
+})
+
+describe('caller-pinned subagents start at medium (v0.10.0)', () => {
+  // WHY: 30 subagents pinned to sonnet by the caller ran 1,649 steps at high, against "every tier starts at medium".
+  test('a sonnet the caller named runs at medium, not at the session effort', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'sonnet' })
+    seen.usage.push(U(10, 1, 0, 0, 'claude-sonnet-5-5'))
+    await step($, 'sub', 'claude-sonnet-5-5', id, 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium', agentId: id })
+    expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: id, to: 'sonnet/medium' }))
+  })
+
+  test('its model stays the one the caller named: only the effort starts at medium', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'claude-sonnet-4-5' })
+    await step($, 'sub', 'claude-sonnet-4-5', id, 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-4-5', effort: 'medium' })
+  })
+
+  test('it can still be raised: the ladder goes to sonnet/high first', async () => {
+    expect(stepUp(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true), IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+  })
+
+  // WHY: medium is Opus's own self cap: an Opus pin at medium could never raise itself, and it used to run at the
+  // session effort. Sonnet and Haiku at medium can still go to high by themselves, so they start at medium anywhere.
+  test('an opus pin keeps the session effort; sonnet and haiku pins start at medium, even on the parent tier', async () => {
+    expect(startOf(OPUS, OPUS, false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf(OPUS, 'claude-fable-5-1', false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf('claude-sonnet-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBe('medium')
+    expect(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true).effort).toBe('medium')
+    expect(startOf('claude-haiku-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBe('medium')
+  })
+
+  test('an opus the caller named under an opus parent runs at the session effort, capped at high', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'opus' })
+    await step($, 'sub', OPUS, id, 'xhigh')
+    expect(seen.steps.at(-1)).toMatchObject({ model: OPUS, effort: 'high' })
+  })
+
+  test('an inheriting agent, `inherit` and an unknown id keep the session effort, as before', async () => {
+    expect(startOf(OPUS, OPUS, false, IDS_BY_KEY).effort).toBeUndefined()
+    expect(isCallerPin(undefined)).toBe(false)
+    expect(isCallerPin('inherit')).toBe(false)
+    expect(isCallerPin('my-model')).toBe(false)
+    expect(isCallerPin('claude-fable-5-1')).toBe(false)
+    expect(isCallerPin('haiku')).toBe(true)
+  })
+})
+
+describe('execute needs a settled plan; opus delegates settled work (v0.10.0)', () => {
+  // WHY: 9 of 37 Sonnet main turns went to Opus at their first step. The wording read as execute ("add it to the PR",
+  // "cherry-pick it") while what to change still had to be worked out.
+  test('the classifier calls work execute only when what to change is visible', async () => {
+    const text = classifierSystem('en')
+    expect(text).toContain('already settled in the message or the context you can see')
+    expect(text).toContain('is execute when the context shows what to\n  change (an approved plan')
+    expect(text).toContain('When what to change still has to be worked out, it is decide.')
+    // An approved plan stays execute: the new rule must not contradict the old one.
+    expect(text).toContain('is execute, because the plan settles what to do')
+    expect(text).toContain('porting a change to a branch whose version of the code differs')
+  })
+
+  test('opus is told to hand settled multi-file work to an unpinned subagent and verify it; other models are not', async () => {
+    expect(assignmentContext(routeFor('decide', ''))).toContain('delegate it to a general-purpose subagent without a model')
+    expect(assignmentContext(routeFor('decide', ''))).toContain('make small changes directly')
+    expect(assignmentContext(routeFor('execute', ''))).not.toContain('delegate it')
+  })
+})
+
+describe('an effort the caller sets on the Agent tool is kept (v0.10.0, review P2)', () => {
+  // WHY: Agent({ model: "sonnet", effort: "high" }) is an explicit request; starting it at medium silently overrode it.
+  function agentWorld($: any, on: any) {
+    const seen = world($, on, execute)
+    const ids: string[] = []
+    // As the engine does: the Agent tool call spawns the subagent while the call runs, under the same tool_use_id.
+    on('tool.call', async (_$: unknown, e: any) => {
+      if (e.tool === 'Agent') ids.push(await spawnAgent($, { tool_use_id: e.tool_use_id, model: e.model, subagentType: e.subagent_type ?? 'general-purpose' }))
+      return { result: 'ok' } as never
+    })
+    return { seen, ids }
+  }
+
+  test('a caller pin with an explicit effort runs at that effort, not at medium', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-1', model: 'sonnet', effort: 'high', prompt: 'p' } as never)
+    await step($, 'sub', 'claude-sonnet-5-5', ids[0], 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+  })
+
+  test('a router pin with an explicit effort keeps it too; the hard cap still holds', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-2', effort: 'max', prompt: 'p', subagent_type: 'Explore' } as never)
+    await step($, 'sub', OPUS, ids[0], 'max')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+  })
+
+  test('without an explicit effort the pin starts at medium; one call never leaks its effort into the next', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-3', model: 'sonnet', effort: 'high', prompt: 'p' } as never)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-4', model: 'sonnet', prompt: 'p' } as never)
+    await step($, 'sub', 'claude-sonnet-5-5', ids[1], 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ effort: 'medium' })
+  })
 })
 
 describe('large tool-output reduction (1.0)', () => {
@@ -4236,7 +5405,7 @@ describe('large tool-output reduction (1.0)', () => {
     const text = '\x1b[31mINFO start\x1b[0m\nprogress 1\rprogress 2\rprogress 3\n' +
       'INFO same line\nINFO same line\nINFO same line\nINFO received 1 records\nINFO received 2 records\nERROR 1\nERROR 2\nwarning same\nwarning same'
     const reduced = reduceOutput(text, limit, omitted)
-    expect(reduced).toBe('INFO start\nprogress 3\nINFO same line [×3]\nINFO received 1 records\nINFO received 2 records\nERROR 1\nERROR 2\nwarning same\nwarning same')
+    expect(reduced).toBe('INFO start\nprogress 1 … progress 3 [×3]\nINFO same line [×3]\nINFO received 1 records\nINFO received 2 records\nERROR 1\nERROR 2\nwarning same\nwarning same')
     expect(reduceOutput('error before redraw\rprogress now', limit, omitted)).toContain('error before redraw')
   })
 
@@ -4283,8 +5452,8 @@ describe('large tool-output reduction (1.0)', () => {
       expect(reduced.length).toBeLessThan(2 * longLog.length)
     }
     const text = 'INFO start\nraw continuation\rINFO next\nINFO before\rprogress 1\rprogress 2\runknown tail'
-    expect(reduceOutput(text, limit, omitted)).toBe('INFO start\nraw continuation\nINFO next\nINFO before\nprogress 2\nunknown tail')
-    expect(reduceOutput('progress 1\rprogress 2\rprogress 3', limit, omitted)).toBe('progress 3')
+    expect(reduceOutput(text, limit, omitted)).toBe('INFO start\nraw continuation\nINFO next\nINFO before\nprogress 1 … progress 2 [×2]\nunknown tail')
+    expect(reduceOutput('progress 1\rprogress 2\rprogress 3', limit, omitted)).toBe('progress 1 … progress 3 [×3]')
   })
 
   for (const level of ['fatal', 'error', 'critical', 'panic', 'emerg', 'alert']) {
@@ -4306,6 +5475,30 @@ describe('large tool-output reduction (1.0)', () => {
       }
     })
   }
+
+  test('CR progress runs keep first and last states, and distinct ids, hashes and file names (merge review #2)', async () => {
+    for (const [first, last] of [
+      ['Downloading 10% artifact sha256:aaaa', 'Downloading 20% artifact sha256:bbbb'],
+      ['Uploading [###-------] 30% id 123', 'Uploading [#####-----] 50% id 456'],
+      ['Processing 10% file first.tar', 'Processing 20% file last.tar'],
+      ['INFO progress 1/100', 'INFO progress 2/200'],
+    ]) {
+      const original = `${first}\r${last}`
+      expect(reduceOutput(original, limit, omitted)).toBe(`${first}\n${last}`)
+      const large = `${Array(1800).fill('INFO waiting for artifact').join('\n')}\n${original}`
+      expect(large.length).toBeGreaterThan(45_000)
+      const reduced = reduceOutput(large, limit, omitted)
+      expect(reduced).toContain(`${first}\n${last}`)
+      expect(reduced.length).toBeLessThan(limit)
+    }
+    for (const rows of [
+      ['progress 1', 'progress 2', 'progress 3'],
+      ['Downloading 10% same.tar', 'Downloading 20% same.tar', 'Downloading 30% same.tar'],
+      ['[###-------] 30% same.tar', '[#####-----] 50% same.tar', '[########--] 80% same.tar'],
+    ]) expect(reduceOutput(rows.join('\r'), limit, omitted)).toBe(`${rows[0]} … ${rows[2]} [×3]`)
+    expect(reduceOutput('Downloading 10% a\rDownloading 20% b\rDownloading 30% a', limit, omitted))
+      .toBe('Downloading 10% a\nDownloading 20% b\nDownloading 30% a')
+  })
 
   test('only timestamps and explicit progress fields vary when collapsing recognised logs', async () => {
     for (const [first, second] of [
@@ -4504,6 +5697,20 @@ describe('large tool-output reduction (1.0)', () => {
     expect(await statsOf($)).toContain('Tool outputs reduced: 0; characters removed: 0')
   })
 
+  for (const operation of ['get', 'set']) {
+    test(`session.append keeps the reduced result when its counter store.${operation} throws`, { options: { shrinkToolOutput: limit } }, async ($, on) => {
+      let failures = 0
+      on(`store.${operation}` as never, { key: /^counts:/ }, async () => { failures++; return { deny: 'counters unavailable' } })
+      const seen = outputWorld($, on)
+      const result = await append($, longLog)
+      expect(failures).toBe(1)
+      expect(textOf(result).length).toBeLessThan(longLog.length)
+      expect(textOf(result)).toContain('lines omitted]')
+      expect(Object.values(seen.files)).toContain(longLog)
+      expect(result.message.content[0].tool_use_id).toBe('toolu_123')
+    })
+  }
+
   test('off during an archive write passes the original through without counting a reduction', { options: { shrinkToolOutput: limit } }, async ($, on) => {
     on('fs.write', { path: /\/outputs\// }, async (_$: unknown, e: any, next: any) => {
       const r = await next(e)
@@ -4601,4 +5808,522 @@ describe('large tool-output reduction (1.0)', () => {
       expect(seen.asked).toHaveLength(0)
     })
   }
+})
+
+describe('append-only event logs', () => {
+  const event = (reason: string, at = '1970-01-01T00:00:00Z') => ({ at, agentId: 'main', event: 'turn route', to: 'haiku/medium', reason })
+  const ioOf = (seen: Seen, root = '/plugin') => ({
+    root,
+    now: () => 0,
+    read: async (path: string) => {
+      if (seen.files[path] === undefined) throw new Error(`no file ${path}`)
+      return seen.files[path]!
+    },
+    write: async (path: string, text: string) => { seen.files[path] = text },
+    list: async (path: string) => {
+      const entries = new Map<string, FsEntry['kind']>()
+      for (const file of Object.keys(seen.files)) {
+        if (!file.startsWith(`${path}/`)) continue
+        const tail = file.slice(path.length + 1)
+        entries.set(tail.split('/')[0]!, tail.includes('/') ? 'dir' : 'file')
+      }
+      return [...entries].map(([name, kind]): FsEntry => ({ name, kind, size: 0, mtimeMs: 0, isLink: false }))
+    },
+    stat: async (_path: string): Promise<FsStat> => ({ kind: 'dir', size: 0, mtimeMs: 0, isLink: false }),
+    run: async (_argv: string[]) => ({ exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }),
+    log: (_text: string) => {},
+  })
+
+  test('100 events and 101 queued flushes make at most 100 failed writes before backoff, then recover without loss', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    let now = 0
+    let failing = true
+    let attempts = 0
+    let failures = 0
+    const write = io.write
+    io.now = () => now
+    io.write = async (path, text) => {
+      attempts++
+      if (failing) throw new Error('disk unavailable')
+      await write(path, text)
+    }
+    io.log = () => { failures++ }
+    const writer = new EventLogs()
+    const flushes: Promise<void>[] = []
+    for (let i = 0; i < 100; i++) {
+      writer.event('sess-1', event(`event ${i}`))
+      flushes.push(writer.flush(io))
+    }
+    flushes.push(writer.flush(io))
+    await Promise.all(flushes)
+    expect(attempts).toBeLessThanOrEqual(100)
+    expect(attempts).toBe(100) // Each new batch still gets its first attempt.
+    for (let i = 0; i < 100; i++) await writer.flush(io)
+    expect(attempts).toBe(100)
+    expect(failures).toBe(1)
+    const pending = await writer.read(io, 'sess-1')
+    expect(pending.events).toHaveLength(100)
+    failing = false
+    now = 1000
+    await writer.flush(io)
+    expect(attempts).toBe(200)
+    expect(failures).toBe(1)
+    expect((writer as any).pending.size).toBe(0)
+    expect((writer as any).retries.size).toBe(0)
+    expect(await new EventLogs().read(io, 'sess-1')).toEqual(pending)
+  })
+
+  test('flush requests share one queued pass while a write is held, and pick up later events', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const write = io.write
+    let release!: () => void
+    let started!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const entered = new Promise<void>(resolve => { started = resolve })
+    let active = 0
+    let maximum = 0
+    let attempts = 0
+    io.write = async (path, text) => {
+      attempts++
+      maximum = Math.max(maximum, ++active)
+      started()
+      await held
+      await write(path, text)
+      active--
+    }
+    const writer = new EventLogs()
+    writer.event('sess-1', event('first'))
+    const first = writer.flush(io)
+    await entered
+    writer.event('sess-1', event('while writing'))
+    const queued = writer.flush(io)
+    let shared = true
+    for (let i = 0; i < 100; i++) shared &&= writer.flush(io) === queued
+    release()
+    await Promise.all([first, queued])
+    expect(shared).toBe(true)
+    expect(maximum).toBe(1)
+    expect(attempts).toBe(2)
+    expect((await new EventLogs().read(io, 'sess-1')).events.map(e => e.reason)).toEqual(['first', 'while writing'])
+    writer.event('sess-1', event('after draining'))
+    await writer.flush(io)
+    expect((writer as any).pending.size).toBe(0)
+  })
+
+  test('failed batches double their retry delay to five minutes without delaying a new session', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    let now = 0
+    let attempts = 0
+    let failures = 0
+    const write = io.write
+    io.now = () => now
+    io.write = async (path, text) => {
+      attempts++
+      if (path.includes('/failed/')) throw new Error('disk unavailable')
+      await write(path, text)
+    }
+    io.log = () => { failures++; throw new Error('logging unavailable too') }
+    const writer = new EventLogs()
+    writer.event('failed', event('retry later'))
+    await writer.flush(io)
+    expect(attempts).toBe(1)
+    writer.event('new-session', event('first attempt'))
+    writer.usage('new-session', 'agent-1', 'haiku', 'medium', U(100, 50))
+    await writer.flush(io)
+    expect(attempts).toBe(3)
+    expect((await new EventLogs().read(io, 'new-session')).stats['agent-1']).toEqual(addUsage(undefined, 'haiku', 'medium', U(100, 50)))
+    for (const delay of [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 300000, 300000]) {
+      const before = attempts
+      now += delay - 1
+      await Promise.all(Array.from({ length: 20 }, () => writer.flush(io)))
+      expect(attempts).toBe(before)
+      now++
+      await Promise.all(Array.from({ length: 20 }, () => writer.flush(io)))
+      expect(attempts).toBe(before + 1)
+    }
+    expect(failures).toBe(12)
+    expect((writer as any).pending.size).toBe(1)
+  })
+
+  test('two writers recording the same session concurrently keep every event and usage delta', async ($, on) => {
+    let entered = 0
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const write = io.write
+    io.write = async (path, text) => {
+      if (++entered === 2) release()
+      await held
+      expect(seen.files[path]).toBeUndefined()
+      return write(path, text)
+    }
+    const a = new EventLogs()
+    const b = new EventLogs()
+    a.event('sess-1', event('A', '1970-01-01T00:00:02Z'))
+    b.event('sess-1', event('B', '1970-01-01T00:00:01Z'))
+    a.usage('sess-1', 'agent-1', 'haiku', 'medium', U(100, 50))
+    b.usage('sess-1', 'agent-1', 'haiku', 'medium', U(200, 60))
+    await Promise.all([a.flush(io), b.flush(io)])
+    const reader = new EventLogs()
+    const log = await reader.read(io, 'sess-1')
+    expect(log.events.map(e => e.reason)).toEqual(['B', 'A'])
+    expect(new Set(log.events.map(e => e.id)).size).toBe(2)
+    expect(log.stats['agent-1']).toEqual(addUsage(addUsage(undefined, 'haiku', 'medium', U(100, 50)), 'haiku', 'medium', U(200, 60)))
+    expect(Object.keys(seen.files)).toHaveLength(4)
+    expect(await reader.read(io, 'sess-1')).toEqual(log)
+  })
+
+  for (const acknowledged of [false, true]) {
+    test(`a failed ${acknowledged ? 'acknowledgement' : 'write'} retries the same batches and never counts events or stats twice`, async ($, on) => {
+      let failing = true
+      const attempts: { path: string; text: string }[] = []
+      const seen = world($, on, null)
+      const io = ioOf(seen)
+      const write = io.write
+      io.write = async (path, text) => {
+        attempts.push({ path, text })
+        if (acknowledged) await write(path, text)
+        if (failing) throw new Error('disk unavailable')
+        if (!acknowledged) await write(path, text)
+      }
+      const writer = new EventLogs()
+      writer.event('sess-1', event('retry'))
+      writer.usage('sess-1', 'agent-1', 'haiku', 'medium', U(100, 50))
+      await writer.flush(io)
+      const before = await writer.read(io, 'sess-1')
+      expect(before.events).toHaveLength(1)
+      expect(before.stats['agent-1']!.byEffort).toEqual({ medium: 1 })
+      failing = false
+      io.now = () => 1000
+      await writer.flush(io)
+      expect(attempts.slice(2).map(a => a.text)).toEqual(attempts.slice(0, 2).map(a => a.text))
+      expect(new Set(attempts.map(a => a.path)).size).toBe(4)
+      const reader = new EventLogs()
+      expect(await reader.read(io, 'sess-1')).toEqual(before)
+      expect(await writer.read(io, 'sess-1')).toEqual(before)
+    })
+  }
+
+  test('legacy events and stats join new batches without rewriting the legacy file', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const path = `${logDir('/plugin')}/events-sess-1.json`
+    const legacy = JSON.stringify({ sessionId: 'sess-1', events: [event('legacy', '1969-12-31T00:00:00Z')], stats: { old: addUsage(undefined, 'haiku', 'medium', U(100, 50)) } })
+    seen.files[path] = legacy
+    const writer = new EventLogs()
+    writer.event('sess-1', event('new'))
+    writer.usage('sess-1', 'old', 'haiku', 'high', U(200, 60))
+    await writer.flush(io)
+    const log = await writer.read(io, 'sess-1')
+    expect(log.events.map(e => e.reason)).toEqual(['legacy', 'new'])
+    expect(log.stats.old).toEqual(addUsage(addUsage(undefined, 'haiku', 'medium', U(100, 50)), 'haiku', 'high', U(200, 60)))
+    expect(seen.files[path]).toBe(legacy)
+  })
+
+  test('a same-id resume rereads the batches another process wrote while this one was away', async ($, on) => {
+    let externalRead = false
+    let externalPath = ''
+    on('fs.read', {}, async (_$: unknown, e: any, next: any) => {
+      if (e.path === externalPath) externalRead = true
+      return next(e)
+    })
+    const seen = world($, on, null)
+    await $.prompt.submit({ text: 'first #haiku' } as never)
+    await $.session.end({ reason: 'resume', sessionId: 'sess-1', resume: { id: 'sess-2' } } as never)
+    seen.sessionId = 'sess-2'
+    await statsOf($)
+    const io = ioOf(seen, Object.keys(seen.files)[0]!.split('/model-router/')[0])
+    const other = new EventLogs()
+    other.event('sess-1', event('other process'))
+    await other.flush(io)
+    externalPath = Object.keys(seen.files).find(path => JSON.parse(seen.files[path]!).events.some((e: any) => e.reason === 'other process'))!
+    await $.session.end({ reason: 'resume', sessionId: 'sess-2', resume: { id: 'sess-1' } } as never)
+    seen.sessionId = 'sess-1'
+    await statsOf($)
+    expect(externalRead).toBe(true)
+    await $.prompt.submit({ text: 'continued #sonnet' } as never)
+    expect((await other.read(io, 'sess-1')).events).toHaveLength(3)
+    expect(seen.files[externalPath]).toBeDefined()
+  })
+
+  test('completed sessions leave no events or stats in memory; only failed batches remain', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const writer = new EventLogs()
+    for (let i = 0; i < 40; i++) {
+      writer.event(`sess-${i}`, event(`work ${i}`))
+      writer.usage(`sess-${i}`, 'agent-1', 'haiku', 'medium', U(100, 50))
+      await writer.flush(io)
+      await writer.read(io, `sess-${i}`)
+    }
+    expect((writer as any).pending.size).toBe(0)
+    expect(Object.keys(seen.files)).toHaveLength(80)
+    const broken = { ...io, write: async () => { throw new Error('disk full') } }
+    writer.event('unsaved', event('keep me'))
+    await writer.flush(broken)
+    expect((writer as any).pending.size).toBe(1)
+    io.now = () => 1000
+    await writer.flush(io)
+    expect((writer as any).pending.size).toBe(0)
+  })
+
+  test('retention uses file timestamps in their names, even with fresh directory stats or misleading mtimes', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const root = logDir('/plugin')
+    const writer = new EventLogs()
+    const now = 31 * 24 * 3600_000
+    for (const id of ['old', 'recent', 'edge']) {
+      io.now = () => id === 'recent' ? now : id === 'edge' ? 24 * 3600_000 : 0
+      writer.event(id, event(id))
+      await writer.flush(io)
+    }
+    seen.files[`${root}/events-legacy.json`] = '{}'
+    seen.files[`${root}/old/untimestamped.json`] = '{}'
+    seen.files[`${root}/outputs/old/tool.txt`] = 'original output'
+    const removed: string[][] = []
+    await writer.prune({ ...io,
+      stat: async (): Promise<FsStat> => ({ kind: 'dir', size: 0, mtimeMs: now, isLink: false }),
+      list: async path => (await io.list(path)).map(file => ({ ...file, mtimeMs: path.endsWith('/old') ? now : 0 })),
+      run: async argv => { removed.push(argv); return { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } },
+    }, now, 30)
+    const path = Object.keys(seen.files).find(path => path.startsWith(`${root}/old/`) && !path.endsWith('untimestamped.json'))!
+    expect(removed.filter(argv => argv[0] === 'rm')).toEqual([['rm', '-f', '--', path]])
+    expect(removed.every(argv => argv[0] === 'rm' || argv[0] === 'rmdir')).toBe(true)
+  })
+
+  test('retention never deletes a pending batch id, but can expire another batch in the same session', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const writer = new EventLogs()
+    writer.event('old', event('expired'))
+    await writer.flush(io)
+    const expired = Object.keys(seen.files)[0]!
+    writer.event('old', event('pending'))
+    await writer.flush({ ...io, write: async (path, text) => { await io.write(path, text); throw new Error('ack lost') } })
+    const removed: string[] = []
+    await writer.prune({ ...io, run: async argv => {
+      if (argv[0] === 'rm') {
+        removed.push(...argv.slice(3))
+        for (const path of argv.slice(3)) delete seen.files[path]
+      }
+      return { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+    } }, 31 * 24 * 3600_000, 30)
+    expect(removed).toEqual([expired])
+    expect((writer as any).pending.size).toBe(1)
+    expect((await new EventLogs().read(io, 'old')).events.map(e => e.reason)).toEqual(['pending'])
+  })
+
+  test('retention preserves batches written after its file listing', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const writer = new EventLogs()
+    const other = new EventLogs()
+    writer.event('old', event('expired'))
+    await writer.flush(io)
+    const expired = Object.keys(seen.files)[0]!
+    const dir = expired.slice(0, expired.lastIndexOf('/'))
+    const now = 31 * 24 * 3600_000
+    io.now = () => now
+    await writer.prune({ ...io,
+      list: async path => {
+        const files = await io.list(path)
+        if (path === dir) {
+          other.event('old', event('during list'))
+          await other.flush(io)
+        }
+        return files
+      },
+      run: async argv => {
+        if (argv[0] === 'rm') {
+          other.event('old', event('after list'))
+          await other.flush(io)
+          for (const path of argv.slice(3)) delete seen.files[path]
+        }
+        // rmdir refuses a directory which now contains either of the fresh batches.
+        return { exitCode: argv[0] === 'rmdir' ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+      },
+    }, now, 30)
+    expect(seen.files[expired]).toBeUndefined()
+    expect(Object.keys(seen.files).every(path => path.startsWith(`${dir}/`))).toBe(true)
+    expect((await other.read(io, 'old')).events.map(e => e.reason).sort()).toEqual(['after list', 'during list'])
+    expect((other as any).pending.size).toBe(0)
+  })
+
+  for (const stillExpired of [false, true]) {
+    test(`a retry after an expired listing survives deletion of that stale listing (${stillExpired ? 'still-expired' : 'fresh'} clock)`, async ($, on) => {
+      const seen = world($, on, null)
+      const io = ioOf(seen)
+      const owner = new EventLogs()
+      owner.event('old', event('retried event'))
+      owner.usage('old', 'agent-1', 'haiku', 'medium', U(100, 50))
+      await owner.flush({ ...io, write: async (path, text) => { await io.write(path, text); throw new Error('ack lost') } })
+      const expired = Object.keys(seen.files)
+      const now = 31 * 24 * 3600_000
+      io.now = () => stillExpired ? 1000 : now
+      await new EventLogs().prune({ ...io,
+        list: async path => {
+          const files = await io.list(path)
+          if (path.endsWith('/old')) await owner.flush(io)
+          return files
+        },
+        run: async argv => {
+          if (argv[0] === 'rm') for (const path of argv.slice(3)) delete seen.files[path]
+          return { exitCode: argv[0] === 'rmdir' ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+        },
+      }, now, 30)
+      expect(expired.every(path => seen.files[path] === undefined)).toBe(true)
+      expect((owner as any).pending.size).toBe(0)
+      const log = await new EventLogs().read(io, 'old')
+      expect(log.events.map(e => e.reason)).toEqual(['retried event'])
+      expect(log.stats['agent-1']).toEqual(addUsage(undefined, 'haiku', 'medium', U(100, 50)))
+    })
+  }
+
+  test('malformed, truncated and incomplete batches cannot hide valid batches, pending work or legacy data', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const writer = new EventLogs()
+    writer.event('sess-1', event('valid'))
+    writer.usage('sess-1', 'agent-1', 'haiku', 'medium', U(100, 50))
+    await writer.flush(io)
+    const path = Object.keys(seen.files)[0]!
+    const batch = JSON.parse(seen.files[path]!)
+    const dir = path.slice(0, path.lastIndexOf('/'))
+    seen.files[`${dir}/malformed.json`] = '{invalid'
+    seen.files[`${dir}/truncated.json`] = seen.files[path]!.slice(0, -5)
+    // A parseable prefix is still incomplete without the final end marker.
+    delete batch.end
+    seen.files[path] = JSON.stringify(batch)
+    writer.event('sess-1', event('pending'))
+    seen.files[`${logDir('/plugin')}/events-sess-1.json`] = JSON.stringify({ sessionId: 'sess-1', events: [event('legacy')], stats: {} })
+    const log = await writer.read(io, 'sess-1')
+    expect(log.events.map(e => e.reason)).toEqual(['legacy', 'pending'])
+    expect(log.stats['agent-1']).toEqual(addUsage(undefined, 'haiku', 'medium', U(100, 50)))
+    expect(writer.diagnostics.skippedBatches).toBe(3)
+    // A new process sees the same corrupt files and still loads the usable history.
+    const reader = new EventLogs()
+    expect((await reader.read(io, 'sess-1')).events.map(e => e.reason)).toEqual(['legacy'])
+    expect(reader.diagnostics.skippedBatches).toBe(3)
+  })
+
+  test('an interrupted attempt is skipped while pending data survives and its retry publishes a complete fresh attempt', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const writer = new EventLogs()
+    writer.event('sess-1', event('survives'))
+    await writer.flush({ ...io, write: async (path, text) => {
+      seen.files[path] = text.slice(0, -5)
+      throw new Error('interrupted write')
+    } })
+    const broken = Object.keys(seen.files)[0]!
+    expect((await writer.read(io, 'sess-1')).events.map(e => e.reason)).toEqual(['survives'])
+    expect((await new EventLogs().read(io, 'sess-1')).events).toEqual([])
+    io.now = () => 1000
+    await writer.flush(io)
+    expect(Object.keys(seen.files)).toHaveLength(2)
+    expect(seen.files[broken]!.endsWith('}')).toBe(false)
+    const reader = new EventLogs()
+    expect((await reader.read(io, 'sess-1')).events.map(e => e.reason)).toEqual(['survives'])
+    expect(reader.diagnostics.skippedBatches).toBe(1)
+  })
+
+  for (const source of ['legacy', 'batch']) {
+    for (const text of ['{"sessionId":', 'null', '{}',
+      JSON.stringify({ sessionId: 'sess-1', events: [null], stats: {} }),
+      JSON.stringify({ sessionId: 'sess-1', events: [], stats: { main: null } }),
+      JSON.stringify({ sessionId: 'sess-1', events: [], stats: { main: { byEffort: {}, byModel: { haiku: { steps: 'bad' } } } } }),
+    ]) {
+      test(`${source} source ${text} is skipped and counted without hiding usable data`, async ($, on) => {
+        const seen = world($, on, null)
+        const io = ioOf(seen)
+        const writer = new EventLogs()
+        writer.event('sess-1', event('saved'))
+        writer.usage('sess-1', 'agent-1', 'haiku', 'medium', U(100, 50))
+        await writer.flush(io)
+        const path = source === 'legacy' ? `${logDir('/plugin')}/events-sess-1.json` : `${logDir('/plugin')}/sess-1/broken.json`
+        seen.files[path] = text
+        writer.event('sess-1', event('pending'))
+        writer.usage('sess-1', 'agent-1', 'haiku', 'high', U(200, 60))
+        const log = await writer.read(io, 'sess-1')
+        expect(log.events.map(e => e.reason)).toEqual(['saved', 'pending'])
+        expect(log.stats['agent-1']).toEqual(addUsage(addUsage(undefined, 'haiku', 'medium', U(100, 50)), 'haiku', 'high', U(200, 60)))
+        expect(writer.diagnostics.skippedBatches).toBe(1)
+        const reader = new EventLogs()
+        expect((await reader.read(io, 'sess-1')).events.map(e => e.reason)).toEqual(['saved'])
+        expect(reader.diagnostics.skippedBatches).toBe(1)
+        expect(seen.files[path]).toBe(text)
+      })
+    }
+  }
+
+  for (const text of ['{truncated', JSON.stringify({ sessionId: 'sess-1', events: [null], stats: {} })]) {
+    test(`a malformed legacy source ${text} does not leave session initialization retrying`, async ($, on) => {
+      let reads = 0
+      on('fs.read', { path: /events-sess-1\.json$/ }, async () => { reads++; return { value: text } })
+      const seen = world($, on, null)
+      await $.prompt.submit({ text: 'first #haiku' } as never)
+      await step($, 't1')
+      await statsOf($)
+      await $.prompt.submit({ text: 'again #haiku' } as never)
+      expect(reads).toBe(1)
+      expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+      expect(seen.submits).toHaveLength(2)
+    })
+  }
+
+  test('a malformed batch does not leave session initialization retrying on every request', async ($, on) => {
+    let reads = 0
+    on('fs.read', { path: /broken\.json$/ }, async () => { reads++; return { value: '{truncated' } })
+    on('fs.list', { path: /\/model-router\/sess-1$/ }, async (_$: unknown, e: any, next: any) => {
+      seen.files[`${e.path}/broken.json`] = '{truncated'
+      return next(e)
+    })
+    const seen = world($, on, null)
+    await $.prompt.submit({ text: 'first #haiku' } as never)
+    await step($, 't1')
+    await statsOf($)
+    await $.prompt.submit({ text: 'again #haiku' } as never)
+    expect(reads).toBe(1)
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+    expect(seen.submits).toHaveLength(2)
+  })
+
+  test('parseable malformed batch shapes are isolated before merging', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const dir = `${logDir('/plugin')}/sess-1`
+    for (const [i, batch] of [null, {}, { sessionId: 'sess-1', events: [null], stats: {} },
+      { sessionId: 'sess-1', events: [], stats: { main: null } }].entries()) {
+      seen.files[`${dir}/bad-${i}.json`] = JSON.stringify(batch)
+    }
+    const reader = new EventLogs()
+    expect(await reader.read(io, 'sess-1')).toEqual({ sessionId: 'sess-1', events: [], stats: {} })
+    expect(reader.diagnostics.skippedBatches).toBe(4)
+  })
+
+  test('valid batch and event ids both dedupe, and old batches still load', async ($, on) => {
+    const seen = world($, on, null)
+    const io = ioOf(seen)
+    const writer = new EventLogs()
+    writer.event('sess-1', event('once'))
+    await writer.flush(io)
+    const path = Object.keys(seen.files)[0]!
+    const batch = JSON.parse(seen.files[path]!)
+    seen.files[`${path.slice(0, path.lastIndexOf('/'))}/copy.json`] = seen.files[path]!
+    // Pre-marker batches have their original batch id as the filename.
+    delete batch.end
+    seen.files[`${path.slice(0, path.lastIndexOf('/'))}/${batch.id}-other.json`] = JSON.stringify({
+      ...batch, id: `${batch.id}-other`, events: [...batch.events, { ...event('old batch'), id: 'old-event' }],
+      stats: { old: addUsage(undefined, 'haiku', 'medium', U(100, 50)) },
+    })
+    const log = await new EventLogs().read(io, 'sess-1')
+    expect(log.events.map(e => e.reason)).toEqual(['once', 'old batch'])
+    expect(log.stats.old).toEqual(addUsage(undefined, 'haiku', 'medium', U(100, 50)))
+  })
+
 })

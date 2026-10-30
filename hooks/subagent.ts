@@ -56,6 +56,13 @@ export type Decision = { model: ModelKey | undefined; reason: string; fable?: bo
 
 type SpawnFacts = Pick<AgentSpawnInput, 'subagentType' | 'model' | 'parentModel' | 'fork' | 'workflow'>
 
+// A model the caller named that the router can rank, below Fable: such an agent starts at medium (see startOf).
+// `inherit`, an unknown id and Fable are not pins of a tier.
+export function isCallerPin(model: string | undefined): boolean {
+  const f = familyOf(model)
+  return f !== undefined && f !== 'fable'
+}
+
 // Only a general-purpose agent the call gave no model needs the classifier.
 export function needsClassifier(e: SpawnFacts): boolean {
   return !e.fork && e.workflow === undefined && e.model === undefined && e.subagentType === 'general-purpose'
@@ -109,15 +116,30 @@ export type AgentTier = {
   retriedAtTier: boolean
 }
 
+// Whether a tier starting at its starting effort can still raise its effort by itself.
+function roomToRise(tier: ModelKey): boolean {
+  return EFFORTS.indexOf(START_EFFORT[tier]) < EFFORTS.indexOf(SELF_EFFORT_CAP[tier])
+}
+
 // The tier a started agent is on: what the engine resolved it to, and whether this router pinned it.
-export function startOf(resolved: string | undefined, parentModel: string, isPinned: boolean, ids: Record<ModelKey, string>): AgentTier {
+// callerPinned: the caller named a model the router left as it was. Its model is the caller's but it starts at medium like
+// a router pin: otherwise it ran at the session's effort (high, once capped), against "every tier starts at medium".
+// Except where medium is already the tier's own effort cap (Opus): there it would sit at the self cap with no way up of
+// its own, so an Opus pin keeps the session's effort, as before.
+export function startOf(
+  resolved: string | undefined,
+  parentModel: string,
+  isPinned: boolean,
+  ids: Record<ModelKey, string>,
+  callerPinned = false,
+): AgentTier {
   const ceiling = ceilingOf(parentModel)
   const tier = clamp(familyOf(resolved) ?? ceiling, ceiling)
   return {
     tier,
     family: familyOf(resolved) ?? tier,
     model: isPinned ? ids[tier] : undefined,
-    effort: isPinned ? START_EFFORT[tier] : undefined,
+    effort: isPinned || (callerPinned && roomToRise(tier)) ? START_EFFORT[tier] : undefined,
     ceiling,
     parentModel,
     errorsInARow: 0,
@@ -186,12 +208,12 @@ export function describeTier(s: AgentTier): string {
   return `${s.tier}${s.effort ? `/${s.effort}` : ''}`
 }
 
-// The events log, for your own analysis: one file per session in ~/.claude/model-router.
+// The events log, for your own analysis: batches per session in ~/.claude/model-router.
 export type UsageStats = { steps: number; input: number; output: number; cacheRead: number; cacheWrite: number }
 export type AgentStats = { byModel: Record<string, UsageStats>; byEffort: Record<string, number> }
 export type EventLog = {
   sessionId: string
-  events: { at: string; agentId: string; event: string; to: string; reason: string }[]
+  events: { id?: string; at: string; agentId: string; event: string; to: string; reason: string }[]
   stats: Record<string, AgentStats>
 }
 

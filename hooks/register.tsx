@@ -1,7 +1,7 @@
-import { atom, read, update } from 'claude-code'
+import { atom, memberOf, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit, Timer } from 'claude-code'
 
-import type { ModelKey, Route, SpendRole, SpendUsage, Tally, Tier } from '../types'
+import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
 import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, saved, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
@@ -23,9 +23,9 @@ import {
   TIER_ROUTE,
   withSuffixOf,
 } from './route'
-import type { AgentTier, EventLog } from './subagent'
+import { Backoff, EventLogs } from './log'
+import type { AgentTier } from './subagent'
 import {
-  addUsage,
   AUTO_ESCALATE_AFTER,
   capSent,
   decideSpawn,
@@ -33,6 +33,7 @@ import {
   effortCap,
   escalateAgent,
   familyOf,
+  isCallerPin,
   logDir,
   modelCap,
   needsClassifier,
@@ -50,6 +51,7 @@ const PROBE_EVERY_MS = 24 * 3600 * 1000
 const CLASSIFY_MAX_TOKENS = 300
 const SNIPPET_CHARS = 120
 
+// A lifetime starts with empty routing and turn spend; loading history never clears either.
 const route = atom({ plugin: 'model-router', key: 'route' } as const, null)
 const enabled = atom({ plugin: 'model-router', key: 'enabled' } as const, true)
 const meter = atom({ plugin: 'model-router', key: 'meter' } as const, { turn: EMPTY, today: EMPTY })
@@ -131,9 +133,25 @@ const agents = new Map<string, AgentTier>()
 const agentModels = new Map<string, keyof typeof PRICES>()
 // Resumes after a reload resolve their effort on the first step, not in the spawn result.
 const resumed = new Set<string>()
-// Per session: what changed and what each tiered subagent cost per model and effort. Written to
-// ~/.claude/model-router/, one file per session, for your own analysis.
-const log: EventLog = { sessionId: '', events: [], stats: {} }
+// The effort an Agent tool call set explicitly, by tool_use_id, until its spawn reads it. agent.spawn does not carry the
+// call's arguments, so tool.call records them; the subagent's steps carry that effort, and the router must not replace
+// it with its own starting effort.
+const askedEffort = new Map<string, Effort>()
+const AGENT_TOOLS: readonly string[] = ['Agent', 'Task']
+const logs = new EventLogs()
+
+function logIO($: EngineInterface) {
+  return {
+    root: $.plugin.root,
+    now: Date.now,
+    read: (path: string) => $.fs.read(path),
+    write: (path: string, text: string) => $.fs.write(path, text),
+    list: (path: string) => $.fs.list(path),
+    stat: (path: string) => $.fs.stat(path),
+    run: (argv: string[]) => $.process.run(argv),
+    log: (text: string) => $.ui.log(text),
+  }
+}
 
 const STR = {
   zh: {
@@ -381,9 +399,10 @@ function refreshUi($: EngineInterface, session: Session, now: number) {
   publishStatus($)
   uiTick?.cancel()
   uiTick = $.clock.every(60_000, async () => {
-    if (!await stillHere($, session)) {
+    const identity = await stillHere($, session)
+    if (identity !== 'same') {
       // An id change without session.end still retires this lifetime. A newer activation owns its own UI.
-      if (here(session)) {
+      if (identity === 'different' && here(session)) {
         session.ended = true
         sessionGeneration += 1
         resetSession($)
@@ -391,7 +410,7 @@ function refreshUi($: EngineInterface, session: Session, now: number) {
       return
     }
     const now = await $.clock.now()
-    if (!await stillHere($, session)) return
+    if (await stillHere($, session) !== 'same') return
     uiNow = now
     publishStatus($)
     $.ui.invalidate('ui.render')
@@ -428,59 +447,81 @@ function cancelCompact($: EngineInterface) {
 
 // A hook and every callback it starts keep the originating session, including across /clear and resume.
 // The id alone is not enough: an ended session can be resumed again in this process.
-type Session = { id: string; ended: boolean; ready?: Promise<void>; bound?: Promise<void>; today?: Tally }
+type Load = { done: boolean; pending?: Promise<void>; retry: Backoff }
+type Session = { id: string; stateId: string; ended: boolean; history: Load; daily: Load; retries: Map<string, Backoff>; today?: Tally }
 let activeSession: Session | undefined
-// Every activation (including end and same-id resume) invalidates older identity lookups.
+// Host state survives hot reload; a new module must never select an earlier activation's members.
+const activationId = crypto.randomUUID()
+// Every lifetime (including end and same-id resume) invalidates older identity lookups.
 let sessionGeneration = 0
+let identityRetry = new Backoff()
+
+function newSession(id: string, ended = false): Session {
+  identityRetry = new Backoff()
+  return { id, stateId: `${activationId}-${++sessionGeneration}`, ended, history: { done: false, retry: new Backoff() }, daily: { done: false, retry: new Backoff() }, retries: new Map() }
+}
+
+function retryFor(session: Session, key: string): Backoff {
+  let retry = session.retries.get(key)
+  if (!retry) session.retries.set(key, retry = new Backoff())
+  return retry
+}
+
+function sessionId($: EngineInterface) {
+  return bookkeeping($, () => $.session.id(), undefined, identityRetry)
+}
+
 function here(session: Session | undefined): session is Session {
   return session !== undefined && session === activeSession && !session.ended
 }
 
-async function useSession($: EngineInterface, starting = false, rendering = false): Promise<Session | undefined> {
+async function useSession($: EngineInterface): Promise<Session | undefined> {
   const generation = sessionGeneration
-  const id = await $.session.id()
-  if (generation !== sessionGeneration) return undefined
-  if (activeSession?.id === id && !(starting && activeSession.ended)) {
+  const id = await sessionId($)
+  if (id === undefined || generation !== sessionGeneration) return undefined
+  if (activeSession?.id === id && !activeSession.ended) {
     const session = activeSession
-    await session.ready
-    if (!rendering) await bindSession($, session)
+    await readySession($, session)
+    void logs.flush(logIO($))
     return session
   }
   const first = activeSession === undefined
-  const session: Session = { id, ended: false }
-  sessionGeneration += 1
+  const session = newSession(id)
   activeSession = session
   resetSession($, !first)
-  // Publish the barrier before doing any work: concurrent hooks must not log or persist a fresh,
-  // shorter history while the destination's file is still being read. This also covers in-process resume.
-  session.ready = Promise.resolve().then(async () => {
-    await restore($, session)
-    if (!here(session)) return
-    const now = await $.clock.now()
-    if (!here(session)) return
-    const { today } = await totals($, now, true)
-    if (!here(session)) return
-    session.today = today
-  })
-  await session.ready
-  if (!rendering) await bindSession($, session)
+  await readySession($, session)
+  void logs.flush(logIO($))
   return session
 }
 
-// Rendering can be the first event after resume. It may restore local data, but drawing cannot write atoms.
-// The first writable hook binds the restored totals before doing any accounting.
-async function bindSession($: EngineInterface, session: Session) {
-  if (!here(session)) return
-  session.bound ??= (async () => {
-    await update($, route, r => here(session) ? null : r)
-    if (!here(session)) return
-    await update($, meter, m => here(session) ? { turn: EMPTY, today: session.today ?? EMPTY } : m)
-  })()
-  await session.bound
+// Activation rereads disk history without keeping it. Each load finishes independently; backoff never holds a hook.
+async function readySession($: EngineInterface, session: Session) {
+  await Promise.all([
+    loadPart($, session.history, async () => { await logs.read(logIO($), session.id) }),
+    loadPart($, session.daily, async () => {
+      const now = await $.clock.now()
+      if (!here(session)) return
+      const { today } = await totals($, now, true)
+      if (here(session) && session.today === undefined) session.today = today
+    }),
+  ])
 }
 
-async function stillHere($: EngineInterface, session: Session): Promise<boolean> {
-  return here(session) && await $.session.id() === session.id && here(session)
+async function loadPart($: EngineInterface, part: Load, job: () => Promise<void>) {
+  if (part.done || part.retry.waiting(Date.now())) return
+  part.pending ??= Promise.resolve().then(() => bookkeeping($, async () => {
+    await job()
+    part.done = true
+  }, undefined, part.retry)).finally(() => { part.pending = undefined })
+  await part.pending
+}
+
+// An unavailable id (including backoff) skips this action without ending the lifetime or cancelling its timers.
+async function stillHere($: EngineInterface, session: Session): Promise<'same' | 'different' | 'unavailable'> {
+  if (!here(session)) return 'different'
+  const id = await sessionId($)
+  if (!here(session)) return 'different'
+  return id === undefined ? 'unavailable' : id === session.id ? 'same' : 'different'
 }
 
 function resetSession($: EngineInterface, cancel = true) {
@@ -509,10 +550,8 @@ function resetSession($: EngineInterface, cancel = true) {
   agents.clear()
   agentModels.clear()
   resumed.clear()
+  askedEffort.clear()
   fableCounted.clear()
-  log.sessionId = activeSession?.id ?? ''
-  log.events = []
-  log.stats = {}
   publishStatus($)
 }
 
@@ -557,16 +596,19 @@ async function setEnabled($: EngineInterface, session: Session, isOn: boolean) {
     if (guardPending) skipCompact($, STR[uiLang].routerOff)
     cancelCompact($)
   }
-  if (!await stillHere($, session)) return
+  if (await stillHere($, session) !== 'same') return
   await update($, enabled, previous => here(session) ? isOn : previous)
-  if (!await stillHere($, session)) return
-  await $.store.set('enabled', isOn)
+  if (await stillHere($, session) !== 'same') return
+  await bookkeeping($, () => $.store.set('enabled', isOn), undefined, retryFor(session, 'enabled write'))
 }
 
 // Each session owns its daily keys. The chain also keeps parallel subagent increments in this process in order.
 let writes: Promise<void> = Promise.resolve()
 const RETAIN_DAYS = 30
 let prunedDay = ''
+let prunedLogsDay = ''
+const pruneRetry = new Backoff()
+const pruneLogsRetry = new Backoff()
 
 function oldestDay(now: number): string {
   const d = new Date(now)
@@ -576,13 +618,18 @@ function oldestDay(now: number): string {
 
 async function prune($: EngineInterface, now: number) {
   const day = dayKey(now)
-  if (prunedDay === day) return
-  const oldest = oldestDay(now)
-  for (const key of await $.store.keys()) {
-    const day = /^(?:meter|counts):(\d{8}):/.exec(key)?.[1]
-    if (day !== undefined && day < oldest) await $.store.delete(key)
-  }
-  prunedDay = day
+  if (prunedDay !== day) await bookkeeping($, async () => {
+    const oldest = oldestDay(now)
+    for (const key of await $.store.keys()) {
+      const day = /^(?:meter|counts):(\d{8}):/.exec(key)?.[1]
+      if (day !== undefined && day < oldest) await $.store.delete(key)
+    }
+    prunedDay = day
+  }, undefined, pruneRetry)
+  if (prunedLogsDay !== day) await bookkeeping($, async () => {
+    await logs.prune(logIO($), now, RETAIN_DAYS)
+    prunedLogsDay = day
+  }, undefined, pruneLogsRetry)
 }
 
 async function totals($: EngineInterface, now: number, todayOnly = false): Promise<{ today: Tally; all: Tally; counts: Counts }> {
@@ -624,18 +671,38 @@ function mergeCounts(a: Counts, b: Counts): Counts {
   return out
 }
 
-function serial($: EngineInterface, session: Session, job: () => Promise<void>): Promise<void> {
-  writes = writes.then(async () => { if (await stillHere($, session)) await job() }).catch(err => $.ui.log(`model-router: store write failed: ${String(err)}`))
+function storeFailure($: EngineInterface, err: unknown) {
+  try { $.ui.log(`model-router: bookkeeping failed: ${String(err)}`) } catch { /* Logging is best effort too. */ }
+}
+
+async function bookkeeping<T>($: EngineInterface, job: () => Promise<T>, fallback: T, retry?: Backoff): Promise<T> {
+  if (retry?.waiting(Date.now())) return fallback
+  try {
+    const value = await job()
+    retry?.reset()
+    return value
+  } catch (err) {
+    // Concurrent readers may have started before the first one failed. They share its backoff step.
+    if (!retry || !retry.waiting(Date.now())) {
+      retry?.fail(Date.now())
+      storeFailure($, err)
+    }
+    return fallback
+  }
+}
+
+function serial($: EngineInterface, session: Session, key: string, job: () => Promise<void>): Promise<void> {
+  writes = writes.then(async () => { if (await stillHere($, session) === 'same') await bookkeeping($, job, undefined, retryFor(session, key)) }).catch(err => storeFailure($, err))
   return writes
 }
 
 function count($: EngineInterface, session: Session, change: (c: Counts) => Counts): Promise<void> {
-  return serial($, session, async () => {
+  return serial($, session, 'counts', async () => {
     const now = await $.clock.now()
     await prune($, now)
     const key = `counts:${dayKey(now)}:${session.id}`
     const c = ((await $.store.get(key)) as Counts | undefined) ?? NO_COUNTS
-    if (!await stillHere($, session)) return
+    if (await stillHere($, session) !== 'same') return
     await $.store.set(key, change(c))
   })
 }
@@ -643,25 +710,33 @@ function count($: EngineInterface, session: Session, change: (c: Counts) => Coun
 // Every model call this session pays for, the router's own included, goes on the turn, the day and the total.
 // switched: a main-thread step that changed model family within the cache TTL (see baselineOf).
 function record($: EngineInterface, session: Session, modelId: string, u: Usage, switched = false, overhead = false, role: SpendRole = 'main'): Promise<void> {
-  return serial($, session, async () => {
+  return serial($, session, 'meter', async () => {
     const now = await $.clock.now()
     await prune($, now)
     const key = `meter:${dayKey(now)}:${session.id}`
     const previous = ((await $.store.get(key)) as Tally | undefined) ?? EMPTY
-    if (!await stillHere($, session)) return
+    if (await stillHere($, session) !== 'same') return
     await $.store.set(key, add(previous, modelId, u, switched, overhead, role))
-    const { today } = await totals($, now, true)
-    if (!await stillHere($, session)) return
-    await update($, meter, m => here(session) ? { turn: add((m ?? { turn: EMPTY }).turn, modelId, u, switched, overhead, role), today } : m)
+    const loaded = await bookkeeping($, async () => {
+      const { today } = await totals($, now, true)
+      return today
+    }, undefined, session.daily.retry)
+    if (await stillHere($, session) !== 'same') return
+    if (loaded !== undefined) {
+      session.today = loaded
+      session.daily.done = true
+    }
+    const today = session.today ?? EMPTY
+    await update($, memberOf(meter, { requestId: session.stateId }), m => here(session) ? { turn: add((m ?? { turn: EMPTY }).turn, modelId, u, switched, overhead, role), today } : m)
   })
 }
 
 function recordDetail($: EngineInterface, session: Session, change: (t: Tally, now: number) => Tally): Promise<void> {
-  return serial($, session, async () => {
+  return serial($, session, 'meter detail', async () => {
     const now = await $.clock.now()
     const key = `meter:${dayKey(now)}:${session.id}`
     const previous = ((await $.store.get(key)) as Tally | undefined) ?? EMPTY
-    if (!await stillHere($, session)) return
+    if (await stillHere($, session) !== 'same') return
     await $.store.set(key, change(previous, now))
   })
 }
@@ -688,42 +763,16 @@ async function rewriteCount($: EngineInterface, day?: string, id?: string): Prom
   return n
 }
 
-// The log is for review only: a failed write never fails a turn or an agent. Writes go through the
-// serial chain so a slow older snapshot cannot land over a newer one.
-function persist($: EngineInterface, session: Session): Promise<void> {
-  return serial($, session, async () => {
-    try {
-      if (!await stillHere($, session)) return
-      await $.fs.write(`${logDir($.plugin.root)}/events-${log.sessionId}.json`, JSON.stringify(log, null, 1))
-    } catch {
-      // Nothing to do: the next event writes the whole log again.
-    }
-  })
-}
-
-// Called only by activation. A restore never activates the id returned by its own lookup.
-async function restore($: EngineInterface, session: Session) {
-  try {
-    const id = session.id
-    const saved = JSON.parse(await $.fs.read(`${logDir($.plugin.root)}/events-${id}.json`)) as EventLog
-    if (!here(session) || await $.session.id() !== id || !here(session)) return
-    log.events = saved.events ?? []
-    log.stats = saved.stats ?? {}
-  } catch {
-    // First load of this session: nothing to restore.
-  }
-}
-
 // Guard status takes the subagent event slot only while a guard is pending.
 async function logEvent($: EngineInterface, session: Session, agentId: string, event: string, to: string, reason: string) {
   const now = await $.clock.now()
-  if (!await stillHere($, session)) return
-  log.events.push({ at: new Date(now).toISOString(), agentId, event, to, reason })
+  if (await stillHere($, session) !== 'same') return
+  logs.event(session.id, { at: new Date(now).toISOString(), agentId, event, to, reason })
   if (agentId !== 'main') {
     agentStatus = `subagent ${event}: ${to} (${reason})`
     publishStatus($)
   }
-  await persist($, session)
+  void logs.flush(logIO($))
 }
 
 async function recentContext($: EngineInterface): Promise<string> {
@@ -748,7 +797,7 @@ function failText(c: { why: string; detail?: string }): string {
 async function classifyTier($: EngineInterface, session: Session, lang: Lang, text: string, previous: Tier | null, withContext: boolean): Promise<Classified> {
   try {
     const context = withContext ? await recentContext($) : ''
-    if (!await stillHere($, session)) return { ok: false, why: 'session changed' }
+    if (await stillHere($, session) !== 'same') return { ok: false, why: 'session changed' }
     const r = await $.model.complete({
       model: 'haiku',
       system: classifierSystem(lang),
@@ -759,7 +808,7 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
       effort: 'low',
       timeoutMs: CLASSIFY_MS,
     })
-    if (!await stillHere($, session)) return { ok: false, why: 'session changed' }
+    if (await stillHere($, session) !== 'same') return { ok: false, why: 'session changed' }
     await record($, session, 'claude-haiku-5-5', r.usage, false, true, 'classifier')
     if (!r.isAnswered) {
       if (r.reason === 'aborted') return { ok: false, why: 'timeout' }
@@ -814,18 +863,18 @@ async function reviewerAvailable($: EngineInterface, session: Session, reviewMod
   if (/fable-5-1\b/i.test(reviewModel)) return false
   const now = await $.clock.now()
   const seen = (await $.store.get('reviewer')) as { model: string; ok: boolean; at: number } | undefined
-  if (!await stillHere($, session)) return false
+  if (await stillHere($, session) !== 'same') return false
   if (seen && seen.model === reviewModel && now - seen.at < PROBE_EVERY_MS) return seen.ok
   let ok = false
   try {
     const r = await $.model.complete({ model: reviewModel, prompt: 'Reply with OK.', maxTokens: 5, timeoutMs: 15000 })
-    if (!await stillHere($, session)) return false
+    if (await stillHere($, session) !== 'same') return false
     await record($, session, reviewModel, r.usage, false, true, 'reviewer')
     ok = r.isAnswered
   } catch {
     ok = false
   }
-  if (!await stillHere($, session)) return false
+  if (await stillHere($, session) !== 'same') return false
   await $.store.set('reviewer', { model: reviewModel, ok, at: now })
   return ok
 }
@@ -838,9 +887,9 @@ async function reviewDecision($: EngineInterface, session: Session, lang: Lang, 
     maxTokens: 600,
     timeoutMs: 120000,
   })
-  if (!await stillHere($, session)) return
+  if (await stillHere($, session) !== 'same') return
   await record($, session, reviewModel, r.usage, false, false, 'reviewer')
-  if (!await stillHere($, session) || !r.isAnswered) return
+  if (await stillHere($, session) !== 'same' || !r.isAnswered) return
   await $.session.append({ message: { type: 'system', content: [{ type: 'text', text: `${STR[lang].review} (${reviewModel})：\n${r.text.trim()}` }] } })
 }
 
@@ -848,7 +897,7 @@ async function reviewDecision($: EngineInterface, session: Session, lang: Lang, 
 async function maybeReview($: EngineInterface, session: Session, lang: Lang, reviewModel: string, prompt: string, answer: string) {
   if (reviewModel === '') return
   try {
-    if (await reviewerAvailable($, session, reviewModel) && await stillHere($, session)) await reviewDecision($, session, lang, reviewModel, prompt, answer)
+    if (await bookkeeping($, () => reviewerAvailable($, session, reviewModel), false, retryFor(session, 'reviewer')) && await stillHere($, session) === 'same') await reviewDecision($, session, lang, reviewModel, prompt, answer)
   } catch (err) {
     $.ui.log(`model-router: review failed: ${String(err)}`)
   }
@@ -887,17 +936,19 @@ function detailLines(t: Tally, lang: Lang, rewrites: number): string {
   ].join('\n')
 }
 
-async function statsText($: EngineInterface, session: Session, lang: Lang): Promise<string> {
+async function statsText($: EngineInterface, session: Session, lang: Lang, compaction: string): Promise<string> {
   const now = await $.clock.now()
-  const { today, all, counts: c } = await totals($, now)
-  const tally = await sessionTally($, session)
-  const sessionRewrites = await rewriteCount($, undefined, session.id)
-  const dayRewrites = await rewriteCount($, dayKey(now))
-  if (!await stillHere($, session)) return STR[lang].checkpointCancelled
+  const { today, all, counts: c } = await bookkeeping($, () => totals($, now), { today: session.today ?? EMPTY, all: EMPTY, counts: NO_COUNTS }, retryFor(session, 'stats totals'))
+  const tally = await bookkeeping($, () => sessionTally($, session), EMPTY, retryFor(session, 'stats session'))
+  const sessionRewrites = await bookkeeping($, () => rewriteCount($, undefined, session.id), 0, retryFor(session, 'stats session rewrites'))
+  const dayRewrites = await bookkeeping($, () => rewriteCount($, dayKey(now)), 0, retryFor(session, 'stats day rewrites'))
+  if (await stillHere($, session) !== 'same') return STR[lang].checkpointCancelled
   const failures = Object.entries(c.classifierFailures ?? {})
     .sort((a, b) => b[1] - a[1])
     .map(([why, n]) => `${why} ×${n}`)
   return [
+    compaction,
+    '',
     tallyLines(STR[lang].session, tally),
     detailLines(tally, lang, sessionRewrites),
     '',
@@ -928,7 +979,7 @@ async function contextText($: EngineInterface, session: Session, lang: Lang, col
   const str = STR[lang]
   try {
     const { context } = await $.session.usage({ breakdown: 'summary', columns })
-    if (!await stillHere($, session)) return str.checkpointCancelled
+    if (await stillHere($, session) !== 'same') return str.checkpointCancelled
     const n = contextReading(context.tokens).tokens
     const rows = context.breakdown?.categories
     return [n === undefined ? str.unknownContext : `${str.ctx}: ${fmtTokens(n)}`,
@@ -940,20 +991,20 @@ async function contextText($: EngineInterface, session: Session, lang: Lang, col
   }
 }
 
-async function statusScreen($: EngineInterface, session: Session, lang: Lang, settings: Record<string, unknown>): Promise<string> {
+async function statusScreen($: EngineInterface, session: Session, lang: Lang, settings: Record<string, unknown>, compaction: string): Promise<string> {
   const str = STR[lang]
   try {
     const usage = await $.session.usage()
-    if (!await stillHere($, session)) return str.checkpointCancelled
+    if (await stillHere($, session) !== 'same') return str.checkpointCancelled
     rateLimits = usage.rateLimits
   } catch {
     // Keep the last measurement.
   }
   const now = await $.clock.now()
-  if (!await stillHere($, session)) return str.checkpointCancelled
+  if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   uiNow = now
   publishStatus($)
-  return [str.settings,
+  return [compaction, '', str.settings,
     `enabled: ${await read($, enabled)}`,
     ...Object.entries(settings).map(([key, value]) => `${key}: ${value === '' ? '""' : String(value)}`),
     `${str.pending}: ${pendingText(lang, uiNow) || str.none}${guardPending ? ` (${new Date(guardPending.at).toISOString()})` : ''}`,
@@ -970,78 +1021,97 @@ async function statusScreen($: EngineInterface, session: Session, lang: Lang, se
 type CompactOutcome = 'done' | 'skipped' | 'rejected'
 let pluginCompaction: { session: Session } | null = null
 
+// Issued attempts keep their session id even after end/resume. Logging has its own queue: a slow write
+// must not hold up the result, accounting, or cancellation of the running compaction.
+function logCompact($: EngineInterface, session: Session, kind: string, to: CompactOutcome, reason: string) {
+  void $.clock.now().then(now => {
+    logs.event(session.id, { at: new Date(now).toISOString(), agentId: 'main', event: `compact ${kind}`, to, reason })
+    return logs.flush(logIO($))
+  }).catch(err => storeFailure($, err))
+}
+
 // Compacts the main conversation between turns; explicit checkpoints can also run with a cold cache. $.session.compact rejects while a turn
 // runs ('rejected') and resolves { skip } when a hook vetoed it ('skipped'): neither is a compaction, so neither is
 // counted. Never throws.
 async function compactMain($: EngineInterface, session: Session, lang: Lang, kind: 'idle' | 'cap' | 'checkpoint', note = ''): Promise<CompactOutcome> {
-  // The caller just checked the live id and epoch. No await may separate that check from compact.
+  // The caller just checked the live id, clock and epoch. No await may precede compact.
   if (!here(session) || pluginCompaction !== null) return 'rejected'
   const epoch = timerEpoch
   const request = mainRequestSequence
-  const { tokens: before = 0, model } = contextReading()
   // Compact usage has no model id: estimate it at the last main request's rates, including Fable.
-  let tokensBefore: number | undefined
-  let tokensAfter: number | undefined
+  const { tokens: before = 0, model } = contextReading()
   const instructions = kind === 'checkpoint' ? `${CHECKPOINT_INSTRUCTIONS}${note ? `\nCheckpoint note: ${note}` : ''}` : COMPACT_INSTRUCTIONS
   const owner = { session }
+  let r
   try {
-    // Instructions are mutable hook input. Ownership lasts for exactly this invocation, with at most
-    // one plugin compaction in flight, even across cancellation or a session change.
+    // Mutable hook instructions do not change accounting ownership. It lasts for this invocation,
+    // with at most one plugin compaction in flight, even across cancellation or a session change.
     pluginCompaction = owner
-    let r
     try {
       r = await $.session.compact({ instructions })
     } finally {
       if (pluginCompaction === owner) pluginCompaction = null
     }
-    if (!await stillHere($, session)) return 'rejected'
-    if (r.skip !== undefined) return 'skipped'
-    // The compact has already happened. Do not clear a newer turn's context while accounting for it.
+  } catch (err) {
+    logCompact($, session, kind, 'rejected', err instanceof Error ? err.message : String(err))
+    return 'rejected'
+  }
+  if (r.skip !== undefined) {
+    logCompact($, session, kind, 'skipped', String(r.skip))
+    return 'skipped'
+  }
+  const size = r.tokensAfter === undefined ? fmtTokens(r.tokensBefore ?? before) : `${fmtTokens(r.tokensBefore ?? before)} → ${fmtTokens(r.tokensAfter)}`
+  try {
+    if (await stillHere($, session) !== 'same') return 'done'
+    // The compact has already happened. Account for it without clearing a newer turn's context.
+    let notificationEpoch = epoch
     if (request === mainRequestSequence) {
       forgetContext()
       measuredContext = r.tokensAfter
-      if (!stale(epoch)) cancelCompact($)
+      if (!stale(epoch)) {
+        cancelCompact($)
+        notificationEpoch = timerEpoch
+      }
     }
-    tokensBefore = r.tokensBefore
-    tokensAfter = r.tokensAfter
     if (r.usage) await record($, session, model, r.usage, false, false, 'compaction')
-  } catch {
-    return 'rejected'
+    if (await stillHere($, session) !== 'same') return 'done'
+    await count($, session, c =>
+      kind === 'checkpoint' ? { ...c, checkpointCompactions: (c.checkpointCompactions ?? 0) + 1 }
+        : kind === 'idle' ? { ...c, idleCompactions: (c.idleCompactions ?? 0) + 1 } : { ...c, capCompactions: (c.capCompactions ?? 0) + 1 },
+    )
+    await recordDetail($, session, (t, now) => ({ ...t, compactions: [...(t.compactions ?? []), { at: now, before: r.tokensBefore ?? before, after: r.tokensAfter }] }))
+    if (await stillHere($, session) !== 'same' || notificationEpoch !== timerEpoch) return 'done'
+    const str = STR[lang]
+    try {
+      $.ui.toast((kind === 'checkpoint' ? str.checkpointCompacted : kind === 'idle' ? str.idleCompacted : str.capCompacted)(size))
+    } catch {
+      // A missing toast surface is not worth failing a compaction that happened.
+    }
+    return 'done'
+  } finally {
+    // Enqueue after accounting: a slow log write must not delay the result or its toast.
+    logCompact($, session, kind, 'done', size)
   }
-  if (!await stillHere($, session)) return 'rejected'
-  await count($, session, c =>
-    kind === 'checkpoint' ? { ...c, checkpointCompactions: (c.checkpointCompactions ?? 0) + 1 }
-      : kind === 'idle' ? { ...c, idleCompactions: (c.idleCompactions ?? 0) + 1 } : { ...c, capCompactions: (c.capCompactions ?? 0) + 1 },
-  )
-  await recordDetail($, session, (t, now) => ({ ...t, compactions: [...(t.compactions ?? []), { at: now, before: tokensBefore ?? before, after: tokensAfter }] }))
-  // The engine's own figures when it recorded them, else the freshest context reading before the compaction.
-  if (!await stillHere($, session)) return 'rejected'
-  const size = tokensAfter === undefined ? fmtTokens(tokensBefore ?? before) : `${fmtTokens(tokensBefore ?? before)} → ${fmtTokens(tokensAfter)}`
-  const str = STR[lang]
-  try {
-    $.ui.toast((kind === 'checkpoint' ? str.checkpointCompacted : kind === 'idle' ? str.idleCompacted : str.capCompacted)(size))
-  } catch {
-    // A missing toast surface is not worth failing a compaction that happened.
-  }
-  return 'done'
 }
 
 // The host refuses compact inside command.run (that hook holds a turn open). Run on the next clock tick,
 // never behind a running turn: a prompt/off cancels the timer, and every await rechecks its epoch.
 async function runCheckpoint($: EngineInterface, session: Session, lang: Lang, epoch: number, note: string) {
-  if (!await stillHere($, session) || epoch !== timerEpoch) return
-  checkpointTimer = null
+  if (!here(session) || epoch !== timerEpoch) return
   checkpointRunning = true
   const str = STR[lang]
   try {
+    if (await stillHere($, session) !== 'same' || epoch !== timerEpoch) return
     const busy = await agentsBusy($)
-    if (!await stillHere($, session) || epoch !== timerEpoch || runningMain !== null) return
+    if (await stillHere($, session) !== 'same' || epoch !== timerEpoch || runningMain !== null) return
     if (busy !== 0) {
       $.ui.toast(str.skipped(busy < 0 ? str.agentUnavailable : str.agentsBusy))
       return
     }
+    await $.clock.now()
+    if (!here(session) || epoch !== timerEpoch || runningMain !== null) return
     const outcome = await compactMain($, session, lang, 'checkpoint', note)
-    if (await stillHere($, session) && epoch === timerEpoch && outcome !== 'done') $.ui.toast(str.skipped(outcome === 'skipped' ? str.vetoed : str.rejected))
+    if (await stillHere($, session) === 'same' && epoch === timerEpoch && outcome !== 'done') $.ui.toast(str.skipped(outcome === 'skipped' ? str.vetoed : str.rejected))
   } finally {
     if (here(session)) checkpointRunning = false
   }
@@ -1069,30 +1139,38 @@ function stale(epoch: number): boolean {
   return epoch !== timerEpoch || !compactEnabled
 }
 
+// A fired timer no longer owns a pending handle, even when identity validation is unavailable.
+function scheduleCompact($: EngineInterface, ms: number, run: () => Promise<void>) {
+  const timer = $.clock.after(ms, () => {
+    if (compactTimer === timer) compactTimer = null
+    void run().catch(() => {})
+  })
+  compactTimer = timer
+}
+
 // The idle compaction, a single re-check later while background agents run, never past the safe window.
 async function runIdle($: EngineInterface, session: Session, g: Guard, epoch: number, rechecked: boolean): Promise<void> {
-  if (!await stillHere($, session) || stale(epoch)) return
-  compactTimer = null
+  if (await stillHere($, session) !== 'same' || stale(epoch)) return
   const isOn = await read($, enabled)
-  if (!await stillHere($, session) || stale(epoch) || !isOn) return
+  if (await stillHere($, session) !== 'same' || stale(epoch) || !isOn) return
   const now = await $.clock.now()
-  if (!await stillHere($, session) || stale(epoch)) return
+  if (!here(session) || stale(epoch)) return
   if (!idleDue(now, g.minContext)) {
     clearGuard($)
     if (lastMain && (contextReading().tokens ?? 0) >= g.minContext) skipCompact($, STR[g.lang].deadlinePassed)
     return
   }
   const busy = await agentsBusy($)
-  if (!await stillHere($, session) || stale(epoch)) return
+  if (await stillHere($, session) !== 'same' || stale(epoch)) return
   if (busy !== 0) {
     const checkedAt = await $.clock.now()
-    if (!await stillHere($, session) || stale(epoch)) return
+    if (!here(session) || stale(epoch)) return
     const deadline = lastMain === null ? 0 : lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS - IDLE_HEADROOM_MS
     if (!rechecked && checkedAt < deadline) {
       const at = Math.min(checkedAt + AGENT_RECHECK_MS, deadline)
       guardPending = { at, kind: 'idle', waiting: busy }
       refreshUi($, session, checkedAt)
-      compactTimer = $.clock.after(at - checkedAt, () => void runIdle($, session, g, epoch, true).catch(() => {}))
+      scheduleCompact($, at - checkedAt, () => runIdle($, session, g, epoch, true))
     } else {
       clearGuard($)
       skipCompact($, busy < 0 ? STR[g.lang].agentUnavailable : STR[g.lang].agentsBusy)
@@ -1100,7 +1178,7 @@ async function runIdle($: EngineInterface, session: Session, g: Guard, epoch: nu
     return
   }
   const checkedAt = await $.clock.now()
-  if (!await stillHere($, session) || stale(epoch)) return
+  if (!here(session) || stale(epoch)) return
   if (!idleDue(checkedAt, g.minContext)) {
     clearGuard($)
     skipCompact($, STR[g.lang].deadlinePassed)
@@ -1114,9 +1192,9 @@ async function runIdle($: EngineInterface, session: Session, g: Guard, epoch: nu
 async function armIdle($: EngineInterface, session: Session, g: Guard, epoch: number) {
   if (g.idleMs <= 0 || lastMain === null || (contextReading().tokens ?? 0) < g.minContext) return
   const isOn = await read($, enabled)
-  if (!await stillHere($, session) || stale(epoch) || !isOn) return
+  if (await stillHere($, session) !== 'same' || stale(epoch) || !isOn) return
   const now = await $.clock.now()
-  if (!await stillHere($, session) || stale(epoch) || lastMain === null) return
+  if (!here(session) || stale(epoch) || lastMain === null) return
   const completedAt = g.completedAt ?? now
   const deadline = lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS - IDLE_HEADROOM_MS
   const earliest = Math.max(now, completedAt + IDLE_MIN_MINUTES * 60_000)
@@ -1128,17 +1206,16 @@ async function armIdle($: EngineInterface, session: Session, g: Guard, epoch: nu
   const at = Math.max(earliest, Math.min(completedAt + g.idleMs, deadline))
   guardPending = { at, kind: 'idle' }
   refreshUi($, session, now)
-  compactTimer = $.clock.after(at - now, () => void runIdle($, session, g, epoch, false).catch(() => {}))
+  scheduleCompact($, at - now, () => runIdle($, session, g, epoch, false))
 }
 
 // The cap compaction, retried when refused; if it never lands, the idle guard takes over for this turn.
 async function runCap($: EngineInterface, session: Session, g: Guard, epoch: number, attempt: number): Promise<void> {
-  if (!await stillHere($, session) || stale(epoch)) return
-  compactTimer = null
+  if (await stillHere($, session) !== 'same' || stale(epoch)) return
   const isOn = await read($, enabled)
-  if (!await stillHere($, session) || stale(epoch) || !isOn) return
+  if (await stillHere($, session) !== 'same' || stale(epoch) || !isOn) return
   const busy = await agentsBusy($)
-  if (!await stillHere($, session) || stale(epoch)) return
+  if (await stillHere($, session) !== 'same' || stale(epoch)) return
   if (busy !== 0) {
     await armIdle($, session, g, epoch)
     if (!stale(epoch) && compactTimer === null) {
@@ -1147,12 +1224,26 @@ async function runCap($: EngineInterface, session: Session, g: Guard, epoch: num
     }
     return
   }
+  const checkedAt = await $.clock.now()
+  if (!here(session) || stale(epoch)) return
+  if (!idleDue(checkedAt, 0)) {
+    clearGuard($)
+    skipCompact($, STR[g.lang].deadlinePassed)
+    return
+  }
   const outcome = await compactMain($, session, g.lang, 'cap')
-  if (!await stillHere($, session) || stale(epoch) || outcome === 'done') return
+  if (await stillHere($, session) !== 'same' || stale(epoch) || outcome === 'done') return
   if (outcome === 'rejected' && attempt < CAP_RETRIES) {
-    guardPending = { at: uiNow + CAP_RETRY_MS, kind: 'cap' }
+    const now = await $.clock.now()
+    if (!here(session) || stale(epoch)) return
+    if (!idleDue(now + CAP_RETRY_MS, 0)) {
+      clearGuard($)
+      skipCompact($, STR[g.lang].deadlinePassed)
+      return
+    }
+    guardPending = { at: now + CAP_RETRY_MS, kind: 'cap' }
     publishStatus($)
-    compactTimer = $.clock.after(CAP_RETRY_MS, () => void runCap($, session, g, epoch, attempt + 1).catch(() => {}))
+    scheduleCompact($, CAP_RETRY_MS, () => runCap($, session, g, epoch, attempt + 1))
     return
   }
   await armIdle($, session, g, epoch)
@@ -1192,6 +1283,10 @@ export const register: Register = (on, options) => {
   const shrinkToolOutput = outputLimit(options.shrinkToolOutput)
   const str = STR[lang]
   const guard: Guard = { lang, idleMs, minContext: compactMinContext }
+  const compactionText =
+    `idle ${idleMs > 0 ? `after ${idleMs / 60_000} min` : 'off'} · cap ${capOn ? `at ${fmtTokens(compactAtContext)}` : 'off'} · ` +
+    `min context ${fmtTokens(compactMinContext)}. Changing plugin options reloads the plugin with the new values. ` +
+    'Explicit checkpoints remain available when the router is off.'
   uiLang = lang
   const settings = {
     language: lang, mainRouting, blockFable, haikuModel: ids.haiku, sonnetModel: ids.sonnet, opusModel: ids.opus,
@@ -1200,18 +1295,15 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     if (!activeSession || activeSession.id === e.sessionId) {
-      const session = { id: e.sessionId, ended: true }
-      sessionGeneration += 1
+      const session = newSession(e.sessionId, true)
       activeSession = session
       resetSession($)
-      await update($, route, r => activeSession === session ? null : r)
-      await update($, meter, m => activeSession === session ? { turn: EMPTY, today: EMPTY } : m)
     }
     return next(e)
   })
 
   on('session.start', async ($, e, next) => {
-    const session = await useSession($, true)
+    const session = await useSession($)
     if (!here(session)) return next(e)
     await $.command.register({
       name: 'model-router',
@@ -1256,22 +1348,20 @@ export const register: Register = (on, options) => {
         additionalProperties: false,
       },
     })
-    const stored = await $.store.get('enabled')
-    if (!await stillHere($, session)) return next(e)
+    const stored = await bookkeeping($, () => $.store.get('enabled'), compactEnabled, retryFor(session, 'enabled read'))
+    if (await stillHere($, session) !== 'same') return next(e)
     compactEnabled = stored !== false
     await update($, enabled, () => compactEnabled)
     const now = await $.clock.now()
-    await prune($, now)
-    const { today } = await totals($, now, true)
-    if (!await stillHere($, session)) return next(e)
-    await update($, meter, m => here(session) ? { turn: EMPTY, today } : m)
+    await bookkeeping($, () => prune($, now), undefined)
+    if (await stillHere($, session) !== 'same') return next(e)
     try {
       const usage = await $.session.usage()
-      if (!await stillHere($, session)) return next(e)
+      if (await stillHere($, session) !== 'same') return next(e)
       rateLimits = usage.rateLimits
       measuredContext = usage.context.tokens
       const model = priceKey(await $.session.model())
-      if (!await stillHere($, session)) return next(e)
+      if (await stillHere($, session) !== 'same') return next(e)
       sessionModel = model
     } catch {
       // No measurement yet.
@@ -1300,17 +1390,27 @@ export const register: Register = (on, options) => {
       // Keep the existing guard until compaction succeeds, including refusals on the immediate tick.
       try {
         const busy = await agentsBusy($)
-        if (!await stillHere($, session) || epoch !== timerEpoch || runningMain !== null) return { text: str.checkpointCancelled }
+        if (await stillHere($, session) !== 'same' || epoch !== timerEpoch || runningMain !== null) return { text: str.checkpointCancelled }
         if (busy !== 0) return { text: str.skipped(busy < 0 ? str.agentUnavailable : str.agentsBusy) }
+        await $.clock.now()
+        if (!here(session) || epoch !== timerEpoch || runningMain !== null) return { text: str.checkpointCancelled }
         // Explicit checkpoints work even with routing off; this is an immediate tick, not a queue behind work.
-        checkpointTimer = $.clock.after(0, () => void runCheckpoint($, session, lang, epoch, arg.slice('checkpoint'.length).trim()).catch(() => {}))
+        const timer = $.clock.after(0, () => {
+          if (checkpointTimer === timer) checkpointTimer = null
+          void runCheckpoint($, session, lang, epoch, arg.slice('checkpoint'.length).trim()).catch(() => {})
+        })
+        checkpointTimer = timer
         return { text: str.checkpointStarted }
       } finally {
         if (here(session)) checkpointRunning = false
       }
     }
-    if (arg === 'stats' || arg === '') return { text: await statsText($, session, lang) }
-    if (arg === 'status') return { text: await statusScreen($, session, lang, settings) }
+    if (arg === 'stats' || arg === '' || arg === 'status') {
+      const isOn = await read($, enabled)
+      if (await stillHere($, session) !== 'same') return { text: str.checkpointCancelled }
+      const compaction = `Compaction in this session: ${isOn ? 'router on' : 'router off, so no automatic compaction runs'} · ${compactionText}`
+      return { text: arg === 'status' ? await statusScreen($, session, lang, settings, compaction) : await statsText($, session, lang, compaction) }
+    }
     if (arg === 'context') return { text: await contextText($, session, lang, e.presentation?.columns ?? 80) }
     if (arg !== 'on' && arg !== 'off') return { text: str.usage }
     // setEnabled cancels a pending compaction when switching off.
@@ -1321,17 +1421,17 @@ export const register: Register = (on, options) => {
   on('session.measure', async ($, e, next) => {
     const session = await useSession($)
     if (!here(session)) return next(e)
-    if (!await stillHere($, session)) return next(e)
+    if (await stillHere($, session) !== 'same') return next(e)
     rateLimits = e.rateLimits
     measuredContext = e.context.tokens ?? measuredContext
     try {
       const model = priceKey(await $.session.model())
-      if (!await stillHere($, session)) return next(e)
+      if (await stillHere($, session) !== 'same') return next(e)
       sessionModel = model
     } catch {
       // Keep the last known model.
     }
-    if (!await stillHere($, session)) return next(e)
+    if (await stillHere($, session) !== 'same') return next(e)
     // With routing off, steps pass through without recording a send time. Do not keep an old cache deadline.
     if (!compactEnabled) {
       lastMain = null
@@ -1358,7 +1458,7 @@ export const register: Register = (on, options) => {
     const before = reading.tokens
     const model = (e.agentId === undefined ? undefined : agentModels.get(e.agentId) ?? agents.get(e.agentId)?.family) ?? reading.model
     const result = await next(e)
-    if (!await stillHere($, session)) return result
+    if (await stillHere($, session) !== 'same') return result
     if (owned) return result
     if (e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined) {
       if (request === mainRequestSequence) {
@@ -1384,26 +1484,26 @@ export const register: Register = (on, options) => {
     if (!(await read($, enabled)) || !isPersonOrigin(origin) || e.turnId !== undefined || e.text.trim() === '') {
       return next(e)
     }
-    if (!await stillHere($, session)) return next(e)
+    if (await stillHere($, session) !== 'same') return next(e)
     // The turn's tally starts here, so it includes the classifier's own call.
-    await update($, meter, m => here(session) ? { turn: EMPTY, today: (m ?? { today: EMPTY }).today } : m)
+    await bookkeeping($, () => update($, memberOf(meter, { requestId: session.stateId }), m => here(session) ? { turn: EMPTY, today: (m ?? { today: EMPTY }).today } : m), undefined)
     if (!mainRouting) return next(e)
-    let r = await classify($, session, lang, e.text, routed(await read($, route)))
-    if (!await stillHere($, session)) return next(e)
+    let r = await classify($, session, lang, e.text, routed(await read($, memberOf(route, { requestId: session.stateId }))))
+    if (await stillHere($, session) !== 'same') return next(e)
     if (r.sessionModel) {
       // Unrouted: nothing to rewrite and nothing to tell the model; turn.start still binds the reason for the band.
       pending = r
       pendingPrompt = e.text
       const entered = await next(e)
-      if (await stillHere($, session) && entered.drop !== undefined) {
+      if (await stillHere($, session) === 'same' && entered.drop !== undefined) {
         pending = null
         pendingPrompt = ''
       }
       return entered
     }
-    const shape = ((await $.store.get('shape')) as Shape | undefined) ?? { steps: 3, output: 800 }
+    const shape = ((await bookkeeping($, () => $.store.get('shape'), undefined, retryFor(session, 'shape read'))) as Shape | undefined) ?? { steps: 3, output: 800 }
     const now = await $.clock.now()
-    if (!await stillHere($, session)) return next(e)
+    if (await stillHere($, session) !== 'same') return next(e)
     const pinned = forcedModel(e.text) !== null
     const warm = warmRequest()
     if (pinned && r.model !== 'opus' && isWarmOpus(warm, now)) {
@@ -1415,12 +1515,12 @@ export const register: Register = (on, options) => {
       r = { ...r, keptFrom: r.model, model, effort: TIER_ROUTE[r.tier].effort }
       await count($, session, c => ({ ...c, cacheKeeps: c.cacheKeeps + 1 }))
     }
-    if (!await stillHere($, session)) return next(e)
+    if (await stillHere($, session) !== 'same') return next(e)
     // Set before next: next resolves only after the turn has started, and turn.start binds this route.
     pending = r
     pendingPrompt = e.text
     const entered = await next({ ...e, context: [...(e.context ?? []), assignmentContext(r)] })
-    if (await stillHere($, session) && entered.drop !== undefined) {
+    if (await stillHere($, session) === 'same' && entered.drop !== undefined) {
       // Held back by another plugin: no turn starts, so the route must not bind to the next one.
       pending = null
       pendingPrompt = ''
@@ -1432,7 +1532,7 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) cancelCompact($)
     const session = await useSession($)
     if (!here(session)) return next(e)
-    if (!await stillHere($, session)) return next(e)
+    if (await stillHere($, session) !== 'same') return next(e)
     // A subagent's or teammate's run is not a main turn: it neither takes the pending route nor inherits one.
     if (e.agentId !== undefined) return next(e)
     runningMain = e.turnId
@@ -1441,7 +1541,7 @@ export const register: Register = (on, options) => {
       pending = null
       turnSteps = 0
       turnOutput = 0
-      await update($, route, previous => here(session) ? r : previous)
+      await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? r : previous)
       if (r.sessionModel) {
         await logEvent($, session, 'main', 'turn route', 'session model', r.reason)
       } else {
@@ -1452,14 +1552,14 @@ export const register: Register = (on, options) => {
       // A turn without a person prompt (a task notification, an agent message, a scheduled prompt) is never
       // classified. While the previous route's cache is warm it continues that route: left on the session model it
       // would switch away from, and back to, the model the cache is on. Without a previous route it stays unrouted.
-      const prev = routed(await read($, route))
+      const prev = routed(await read($, memberOf(route, { requestId: session.stateId })))
       const now = await $.clock.now()
-      if (!await stillHere($, session)) return next(e)
+      if (await stillHere($, session) !== 'same') return next(e)
       if (prev && last && now - last.at <= CACHE_TTL_MS) {
         const r: Route = { ...prev, turnId: e.turnId, reason: str.inherited }
         turnSteps = 0
         turnOutput = 0
-        await update($, route, previous => here(session) ? r : previous)
+        await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? r : previous)
         await logEvent($, session, 'main', 'turn inherit', `${r.model}/${r.effort}`, r.reason)
       }
     }
@@ -1473,8 +1573,8 @@ export const register: Register = (on, options) => {
     if (!(await read($, enabled))) return yield* next(e)
     let model = e.model
     let effort = e.effort
-    const r = await read($, route)
-    if (!await stillHere($, session)) return yield* next(e)
+    const r = await read($, memberOf(route, { requestId: session.stateId }))
+    if (await stillHere($, session) !== 'same') return yield* next(e)
     const isMain = e.agentId === undefined
     let sub = e.agentId === undefined ? undefined : agents.get(e.agentId)
     if (sub && e.agentId !== undefined && resumed.delete(e.agentId) && sub.effort === undefined) {
@@ -1503,10 +1603,10 @@ export const register: Register = (on, options) => {
     }
     // When the request was sent: the cache is touched then, and a long streamed response must not stretch the TTL.
     const sentAt = isMain ? await $.clock.now() : 0
-    if (!await stillHere($, session)) return yield* next(e)
+    if (await stillHere($, session) !== 'same') return yield* next(e)
     const result =
       model === e.model && effort === e.effort ? yield* next(e) : yield* next({ ...e, model, effort })
-    if (!await stillHere($, session)) return result
+    if (await stillHere($, session) !== 'same') return result
     const u = result?.usage
     if (e.agentId !== undefined) {
       const family = familyOf(u?.model || model)
@@ -1515,12 +1615,12 @@ export const register: Register = (on, options) => {
     if (u) {
       const key = priceKey(u.model || model)
       const now = await $.clock.now()
-      if (!await stillHere($, session)) return result
+      if (await stillHere($, session) !== 'same') return result
       // Read before `last` moves on: a main step that switched family within the TTL is priced for what it cost.
       // Send time, like lastMain: the cache is touched when the request goes out, not when a long reply ends.
       const switched = isMain && isSwitchStep(last, key, sentAt)
       await record($, session, u.model || model, u, switched, false, isMain ? 'main' : 'subagents')
-      if (!await stillHere($, session)) return result
+      if (await stillHere($, session) !== 'same') return result
       if (isMain) {
         // A cache rewrite after the TTL: the person was away over an hour and the whole context was written again.
         // Also the first request of this process (a --resume): nothing was read from the cache and a big context was
@@ -1538,7 +1638,7 @@ export const register: Register = (on, options) => {
             cacheExpiryRewriteCost: (c.cacheExpiryRewriteCost ?? 0) + cost,
           }))
         }
-        if (!await stillHere($, session)) return result
+        if (await stillHere($, session) !== 'same') return result
         justCompacted = false
         mainRequestSequence += 1
         lastMain = { at: sentAt, context: tokensOf(u) - u.output_tokens }
@@ -1557,10 +1657,10 @@ export const register: Register = (on, options) => {
           await count($, session, c => ({ ...c, modelMismatch: (c.modelMismatch ?? 0) + 1 }))
         }
       }
-      if (!await stillHere($, session)) return result
+      if (await stillHere($, session) !== 'same') return result
       if (e.agentId !== undefined && sub) {
-        log.stats[e.agentId] = addUsage(log.stats[e.agentId], u.model || model, effort === undefined ? undefined : String(effort), u)
-        await persist($, session)
+        logs.usage(session.id, e.agentId, u.model || model, effort === undefined ? undefined : String(effort), u)
+        void logs.flush(logIO($))
       }
     }
     return result
@@ -1591,7 +1691,7 @@ export const register: Register = (on, options) => {
         if (reduced.length >= original.length) continue
         // Archive first. A failed write leaves this row untouched, even if earlier blocks were candidates.
         await $.fs.write(path, original)
-        if (!await stillHere($, session) || !compactEnabled) return next(e)
+        if (await stillHere($, session) !== 'same' || !compactEnabled) return next(e)
         content[i] = { ...block, content: typeof block.content === 'string' ? reduced : [{ ...parts![0], type: 'text', text: reduced }] }
         reductions++
         removed += original.length - reduced.length
@@ -1600,7 +1700,7 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     const result = await next({ ...e, message: { ...e.message, content } })
-    if (await stillHere($, session) && reductions) await count($, session, c => ({ ...c, outputReductions: (c.outputReductions ?? 0) + reductions, outputCharsRemoved: (c.outputCharsRemoved ?? 0) + removed }))
+    if (await stillHere($, session) === 'same' && reductions) await count($, session, c => ({ ...c, outputReductions: (c.outputReductions ?? 0) + reductions, outputCharsRemoved: (c.outputCharsRemoved ?? 0) + removed }))
     return result
   })
 
@@ -1617,7 +1717,7 @@ export const register: Register = (on, options) => {
       const path = outputPath(logDir($.plugin.root), session.id, input.id)
       if (!path) return { result: str.fetchInvalid }
       const selected = outputSlice(await $.fs.read(path), startLine, endLine, pattern as string | undefined)
-      if (!await stillHere($, session)) return { result: str.checkpointCancelled }
+      if (await stillHere($, session) !== 'same') return { result: str.checkpointCancelled }
       const rest = selected.slice(offset)
       if (rest.length <= shrinkToolOutput) return { result: rest }
       // Reserve space for a continuation instruction; even a single enormous line can be paged without loss.
@@ -1663,14 +1763,14 @@ export const register: Register = (on, options) => {
       await logEvent($, session, input.agentId, 'escalated', describeTier(up), input.reason ?? 'no reason given')
       return { result: `Escalated to ${describeTier(up)} from your next step.` }
     }
-    const r = await read($, route)
-    if (!await stillHere($, session)) return { result: str.checkpointCancelled }
+    const r = await read($, memberOf(route, { requestId: session.stateId }))
+    if (await stillHere($, session) !== 'same') return { result: str.checkpointCancelled }
     if (!mainRouting || !r || r.turnId === null || r.sessionModel) {
       return { result: 'No routed turn here: escalate only applies to the main conversation of a routed turn. Carry on.' }
     }
     const out = applyEscalation(r, input)
     if (!out.ok) return { result: `Not changed: ${out.why}. Carry on with the current route.` }
-    await update($, route, previous => here(session) ? out.route : previous)
+    await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? out.route : previous)
     await count($, session, c => ({
       ...c,
       escalations: c.escalations + 1,
@@ -1685,11 +1785,19 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const session = await useSession($)
     if (!here(session)) return next(e)
-    const ran = await next(e)
-    if (!await stillHere($, session)) return ran
+    const asked = AGENT_TOOLS.includes(e.tool) ? (e as { effort?: unknown }).effort : undefined
+    if (typeof asked === 'string' && (EFFORTS as string[]).includes(asked)) askedEffort.set(e.tool_use_id, asked as Effort)
+    let ran: Awaited<ReturnType<typeof next>>
+    try {
+      ran = await next(e)
+    } finally {
+      // Read by the spawn inside this call, or never: a call that spawned nothing must not leave it behind.
+      if (here(session)) askedEffort.delete(e.tool_use_id)
+    }
+    if (await stillHere($, session) !== 'same') return ran
     const s = e.agentId === undefined ? undefined : agents.get(e.agentId)
     if (e.agentId === undefined || s === undefined || e.tool === TOOL_CALL || !(await read($, enabled))) return ran
-    if (!await stillHere($, session)) return ran
+    if (await stillHere($, session) !== 'same') return ran
     const failed = ran.deny === undefined && ran.isError === true
     const errorsInARow = failed ? s.errorsInARow + 1 : 0
     const up = errorsInARow >= AUTO_ESCALATE_AFTER ? stepUp(s, ids) : undefined
@@ -1724,7 +1832,7 @@ export const register: Register = (on, options) => {
     if (!(await read($, enabled)) || e.fork || e.workflow !== undefined) return next(e)
     if (e.resume !== undefined) {
       const ran = await next(e)
-      if (!await stillHere($, session)) return ran
+      if (await stillHere($, session) !== 'same') return ran
       // A reload loses tracking, but a resume must keep the engine's model and effort and any entry still here.
       if (ran.deny === undefined && ran.agentId !== undefined && !agents.has(ran.agentId)) {
         agents.set(ran.agentId, { ...startOf(ran.model, e.parentModel, false, ids), model: ran.model })
@@ -1737,10 +1845,10 @@ export const register: Register = (on, options) => {
     if (failure !== undefined) await countFailure($, session, failure)
     const failureText = verdict && !verdict.ok ? failText(verdict) : undefined
     const ok = verdict?.ok ? verdict.verdict : null
-    if (!await stillHere($, session)) return next(e)
+    if (await stillHere($, session) !== 'same') return next(e)
     const d = decideSpawn(e, ok?.tier ?? null, ok?.sure ?? true, blockFable)
     const ran = await next(d?.model === undefined ? e : { ...e, model: d.model })
-    if (!await stillHere($, session)) return ran
+    if (await stillHere($, session) !== 'same') return ran
     try {
       if (ran.deny === undefined && ran.agentId !== undefined) {
         const model = d?.model
@@ -1753,8 +1861,11 @@ export const register: Register = (on, options) => {
             fableBlocked: c.fableBlocked + (d?.fable ? 1 : 0),
           }))
         }
-        if (!await stillHere($, session)) return ran
-        const s = startOf(ran.model, e.parentModel, model !== undefined, ids)
+        if (await stillHere($, session) !== 'same') return ran
+        const started = startOf(ran.model, e.parentModel, model !== undefined, ids, model === undefined && isCallerPin(e.model))
+        // An effort the caller set explicitly is kept, router pin or not; the hard cap (high) still applies per step.
+        const explicit = askedEffort.get(e.tool_use_id)
+        const s = explicit === undefined ? started : { ...started, effort: capSent(explicit) as Effort }
         agents.set(ran.agentId, s)
         // A failed classification keeps today's fallback (sonnet) and says why.
         const why = failureText !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failureText})`) : d?.reason
@@ -1775,36 +1886,36 @@ export const register: Register = (on, options) => {
     if (!here(session) || (entrySession !== undefined && session !== entrySession)) return next(e)
     // Completion still reaches the engine when the compaction path has been cancelled.
     const done = await next(e)
-    if (!await stillHere($, session)) return done
+    if (await stillHere($, session) !== 'same') return done
     if (e.agentId === undefined && runningMain === e.turnId) runningMain = null
     // An agent ending can make the last busy count stale before the scheduled re-check.
     if (e.agentId !== undefined && guardPending?.waiting !== undefined) {
       const pending = guardPending
       const busy = await agentsBusy($)
-      if (await stillHere($, session) && guardPending === pending && !stale(epoch)) {
+      if (await stillHere($, session) === 'same' && guardPending === pending && !stale(epoch)) {
         guardPending = { ...pending, waiting: busy === 0 ? undefined : busy }
         publishStatus($)
       }
     }
-    if (!await stillHere($, session) || stale(epoch)) return done
-    const r = await read($, route)
-    if (!await stillHere($, session) || stale(epoch)) return done
+    if (await stillHere($, session) !== 'same' || stale(epoch)) return done
+    const r = await bookkeeping($, () => read($, memberOf(route, { requestId: session.stateId })), null)
+    if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     if (e.agentId === undefined && r && r.turnId === e.turnId && turnSteps > 0) {
       // A slow average of the turn's shape feeds the warm-cache decision.
-      const prev = ((await $.store.get('shape')) as Shape | undefined) ?? { steps: 3, output: 800 }
-      if (!await stillHere($, session) || stale(epoch)) return done
+      const prev = ((await bookkeeping($, () => $.store.get('shape'), undefined, retryFor(session, 'shape read'))) as Shape | undefined) ?? { steps: 3, output: 800 }
+      if (await stillHere($, session) !== 'same' || stale(epoch)) return done
       const output = turnOutput / turnSteps
-      await $.store.set('shape', { steps: prev.steps * 0.8 + turnSteps * 0.2, output: prev.output * 0.8 + output * 0.2 })
-      if (!await stillHere($, session) || stale(epoch)) return done
+      await bookkeeping($, () => $.store.set('shape', { steps: prev.steps * 0.8 + turnSteps * 0.2, output: prev.output * 0.8 + output * 0.2 }), undefined, retryFor(session, 'shape write'))
+      if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     }
     const isOn = await read($, enabled)
-    if (!await stillHere($, session) || stale(epoch) || !isOn) return done
+    if (await stillHere($, session) !== 'same' || stale(epoch) || !isOn) return done
     if (e.agentId === undefined && !e.isAborted && r && r.turnId === e.turnId && r.model === 'opus') {
       void maybeReview($, session, lang, reviewModel, pendingPrompt, e.answer)
     }
     if (e.agentId === undefined && !e.isAborted && checkpointHints) {
       const now = await $.clock.now()
-      if (!await stillHere($, session) || stale(epoch) || runningMain !== null) return done
+      if (await stillHere($, session) !== 'same' || stale(epoch) || runningMain !== null) return done
       const { tokens = 0, model } = contextReading()
       if (!(capOn && tokens >= compactAtContext) && tokens >= compactMinContext && checkpointPays(tokens, model) &&
         (!lastHint || tokens >= lastHint.context * CHECKPOINT_GROWTH || now - lastHint.at >= CHECKPOINT_COOLDOWN_MS)) {
@@ -1813,17 +1924,23 @@ export const register: Register = (on, options) => {
       }
     }
     if (e.agentId === undefined && (capOn || idleMs > 0)) {
+      if (await stillHere($, session) !== 'same' || stale(epoch)) return done
       const completedAt = await $.clock.now()
-      if (!await stillHere($, session) || stale(epoch)) return done
+      if (!here(session) || stale(epoch)) return done
       const g = { ...guard, completedAt }
       // Replace an earlier timer without moving past a cancel that landed during this completion.
       compactTimer?.cancel()
       compactTimer = null
       if (!e.isAborted && capOn && lastMain !== null && (contextReading().tokens ?? 0) >= compactAtContext) {
+        if (!idleDue(completedAt, 0)) {
+          clearGuard($)
+          skipCompact($, str.deadlinePassed)
+          return done
+        }
         // The hook runs as the turn ends and compact rejects while a turn runs, so it goes on the next tick of the clock.
         guardPending = { at: completedAt, kind: 'cap' }
         refreshUi($, session, completedAt)
-        compactTimer = $.clock.after(0, () => void runCap($, session, g, epoch, 0).catch(() => {}))
+        scheduleCompact($, 0, () => runCap($, session, g, epoch, 0))
       } else {
         await armIdle($, session, g, epoch)
       }
@@ -1832,14 +1949,14 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const session = await useSession($, false, true)
+    const session = await useSession($)
     if (!here(session)) return next(e)
     const below = await next(e)
-    if (!await stillHere($, session)) return below
+    if (await stillHere($, session) !== 'same') return below
     if (e.props.hasSurvey) return below
     const { Box, Text, Button } = $.ui.resolve(e)
     const exposure = exposureText(lang, await $.clock.now(), e.props.bodyColumns)
-    if (!await stillHere($, session)) return below
+    if (await stillHere($, session) !== 'same') return below
     const narrow = e.props.bodyColumns < 100
 
     if (!(await read($, enabled))) {
@@ -1855,9 +1972,9 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const r = session.bound ? await read($, route) : null
-    const m = (session.bound ? await read($, meter) : null) ?? { turn: EMPTY, today: session.today ?? EMPTY }
-    if (!await stillHere($, session)) return below
+    const r = await bookkeeping($, () => read($, memberOf(route, { requestId: session.stateId })), null)
+    const m = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), { turn: EMPTY, today: session.today ?? EMPTY })
+    if (await stillHere($, session) !== 'same') return below
     const routeText = !r
       ? ''
       : r.sessionModel
@@ -1866,10 +1983,11 @@ export const register: Register = (on, options) => {
           (r.keptFrom ? ` → ${LABEL[r.model]} (${str.kept})` : '') +
           (r.trail.length > 0 ? ` → ${r.trail.join(' → ')}` : '') +
           (r.reason ? ` — ${r.reason}` : '')
-    const s = saved(m.today)
+    const today = session.today ?? m.today
+    const s = saved(today)
     const meterText =
       `${str.turn} ${fmtTokens(m.turn.tokens)} token · ${fmtUsd(m.turn.cost)}   ` +
-      `${str.today} ${fmtTokens(m.today.tokens)} token · ${fmtUsd(m.today.cost)}, ${str.save} ≈${fmtUsd(s.usd)} (${s.pct}%) ${str.vs}`
+      `${str.today} ${fmtTokens(today.tokens)} token · ${fmtUsd(today.cost)}, ${str.save} ≈${fmtUsd(s.usd)} (${s.pct}%) ${str.vs}`
 
     // No route, or no room for it: the meter takes the gear's row, so there is no empty route row.
     if (!r || narrow) {
