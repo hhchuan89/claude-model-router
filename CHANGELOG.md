@@ -20,14 +20,14 @@ their first step.
   result; make small changes directly.
 
 ### Changed
-- A subagent the caller pinned to Haiku, Sonnet or Opus (a model the router left as named) now starts at medium, like
-  the agents the router pins. It used to run at the session's effort, capped at high: 30 such agents ran 1,649 steps at
-  high. The model stays the caller's; `inherit`, unknown ids and Fable are unchanged, and the ladder and `escalate`
-  still raise it.
+- A subagent the caller pinned to a model below the parent's tier (Haiku or Sonnet under Opus, Haiku under Sonnet) now
+  starts at medium, like the agents the router pins. It used to run at the session's effort, capped at high: 30 such agents ran 1,649 steps at
+  high. The model stays the caller's; the ladder and `escalate` still raise it. A pin on the parent's own tier (Opus
+  under Opus) is an inherit in all but name and keeps the session's effort, as do `inherit`, unknown ids and Fable.
 - The classifier calls work `execute` only when what to change is settled in the message or the visible context.
   "Implement it", "add it to the PR", "cherry-pick it" with the change still to be worked out is `decide`, as is
-  working out how a change to business rules, production data, stored procedures or queries should behave, and porting
-  to a branch whose code differs. All 9 Sonnet turns that escalated were of this kind (3 were older
+  working out how a change to business rules, production data or stored procedures should behave, and porting to a
+  branch whose code differs. An approved plan in the context still makes "implement it" execute. All 9 Sonnet turns that escalated were of this kind (3 were older
   classifier-failure fallbacks, gone since 0.7.0).
 
 ## [0.9.2] - 2026-10-30

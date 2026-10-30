@@ -27,7 +27,7 @@ everything on Opus. The numbers are one person's working day, not a typical resu
 |------|----------------|-----------------|
 | lookup | Haiku · medium | Retrieval and mechanical work with nothing to judge: find/grep/list, read a value or status, run a named command, rename, typo, format, short translation |
 | execute | Sonnet · medium | Work whose "what" is settled in the message or visible context: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan |
-| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or procs should behave, porting to a branch whose code differs, anything irreversible or outward-facing |
+| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs, anything irreversible or outward-facing |
 
 1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
@@ -73,7 +73,7 @@ everything on Opus. The numbers are one person's working day, not a typical resu
    `Explore` runs on Haiku · medium; `general-purpose` is sorted by the same classifier (lookup → Haiku · medium,
    execute → Sonnet · medium, decide → inherits the parent's model, never a pinned Opus; if classification fails,
    Sonnet). Pinned subagents start at medium on every model, whether the router pinned them or the caller named a
-   Haiku, Sonnet or Opus model (the caller's model is kept), because effort can be raised later, by the agent or by
+   model below the parent's tier (the caller's model is kept; a pin on the parent's own tier keeps the session effort), because effort can be raised later, by the agent or by
    the automatic ladder below. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
    workflow agents. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
    capped at the parent's tier.

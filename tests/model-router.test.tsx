@@ -2035,6 +2035,22 @@ describe('caller-pinned subagents start at medium (v0.10.0)', () => {
     expect(stepUp(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true), IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
   })
 
+  // WHY: an Opus pin under an Opus parent is an inherit in all but name. At medium it would sit at the self cap
+  // (opus/medium) with no way up of its own, and it used to run at the session effort.
+  test('a pin on the parent tier keeps the session effort: opus under opus, sonnet under sonnet', async () => {
+    expect(startOf(OPUS, OPUS, false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf('claude-sonnet-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true).effort).toBe('medium')
+    expect(startOf('claude-haiku-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBe('medium')
+  })
+
+  test('an opus the caller named under an opus parent runs at the session effort, capped at high', async ($, on) => {
+    const seen = world($, on, execute)
+    const id = await spawnAgent($, { model: 'opus' })
+    await step($, 'sub', OPUS, id, 'xhigh')
+    expect(seen.steps.at(-1)).toMatchObject({ model: OPUS, effort: 'high' })
+  })
+
   test('an inheriting agent, `inherit` and an unknown id keep the session effort, as before', async () => {
     expect(startOf(OPUS, OPUS, false, IDS_BY_KEY).effort).toBeUndefined()
     expect(isCallerPin(undefined)).toBe(false)
@@ -2051,7 +2067,10 @@ describe('execute needs a settled plan; opus delegates settled work (v0.10.0)', 
   test('the classifier calls work execute only when what to change is visible', async () => {
     const text = classifierSystem('en')
     expect(text).toContain('already settled in the message or the context you can see')
-    expect(text).toContain('is execute only when the context shows exactly')
+    expect(text).toContain('is execute when the context shows what to\n  change (an approved plan')
+    expect(text).toContain('When what to change still has to be worked out, it is decide.')
+    // An approved plan stays execute: the new rule must not contradict the old one.
+    expect(text).toContain('is execute, because the plan settles what to do')
     expect(text).toContain('porting a change to a branch whose version of the code differs')
   })
 

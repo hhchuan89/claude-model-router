@@ -21,20 +21,21 @@ lookup (fast model): pure retrieval or mechanical work with nothing to judge —
   or status, run a command the user named and report the output, rename, fix a typo, format, translate a short text,
   look up a fact or a doc.
 execute (mid model): doing work whose "what" is already settled in the message or the context you can see — a plan, a
-  spec or an exact instruction: implement a clearly specified change, fix a bug whose cause is known, write tests, refactor to a stated target, write docs or a report from known material, extract or
-  transform data, explain how existing code works, carry out a plan that was already agreed.
+  spec or an exact instruction: implement a clearly specified change, fix a bug whose cause is known, write tests,
+  refactor to a stated target, write docs or a report from known material, extract or transform data, explain how
+  existing code works, carry out a plan that was already agreed.
 decide (top model): anything that needs judgment before acting — design or architecture, choosing between approaches,
   trade-offs, planning multi-step or multi-file work, finding the root cause of an unexplained failure, security or
   correctness review, research synthesis or recommendations, evaluating quality, ambiguous requests that need
-  interpreting, working out how a change to business rules, production data, stored procedures or queries should
-  behave, porting a change to a branch whose version of the code differs, and anything irreversible or outward-facing
+  interpreting, working out how a change to business rules, production data or stored procedures should behave,
+  porting a change to a branch whose version of the code differs, and anything irreversible or outward-facing
   (deploy, push, delete, money, production, messages to people).
 
 Rules:
 - A short reply that continues the previous turn ("做吧", "yes", "继续", "go on") keeps the previous tier,
-  except: approving a plan that was just made ("照这个做", "开始吧") is execute.
-- "Implement it", "add it to the PR", "commit the fixes" or "cherry-pick it" is execute only when the context shows exactly
-  what to change. When what to change still has to be worked out, it is decide.
+  except: approving a plan that was just made ("照这个做", "开始吧") is execute, because the plan settles what to do.
+- "Implement it", "add it to the PR", "commit the fixes" or "cherry-pick it" is execute when the context shows what to
+  change (an approved plan, a spec, an exact instruction). When what to change still has to be worked out, it is decide.
 - If a message mixes tiers, use the highest one it contains.
 - When unsure between two tiers, pick the higher one.
 - sure: set false when the message is ambiguous, could reasonably be read at two tiers, or depends on context you cannot

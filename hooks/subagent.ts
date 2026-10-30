@@ -115,8 +115,10 @@ export type AgentTier = {
 }
 
 // The tier a started agent is on: what the engine resolved it to, and whether this router pinned it.
-// callerPinned: the caller named a model the router left as it was. Its model is the caller's, but it starts at medium
-// like a router pin: otherwise it ran at the session's effort (high, once capped), against "every tier starts at medium".
+// callerPinned: the caller named a model the router left as it was. Below the parent's tier its model is the caller's but
+// it starts at medium like a router pin: otherwise it ran at the session's effort (high, once capped), against "every tier
+// starts at medium". On the parent's own tier it is an inherit in all but name and keeps the session's effort: an Opus
+// pin at medium would sit at the self cap with no way up of its own.
 export function startOf(
   resolved: string | undefined,
   parentModel: string,
@@ -129,7 +131,7 @@ export function startOf(
   return {
     tier,
     model: isPinned ? ids[tier] : undefined,
-    effort: isPinned || callerPinned ? START_EFFORT[tier] : undefined,
+    effort: isPinned || (callerPinned && RANK[tier] < RANK[ceiling]) ? START_EFFORT[tier] : undefined,
     ceiling,
     parentModel,
     errorsInARow: 0,
