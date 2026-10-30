@@ -114,11 +114,16 @@ export type AgentTier = {
   retriedAtTier: boolean
 }
 
+// Whether a tier starting at its starting effort can still raise its effort by itself.
+function roomToRise(tier: ModelKey): boolean {
+  return EFFORTS.indexOf(START_EFFORT[tier]) < EFFORTS.indexOf(SELF_EFFORT_CAP[tier])
+}
+
 // The tier a started agent is on: what the engine resolved it to, and whether this router pinned it.
-// callerPinned: the caller named a model the router left as it was. Below the parent's tier its model is the caller's but
-// it starts at medium like a router pin: otherwise it ran at the session's effort (high, once capped), against "every tier
-// starts at medium". On the parent's own tier it is an inherit in all but name and keeps the session's effort: an Opus
-// pin at medium would sit at the self cap with no way up of its own.
+// callerPinned: the caller named a model the router left as it was. Its model is the caller's but it starts at medium like
+// a router pin: otherwise it ran at the session's effort (high, once capped), against "every tier starts at medium".
+// Except where medium is already the tier's own effort cap (Opus): there it would sit at the self cap with no way up of
+// its own, so an Opus pin keeps the session's effort, as before.
 export function startOf(
   resolved: string | undefined,
   parentModel: string,
@@ -131,7 +136,7 @@ export function startOf(
   return {
     tier,
     model: isPinned ? ids[tier] : undefined,
-    effort: isPinned || (callerPinned && RANK[tier] < RANK[ceiling]) ? START_EFFORT[tier] : undefined,
+    effort: isPinned || (callerPinned && roomToRise(tier)) ? START_EFFORT[tier] : undefined,
     ceiling,
     parentModel,
     errorsInARow: 0,

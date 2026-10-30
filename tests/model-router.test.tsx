@@ -1978,14 +1978,21 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     // WHY: a session started before the settings changed ran all day at 950k with the guard off, and nothing said so.
     test('stats name the compaction settings this session loaded, and say off when they are off', async ($, on) => {
       compactWorld($, on)
-      expect(await statsOf($)).toContain('Compaction in this session: idle off · cap off.')
+      expect(await statsOf($)).toContain('Compaction in this session: router on · idle off · cap off · min context 100.0k.')
     })
 
     test('stats show loaded idle minutes and cap', { options: { idleCompactMinutes: 50, compactAtContext: 300_000 } }, async ($, on) => {
       compactWorld($, on)
       const text = await statsOf($)
-      expect(text).toContain('Compaction in this session: idle after 50 min · cap at 300.0k.')
-      expect(text).toContain('restart it after changing them')
+      expect(text).toContain('Compaction in this session: router on · idle after 50 min · cap at 300.0k · min context 100.0k.')
+      expect(text).toContain('reload plugins or restart the session')
+    })
+
+    // WHY: off stops both guards; a line that still lists thresholds reads as if compaction ran.
+    test('with the router off the line says no compaction runs', { options: { compactAtContext: 300_000 } }, async ($, on) => {
+      compactWorld($, on)
+      await $.command.run({ command: 'model-router', args: 'off' } as never)
+      expect(await statsOf($)).toContain('Compaction in this session: router off, so no compaction runs · idle off · cap at 300.0k')
     })
 
     test('every compaction attempt lands in the events log with its outcome', { options: { compactAtContext: 200_000 } }, async ($, on) => {
@@ -2035,11 +2042,12 @@ describe('caller-pinned subagents start at medium (v0.10.0)', () => {
     expect(stepUp(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true), IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
   })
 
-  // WHY: an Opus pin under an Opus parent is an inherit in all but name. At medium it would sit at the self cap
-  // (opus/medium) with no way up of its own, and it used to run at the session effort.
-  test('a pin on the parent tier keeps the session effort: opus under opus, sonnet under sonnet', async () => {
+  // WHY: medium is Opus's own self cap: an Opus pin at medium could never raise itself, and it used to run at the
+  // session effort. Sonnet and Haiku at medium can still go to high by themselves, so they start at medium anywhere.
+  test('an opus pin keeps the session effort; sonnet and haiku pins start at medium, even on the parent tier', async () => {
     expect(startOf(OPUS, OPUS, false, IDS_BY_KEY, true).effort).toBeUndefined()
-    expect(startOf('claude-sonnet-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf(OPUS, 'claude-fable-5-1', false, IDS_BY_KEY, true).effort).toBeUndefined()
+    expect(startOf('claude-sonnet-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBe('medium')
     expect(startOf('claude-sonnet-5-5', OPUS, false, IDS_BY_KEY, true).effort).toBe('medium')
     expect(startOf('claude-haiku-5-5', 'claude-sonnet-5-5', false, IDS_BY_KEY, true).effort).toBe('medium')
   })
@@ -2081,3 +2089,38 @@ describe('execute needs a settled plan; opus delegates settled work (v0.10.0)', 
   })
 })
 
+describe('an effort the caller sets on the Agent tool is kept (v0.10.0, review P2)', () => {
+  // WHY: Agent({ model: "sonnet", effort: "high" }) is an explicit request; starting it at medium silently overrode it.
+  function agentWorld($: any, on: any) {
+    const seen = world($, on, execute)
+    const ids: string[] = []
+    // As the engine does: the Agent tool call spawns the subagent while the call runs, under the same tool_use_id.
+    on('tool.call', async (_$: unknown, e: any) => {
+      if (e.tool === 'Agent') ids.push(await spawnAgent($, { tool_use_id: e.tool_use_id, model: e.model, subagentType: e.subagent_type ?? 'general-purpose' }))
+      return { result: 'ok' } as never
+    })
+    return { seen, ids }
+  }
+
+  test('a caller pin with an explicit effort runs at that effort, not at medium', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-1', model: 'sonnet', effort: 'high', prompt: 'p' } as never)
+    await step($, 'sub', 'claude-sonnet-5-5', ids[0], 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+  })
+
+  test('a router pin with an explicit effort keeps it too; the hard cap still holds', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-2', effort: 'max', prompt: 'p', subagent_type: 'Explore' } as never)
+    await step($, 'sub', OPUS, ids[0], 'max')
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+  })
+
+  test('without an explicit effort the pin starts at medium; one call never leaks its effort into the next', async ($, on) => {
+    const { seen, ids } = agentWorld($, on)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-3', model: 'sonnet', effort: 'high', prompt: 'p' } as never)
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'call-4', model: 'sonnet', prompt: 'p' } as never)
+    await step($, 'sub', 'claude-sonnet-5-5', ids[1], 'high')
+    expect(seen.steps.at(-1)).toMatchObject({ effort: 'medium' })
+  })
+})

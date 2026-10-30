@@ -10,9 +10,9 @@ but never loaded, caller-pinned Sonnet subagents ran at high, and 9 of 37 Sonnet
 their first step.
 
 ### Added
-- `/model-router stats` starts with the compaction settings this session loaded ("Compaction in this session: idle
-  after 50 min · cap at 300.0k", or "off"). Options load when a session starts, so a session started before a
-  settings change keeps the old values; the line makes that visible.
+- `/model-router stats` starts with the compaction settings this session loaded ("Compaction in this session: router
+  on · idle after 50 min · cap at 300.0k · min context 100.0k"). With the router off it says no compaction runs. A
+  session whose plugin has not reloaded since a settings change keeps the old values; the line makes that visible.
 - Every compaction attempt the router makes is written to the events log as `compact idle` or `compact cap`, with the
   outcome (`done`, `skipped` with the veto, `rejected` with the engine error) and, when done, the size before and after.
 - The Opus assignment now says: once the plan is settled and carrying it out spans several files or many steps,
@@ -20,10 +20,12 @@ their first step.
   result; make small changes directly.
 
 ### Changed
-- A subagent the caller pinned to a model below the parent's tier (Haiku or Sonnet under Opus, Haiku under Sonnet) now
-  starts at medium, like the agents the router pins. It used to run at the session's effort, capped at high: 30 such agents ran 1,649 steps at
-  high. The model stays the caller's; the ladder and `escalate` still raise it. A pin on the parent's own tier (Opus
-  under Opus) is an inherit in all but name and keeps the session's effort, as do `inherit`, unknown ids and Fable.
+- A subagent the caller pinned to Haiku or Sonnet now starts at medium, like the agents the router pins. It used to run at the session's effort, capped at high: 30 such agents ran 1,649 steps at
+  high. The model stays the caller's; the ladder and `escalate` still raise it. An Opus pin keeps the session's effort:
+  medium is Opus's own self cap, so it could never raise itself. `inherit`, unknown ids and Fable are unchanged.
+- An effort the caller sets on the Agent tool (`Agent({ model: "sonnet", effort: "high" })`) is kept, for router and
+  caller pins alike, instead of being replaced by the starting medium; the hard cap (high) still applies. Router pins
+  had overridden it since 0.5.0. Found by Muhafiz Madzlan's review of this release.
 - The classifier calls work `execute` only when what to change is settled in the message or the visible context.
   "Implement it", "add it to the PR", "cherry-pick it" with the change still to be worked out is `decide`, as is
   working out how a change to business rules, production data or stored procedures should behave, and porting to a

@@ -72,8 +72,9 @@ everything on Opus. The numbers are one person's working day, not a typical resu
 5. **Route subagents.** A subagent spawned without a model gets one by its job, decided when it starts:
    `Explore` runs on Haiku · medium; `general-purpose` is sorted by the same classifier (lookup → Haiku · medium,
    execute → Sonnet · medium, decide → inherits the parent's model, never a pinned Opus; if classification fails,
-   Sonnet). Pinned subagents start at medium on every model, whether the router pinned them or the caller named a
-   model below the parent's tier (the caller's model is kept; a pin on the parent's own tier keeps the session effort), because effort can be raised later, by the agent or by
+   Sonnet). Pinned subagents start at medium on every model, whether the router pinned them or the caller named Haiku or
+   Sonnet (the caller's model is kept; an Opus pin keeps the session effort, since medium is Opus's self cap), unless
+   the Agent call set an effort, which is kept, because effort can be raised later, by the agent or by
    the automatic ladder below. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
    workflow agents. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
    capped at the parent's tier.
@@ -185,8 +186,8 @@ own effort. `stats` covers routed subagents only.
 
 Every model request (the router's own Haiku calls included) is priced at Anthropic API rates and added to the turn,
 the day and the all-time totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
-`/model-router stats` first names the compaction settings this session loaded (options load when a session starts:
-restart sessions after changing them), then shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
+`/model-router stats` first names the compaction settings this session loaded and whether the router is on (if a
+settings change does not show, reload plugins or restart the session), then shows today and all time by model, plus how many turns went to each tier, escalations, warm-cache
 keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus, model mismatches (routed model not the one that answered),
 classifier failures by reason and escalations to max effort (main thread only, counted when effort moves to
 max from below).

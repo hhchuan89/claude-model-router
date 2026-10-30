@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { ModelKey, Route, Tally, Tier } from '../types'
+import type { Effort, ModelKey, Route, Tally, Tier } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
 import { add, CACHE_TTL_MS, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, PRICES, priceKey, saved, tokensOf } from './meter'
 import { isPersonOrigin } from './origin'
@@ -97,6 +97,11 @@ const COMPACT_INSTRUCTIONS =
   'Keep the current task and its goal, the decisions made and why, open items and next steps, and the file paths and identifiers in play. Drop finished exploration and tool output.'
 // What each tiered subagent is on now, by agent id.
 const agents = new Map<string, AgentTier>()
+// The effort an Agent tool call set explicitly, by tool_use_id, until its spawn reads it. agent.spawn does not carry the
+// call's arguments, so tool.call records them; the subagent's steps carry that effort, and the router must not replace
+// it with its own starting effort.
+const askedEffort = new Map<string, Effort>()
+const AGENT_TOOLS: readonly string[] = ['Agent', 'Task']
 // Per session: what changed and what each tiered subagent cost per model and effort. Written to
 // ~/.claude/model-router/, one file per session, for your own analysis.
 const log: EventLog = { sessionId: '', events: [], stats: {} }
@@ -566,8 +571,9 @@ export const register: Register = (on, options) => {
   // Options are read once, when the session's process loads the plugin: a session started before a settings change
   // keeps the old values. Stats say what this process runs with, so a guard that is off by accident is visible.
   const compactionText =
-    `Compaction in this session: idle ${idleMs > 0 ? `after ${idleMs / 60_000} min` : 'off'} · ` +
-    `cap ${capOn ? `at ${fmtTokens(compactAtContext)}` : 'off'}. Settings load when a session starts; restart it after changing them.`
+    `idle ${idleMs > 0 ? `after ${idleMs / 60_000} min` : 'off'} · cap ${capOn ? `at ${fmtTokens(compactAtContext)}` : 'off'} · ` +
+    `min context ${fmtTokens(compactMinContext)}. These are the values this session loaded: if you changed the settings and ` +
+    'they still show the old ones, reload plugins or restart the session.'
 
   on('session.start', async ($, e, next) => {
     await restore($)
@@ -606,7 +612,11 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'model-router' }, async ($, e) => {
     const arg = e.args.trim()
-    if (arg === 'stats' || arg === '') return { text: await statsText($, compactionText) }
+    if (arg === 'stats' || arg === '') {
+      // /model-router off stops both guards, so the line must not show thresholds as if they ran.
+      const state = (await read($, enabled)) ? 'router on' : 'router off, so no compaction runs'
+      return { text: await statsText($, `Compaction in this session: ${state} · ${compactionText}`) }
+    }
     if (arg !== 'on' && arg !== 'off') return { text: 'Usage: /model-router stats | on | off' }
     // setEnabled cancels a pending compaction when switching off.
     await setEnabled($, arg === 'on')
@@ -824,7 +834,15 @@ export const register: Register = (on, options) => {
 
   // Automatic fallback: a subagent that keeps failing is raised one step: effort first, then the next model.
   on('tool.call', async ($, e, next) => {
-    const ran = await next(e)
+    const asked = AGENT_TOOLS.includes(e.tool) ? (e as { effort?: unknown }).effort : undefined
+    if (typeof asked === 'string' && (EFFORTS as string[]).includes(asked)) askedEffort.set(e.tool_use_id, asked as Effort)
+    let ran: Awaited<ReturnType<typeof next>>
+    try {
+      ran = await next(e)
+    } finally {
+      // Read by the spawn inside this call, or never: a call that spawned nothing must not leave it behind.
+      askedEffort.delete(e.tool_use_id)
+    }
     const s = e.agentId === undefined ? undefined : agents.get(e.agentId)
     if (e.agentId === undefined || s === undefined || e.tool === TOOL_CALL || !(await read($, enabled))) return ran
     const failed = ran.deny === undefined && ran.isError === true
@@ -876,7 +894,10 @@ export const register: Register = (on, options) => {
             fableBlocked: c.fableBlocked + (d?.fable ? 1 : 0),
           }))
         }
-        const s = startOf(ran.model, e.parentModel, model !== undefined, ids, model === undefined && isCallerPin(e.model))
+        const started = startOf(ran.model, e.parentModel, model !== undefined, ids, model === undefined && isCallerPin(e.model))
+        // An effort the caller set explicitly is kept, router pin or not; the hard cap (high) still applies per step.
+        const explicit = askedEffort.get(e.tool_use_id)
+        const s = explicit === undefined ? started : { ...started, effort: capSent(explicit) as Effort }
         agents.set(ran.agentId, s)
         // A failed classification keeps today's fallback (sonnet) and says why.
         const why = failureText !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failureText})`) : d?.reason
