@@ -7080,7 +7080,7 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.prompt.submit({ text: 'find files' } as never)
       expect(seen.systems[0]).toBe(classifierSystem('en'))
       failing = false
-      await new Promise(resolve => setTimeout(resolve, 1100))
+      await new Promise(resolve => (globalThis as any).setTimeout(resolve, 1100))
       await $.prompt.submit({ text: 'find more files' } as never)
       expect(seen.systems[1]).toContain('rename the helper')
     })
