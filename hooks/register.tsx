@@ -129,11 +129,16 @@ let pacingOption: PaceMode = 'warn'
 let pacingOverride: PaceMode | undefined
 // The weekly window (its resetsAt) the pace toast last fired for.
 let paceWarned: string | undefined
+// Once per process, not per session: a pane the person closed stays closed across /clear.
 let paneAutoTried = false
+// Whether the model-router pane is open, so a closed pane costs no redraw requests.
+let paneOpen = false
 // The running main turn's first request rewrote a cold cache; and the turn tally the turn started from (an inherited
 // turn does not reset the tally, so its figures are the difference).
 let turnCold = false
 let turnBase = { tokens: 0, cost: 0 }
+// An inherited turn's route already carries earlier escalations: its own start at this many trail steps.
+let turnTrailBase = 0
 // What the pane shows beyond the turn list, computed when it opens and after each main turn, never per render.
 let paneData: { day: string; series: DayCost[]; session: Tally } | undefined
 let paneDirty = true
@@ -253,6 +258,8 @@ const STR = {
     wrongNone: '没有可纠正的已分类轮次（强制、固定、沿用和失败的轮次不经分类）。',
     wrongNoText: '该轮的提示内容已不在内存中，无法记录。',
     wrongFailed: '无法保存纠正。',
+    correctionsClearFailed: '已停止使用纠正记录，但无法删除磁盘上的副本，它可能仍然存在。',
+    pacingNotSaved: '（无法保存：仅对本会话有效。）',
     wrongSame: (tier: string) => `该轮已被分到 ${tier}，没有记录。`,
     wrongDone: (at: string, routed: string, right: string) => `已记录：${at} 的轮次，分类为 ${routed}，应为 ${right}。`,
     corrections: '路由纠正',
@@ -372,6 +379,8 @@ const STR = {
     wrongNone: 'No classified turn to correct (forced, pinned, inherited and failed-classification turns were not classified).',
     wrongNoText: 'The prompt of that turn is no longer in memory, so nothing was recorded.',
     wrongFailed: 'Could not save the correction.',
+    correctionsClearFailed: 'Corrections are no longer used, but the copy on disk could not be deleted and may remain.',
+    pacingNotSaved: '(Could not be saved: this session only.)',
     wrongSame: (tier: string) => `That turn was already routed ${tier}; nothing recorded.`,
     wrongDone: (at: string, routed: string, right: string) => `Recorded: the ${at} turn was routed ${routed} and should have been ${right}.`,
     corrections: 'Routing corrections',
@@ -522,19 +531,22 @@ function redraw($: EngineInterface) {
   }
 }
 
-// Read at session start and by the first thing that needs them, not on every hook: a store that cannot be read costs
-// the prompt path nothing extra.
+// Read at session start and by the first thing that needs them, not on every hook. A failed read is retried later
+// with the other loads' backoff, and defaults stand until it succeeds.
 function ensurePrefs($: EngineInterface, session: Session) {
   return loadPart($, session.prefs, () => loadPrefs($, session))
 }
 
-// The persisted choices: corrections, the pacing override and the window the pace toast last fired for. A store that
-// cannot be read leaves the defaults; none of them is worth a retry loop.
+// A redraw for the pane's own content (turns, corrections): nothing to redraw while it is closed.
+function redrawPane($: EngineInterface) {
+  if (paneOpen) redraw($)
+}
+
+// The persisted choices: corrections, the pacing override and the window the pace toast last fired for.
 async function loadPrefs($: EngineInterface, session: Session) {
-  const read1 = async (key: string) => { try { return await $.store.get(key) } catch { return undefined } }
-  const stored = await read1('corrections')
-  const mode = await read1('pacing')
-  const warned = await read1('paceWarned')
+  const stored = await $.store.get('corrections')
+  const mode = await $.store.get('pacing')
+  const warned = await $.store.get('paceWarned')
   if (!here(session)) return
   corrections = readCorrections(stored)
   pacingOverride = isPaceMode(mode) ? mode : undefined
@@ -730,9 +742,9 @@ function resetSession($: EngineInterface, cancel = true) {
   escalationRight.clear()
   turnCold = false
   turnBase = { tokens: 0, cost: 0 }
+  turnTrailBase = 0
   paneData = undefined
   paneDirty = true
-  paneAutoTried = false
   rateLimits = []
   lastSkipped = null
   skippedEpoch = -1
@@ -1045,13 +1057,15 @@ async function classify($: EngineInterface, session: Session, lang: Lang, text: 
     await count($, session, c => ({ ...c, classifierSkipped: (c.classifierSkipped ?? 0) + 1 }))
     return how(routeFor('decide', STR[lang].warmSkip), 'warm-skip')
   }
-  const c = await classifyTier($, session, lang, text, previous?.tier ?? null, true)
+  // A steered turn hands on the tier the classifier settled on, not the one pacing moved it to.
+  const previousTier = previous ? previous.steeredFrom ?? previous.tier : null
+  const c = await classifyTier($, session, lang, text, previousTier, true)
   if (!c.ok) {
     await countFailure($, session, c.why)
-    if (previous) return how(routeFor(previous.tier, STR[lang].keptTier(failText(c))), 'kept-tier')
+    if (previous) return how(routeFor(previousTier!, STR[lang].keptTier(failText(c))), 'kept-tier')
     return { ...routeFor('execute', STR[lang].sessionModel(failText(c))), sessionModel: true, how: 'session-model' }
   }
-  const s = settleTier(c.verdict, previous?.tier ?? null)
+  const s = settleTier(c.verdict, previousTier)
   // Weekly pacing, steer mode only: while use runs ahead of an even pace, a decide the classifier was unsure of goes to
   // execute. Whatever follows still applies: keepWarm keeps a warm large Opus context where it is, a sure decide stays
   // on Opus, escalate can raise the turn, and #model or a pin never get here.
@@ -1059,12 +1073,12 @@ async function classify($: EngineInterface, session: Session, lang: Lang, text: 
   const pace = paceOf(w, now)
   if (pacingMode() === 'steer' && c.verdict.tier === 'decide' && !c.verdict.sure && pace.state === 'ahead' && w) {
     const reason = `${s.reason} (pacing: weekly ${w.percentUsed}%, ${fmtPace(pace)} pace)`.trim()
-    return { ...how(routeFor('execute', reason), 'classified'), steered: true }
+    return { ...how(routeFor('execute', reason), 'classified'), steered: true, steeredFrom: s.tier }
   }
   return how(routeFor(s.tier, s.reason), 'classified')
 }
 
-/// Keeps a classified turn's masked prompt for a later correction, newest SNIPPETS_KEPT only.
+// Keeps a classified turn's masked prompt for a later correction, newest SNIPPETS_KEPT only.
 function rememberSnippet(turnId: string, prompt: string) {
   const text = snippetOf(prompt)
   if (text === '') return
@@ -1074,7 +1088,7 @@ function rememberSnippet(turnId: string, prompt: string) {
 
 // Writes one correction (newest last, capped, a repeated text replaced) and counts it by source. False when the store
 // could not be written; nothing is claimed then.
-async function recordCorrection($: EngineInterface, session: Session, c: Correction): Promise<boolean> {
+async function recordCorrection($: EngineInterface, session: Session, c: Correction, counted = true): Promise<boolean> {
   let ok = false
   await serial($, session, 'corrections', async () => {
     const next = addCorrection(readCorrections(await $.store.get('corrections')), c)
@@ -1083,7 +1097,7 @@ async function recordCorrection($: EngineInterface, session: Session, c: Correct
     corrections = next
     ok = true
   })
-  if (ok) {
+  if (ok && counted) {
     await count($, session, k => c.source === 'manual'
       ? { ...k, correctionsManual: (k.correctionsManual ?? 0) + 1 }
       : { ...k, correctionsEscalate: (k.correctionsEscalate ?? 0) + 1 })
@@ -1091,18 +1105,24 @@ async function recordCorrection($: EngineInterface, session: Session, c: Correct
   return ok
 }
 
-// The most recent completed turn the classifier sorted, the only kind a correction can apply to.
-async function lastClassified($: EngineInterface, session: Session): Promise<TurnRecord | undefined> {
+// The only turns a correction can apply to: the classifier sorted them and nothing moved them since. A steered turn
+// was routed by pacing, so correcting it would teach a verdict the classifier never gave. The pane's buttons and the
+// command both choose by this.
+function isCorrectable(t: TurnRecord): boolean {
+  return t.how === 'classified' && !t.steered
+}
+
+// The turn a correction applies to: the one named (a pane button names the turn it drew), else the latest correctable.
+async function correctionTarget($: EngineInterface, session: Session, turnId?: string): Promise<TurnRecord | undefined> {
   const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
-  // A steered turn was routed by pacing, not by the classifier's tier: correcting it would teach a verdict it never gave.
-  return [...list].reverse().find(t => t.how === 'classified' && !t.steered)
+  return turnId === undefined ? [...list].reverse().find(isCorrectable) : list.find(t => t.turnId === turnId && isCorrectable(t))
 }
 
 // "/model-router wrong <tier>" and the pane's buttons. Answers with what was recorded, or why nothing was.
-async function correctTurn($: EngineInterface, session: Session, lang: Lang, right: Tier): Promise<string> {
+async function correctTurn($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId?: string): Promise<string> {
   const str = STR[lang]
   if (!learning) return str.wrongOff
-  const rec = await lastClassified($, session)
+  const rec = await correctionTarget($, session, turnId)
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   if (!rec) return str.wrongNone
   if (rec.tier === right) return str.wrongSame(rec.tier)
@@ -1113,12 +1133,12 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   if (!(await recordCorrection($, session, { at, text, routed: rec.tier, right, source: 'manual' }))) return str.wrongFailed
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
   paneDirty = true
-  redraw($)
+  redrawPane($)
   return str.wrongDone(hhmm(rec.at), rec.tier, right)
 }
 
-async function pressWrong($: EngineInterface, session: Session, lang: Lang, right: Tier) {
-  const text = await correctTurn($, session, lang, right)
+async function pressWrong($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId: string) {
+  const text = await correctTurn($, session, lang, right, turnId)
   try {
     $.ui.toast(text)
   } catch {
@@ -1137,19 +1157,21 @@ async function writeTurnRecord($: EngineInterface, session: Session, r: Route, t
     tier: r.tier,
     model: r.sessionModel ? 'session' : r.model,
     ...(r.sessionModel ? {} : { effort: r.effort }),
-    ...(r.keptFrom ? { keptFrom: r.keptFrom } : {}),
+    // An inherited turn's route carries the earlier turn's cache keep and escalations: only its own are its.
+    ...(r.keptFrom && r.how !== 'inherited' ? { keptFrom: r.keptFrom } : {}),
     reason: r.reason,
-    trail: r.how === 'inherited' ? [] : r.trail,
+    trail: r.trail.slice(turnTrailBase),
     tokens: Math.max(0, (m?.turn.tokens ?? 0) - turnBase.tokens),
     cost: Math.max(0, (m?.turn.cost ?? 0) - turnBase.cost),
     cold: turnCold,
-    how: r.how ?? 'classified',
+    // A route without a tag (one an earlier version stored) was not classified by this one: not correctable.
+    how: r.how ?? 'inherited',
     ...(r.steered ? { steered: true } : {}),
     ...(escalationRight.has(turnId) ? { corrected: escalationRight.get(turnId) } : {}),
   }
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? [...list, rec].slice(-MAX_TURNS) : list), undefined, retryFor(session, 'turn record'))
   paneDirty = true
-  redraw($)
+  redrawPane($)
 }
 
 // The seven-day series and the session total in one pass over the store keys.
@@ -1168,6 +1190,7 @@ async function refreshPaneData($: EngineInterface, session: Session, now: number
     if (inWeek) byDay.set(m[1]!, merge(byDay.get(m[1]!) ?? EMPTY, t))
     if (own) mine = merge(mine, t)
   }
+  if (await stillHere($, session) !== 'same') return
   paneData = { day: dayKey(now), series: days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0 })), session: mine }
   paneDirty = false
 }
@@ -1175,7 +1198,9 @@ async function refreshPaneData($: EngineInterface, session: Session, now: number
 async function openPane($: EngineInterface, title: string): Promise<boolean> {
   paneDirty = true
   try {
-    return (await $.ui.open({ id: PANE, title })).isPlaced
+    const opened = await $.ui.open({ id: PANE, title })
+    paneOpen = true
+    return opened.isPlaced
   } catch {
     return false
   }
@@ -1186,6 +1211,7 @@ async function togglePane($: EngineInterface, lang: Lang): Promise<string> {
   try {
     if ((await $.ui.panes()).some(p => p.id === PANE)) {
       await $.ui.close({ id: PANE })
+      paneOpen = false
       return str.paneClosed
     }
   } catch {
@@ -1231,24 +1257,28 @@ async function pacingCommand($: EngineInterface, session: Session, lang: Lang, a
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   // Takes effect at once; the store write is what makes it last across sessions.
   pacingOverride = value === 'default' ? undefined : value as PaceMode
-  await bookkeeping($, () => value === 'default' ? $.store.delete('pacing') : $.store.set('pacing', value), undefined, retryFor(session, 'pacing write'))
+  let saved = false
+  await bookkeeping($, async () => { await (value === 'default' ? $.store.delete('pacing') : $.store.set('pacing', value)); saved = true }, undefined, retryFor(session, 'pacing write'))
   const now = await $.clock.now()
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   publishStatus($)
   redraw($)
   await paceNotice($, session, now)
-  return value === 'default' ? str.pacingDefault(pacingMode()) : str.pacingSet(value)
+  return (value === 'default' ? str.pacingDefault(pacingMode()) : str.pacingSet(value)) + (saved ? '' : ` ${str.pacingNotSaved}`)
 }
 
 async function correctionsCommand($: EngineInterface, session: Session, lang: Lang, arg: string): Promise<string> {
   const str = STR[lang]
+  // Loaded first: a later load must not bring back what clear emptied.
+  await ensurePrefs($, session)
   if (/^corrections\s+clear$/.test(arg)) {
-    await bookkeeping($, () => $.store.delete('corrections'), undefined, retryFor(session, 'corrections write'))
+    let deleted = false
+    await bookkeeping($, async () => { await $.store.delete('corrections'); deleted = true }, undefined, retryFor(session, 'corrections write'))
+    // Whatever the disk says, nothing more is sent to the classifier.
     corrections = []
-    return str.correctionsCleared
+    return deleted ? str.correctionsCleared : str.correctionsClearFailed
   }
   if (arg !== 'corrections') return str.usage
-  await ensurePrefs($, session)
   const list = readCorrections(await bookkeeping($, () => $.store.get('corrections'), undefined, retryFor(session, 'corrections read')))
   const off = learning ? '' : ` ${str.learnedOff}`
   if (list.length === 0) return `${str.correctionsNone}${off}`
@@ -1781,9 +1811,16 @@ export const register: Register = (on, options) => {
     } catch {
       // No measurement yet.
     }
-    refreshUi($, session, now)
-    if (await stillHere($, session) !== 'same') return next(e)
+    // The stored pacing override decides whether the first status line carries a pace.
     await ensurePrefs($, session)
+    if (await stillHere($, session) !== 'same') return next(e)
+    refreshUi($, session, now)
+    try {
+      paneOpen = (await $.ui.panes()).some(p => p.id === PANE)
+    } catch {
+      // Not listed: treated as closed until it is opened or drawn.
+    }
+    if (await stillHere($, session) !== 'same') return next(e)
     await paceNotice($, session, now)
     // Desktop docks a pane beside the chat. The terminal says so only when it draws (see the AbovePrompt hook).
     if (autoOpenPane && !paneAutoTried && e.surface === 'desktop' && e.isInteractive) {
@@ -1870,8 +1907,10 @@ export const register: Register = (on, options) => {
       observedModel = undefined
     }
     const measuredAt = await $.clock.now()
+    await ensurePrefs($, session)
+    if (await stillHere($, session) !== 'same') return next(e)
     refreshUi($, session, measuredAt)
-    if (here(session)) await paceNotice($, session, measuredAt)
+    await paceNotice($, session, measuredAt)
     return next(e)
   })
 
@@ -1948,9 +1987,6 @@ export const register: Register = (on, options) => {
     if (model !== r.model) {
       r = { ...r, keptFrom: r.model, model, effort: TIER_ROUTE[r.tier].effort }
       await count($, session, c => ({ ...c, cacheKeeps: c.cacheKeeps + 1 }))
-    } else if (r.steered) {
-      // Counted only when the steer held: a warm cache that kept the turn on Opus was not steered.
-      await count($, session, c => ({ ...c, pacingSteered: (c.pacingSteered ?? 0) + 1 }))
     }
     if (await stillHere($, session) !== 'same') return next(e)
     // Set before next: next resolves only after the turn has started, and turn.start binds this route.
@@ -1975,6 +2011,7 @@ export const register: Register = (on, options) => {
     runningMain = e.turnId
     turnCold = false
     turnBase = { tokens: 0, cost: 0 }
+    turnTrailBase = 0
     if (pending) {
       const r = { ...pending, turnId: e.turnId }
       pending = null
@@ -1986,6 +2023,9 @@ export const register: Register = (on, options) => {
         redraw($)
       }
       if (r.how === 'classified') rememberSnippet(e.turnId, pendingPrompt)
+      // Counted when the turn starts (a dropped prompt is not a steer), and only if the steer held: a warm cache that
+      // kept the turn on a bigger model was not steered.
+      if (r.steered && !r.keptFrom) await count($, session, c => ({ ...c, pacingSteered: (c.pacingSteered ?? 0) + 1 }))
       await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? r : previous)
       if (r.sessionModel) {
         await logEvent($, session, 'main', 'turn route', 'session model', r.reason)
@@ -2008,6 +2048,7 @@ export const register: Register = (on, options) => {
         const before = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), undefined)
         if (await stillHere($, session) !== 'same') return next(e)
         turnBase = { tokens: before?.turn.tokens ?? 0, cost: before?.turn.cost ?? 0 }
+        turnTrailBase = prev.trail.length
         await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? r : previous)
         await logEvent($, session, 'main', 'turn inherit', `${r.model}/${r.effort}`, r.reason)
       }
@@ -2229,16 +2270,20 @@ export const register: Register = (on, options) => {
       maxEffort: (c.maxEffort ?? 0) + (out.route.effort === 'max' && r.effort !== 'max' ? 1 : 0),
     }))
     // Moving to a higher MODEL than the classified tier's own means the classifier sorted it too low. An effort-only
-    // raise, or a turn the warm cache kept on a bigger model, is not a correction. Once per turn.
+    // raise, or a turn the warm cache kept on a bigger model, is not a correction. One entry per turn, counted once;
+    // a later, higher raise in the same turn moves it up to the highest model reached.
     const text = snippets.get(r.turnId)
-    if (learning && r.how === 'classified' && !r.steered && text !== undefined && !escalationRight.has(r.turnId) &&
-      out.route.model !== r.model && MODELS.indexOf(out.route.model) > MODELS.indexOf(TIER_ROUTE[r.tier].model)) {
-      const right = TIER_OF[out.route.model]
-      escalationRight.set(r.turnId, right)
+    const reached = escalationRight.get(r.turnId)
+    const right = TIER_OF[out.route.model]
+    if (learning && r.how === 'classified' && !r.steered && text !== undefined && out.route.model !== r.model &&
+      MODELS.indexOf(out.route.model) > MODELS.indexOf(TIER_ROUTE[r.tier].model) &&
+      (reached === undefined || MODELS.indexOf(out.route.model) > MODELS.indexOf(TIER_ROUTE[reached].model))) {
       const at = await $.clock.now()
-      if (await stillHere($, session) === 'same') await recordCorrection($, session, { at, text, routed: r.tier, right, source: 'escalate' })
+      if (await stillHere($, session) === 'same' && await recordCorrection($, session, { at, text, routed: r.tier, right, source: 'escalate' }, reached === undefined)) {
+        escalationRight.set(r.turnId, right)
+      }
     }
-    redraw($)
+    redrawPane($)
     return {
       result: `Route updated: from your next step this turn runs on ${out.route.model} at ${out.route.effort} effort. Now do the work.`,
     }
@@ -2363,8 +2408,6 @@ export const register: Register = (on, options) => {
     if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     const r = await bookkeeping($, () => read($, memberOf(route, { requestId: session.stateId })), null)
     if (await stillHere($, session) !== 'same' || stale(epoch)) return done
-    if (e.agentId === undefined && r && r.turnId === e.turnId) await writeTurnRecord($, session, r, e.turnId)
-    if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     if (e.agentId === undefined && r && r.turnId === e.turnId && turnSteps > 0) {
       // A slow average of the turn's shape feeds the warm-cache decision.
       const prev = ((await bookkeeping($, () => $.store.get('shape'), undefined, retryFor(session, 'shape read'))) as Shape | undefined) ?? { steps: 3, output: 800 }
@@ -2373,6 +2416,9 @@ export const register: Register = (on, options) => {
       await bookkeeping($, () => $.store.set('shape', { steps: prev.steps * 0.8 + turnSteps * 0.2, output: prev.output * 0.8 + output * 0.2 }), undefined, retryFor(session, 'shape write'))
       if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     }
+    // New with 1.1.0, after everything main did before it: the pane's record of this turn.
+    if (e.agentId === undefined && r && r.turnId === e.turnId) await writeTurnRecord($, session, r, e.turnId)
+    if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     const isOn = await read($, enabled)
     if (await stillHere($, session) !== 'same' || stale(epoch) || !isOn) return done
     if (e.agentId === undefined && !e.isAborted && r && r.turnId === e.turnId && r.model === 'opus') {
@@ -2413,11 +2459,20 @@ export const register: Register = (on, options) => {
     return done
   })
 
+  // A close (the person's mark, a command, an unload) leaves nothing to redraw.
+  on('ui.close', async ($, e, next) => {
+    const closed = await next(e)
+    if (e.id === PANE) paneOpen = false
+    return closed
+  })
+
   // The router pane: this session's turns, the totals, the last seven days and, with learning on, correction buttons.
   // Drawn only while the person has it open (/model-router pane, or autoOpenPane), so a closed pane costs nothing here.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const session = await useSession($)
     if (!here(session)) return next(e)
+    // Being asked to draw means it is open.
+    paneOpen = true
     const now = await $.clock.now()
     if (await stillHere($, session) !== 'same') return next(e)
     await ensurePrefs($, session)
@@ -2439,7 +2494,7 @@ export const register: Register = (on, options) => {
     const weekCost = series.reduce((sum, d) => sum + d.cost, 0)
     const weekBase = series.reduce((sum, d) => sum + d.baseline, 0)
     const weekLine = `${str.paneWeek}: ${fmtUsd(weekCost)} (Opus ${fmtUsd(weekBase)})`
-    const target = learning ? [...list].reverse().find(t => t.how === 'classified') : undefined
+    const target = learning ? [...list].reverse().find(isCorrectable) : undefined
     const head = [isOn ? str.paneOn : str.paneOff, weeklyText(lang), pin ? `📌 ${LABEL[pin.model]}${pin.left === undefined ? '' : ` (${pin.left})`}` : ''].filter(Boolean).join(' · ')
     const figures = (name: string, t: Tally) => `${name} ${fmtTokens(t.tokens)} token · ${fmtUsd(t.cost)}, ${str.save} ≈${fmtUsd(saved(t).usd)} (${saved(t).pct}%)`
     return (
@@ -2456,7 +2511,7 @@ export const register: Register = (on, options) => {
           ].filter(Boolean)
           const detail = `${fmtUsd(t.cost)} · ${fmtTokens(t.tokens)}${tags.length > 0 ? ` · ${tags.join(' · ')}` : ''}${t.reason ? ` — ${t.reason}` : ''}`
           return (
-            <Box flexDirection="row" gap={1}>
+            <Box key={t.turnId} flexDirection="row" gap={1}>
               <Box flexShrink={0}>
                 <Text dimColor>{hhmm(t.at)}</Text>
               </Box>
@@ -2483,7 +2538,7 @@ export const register: Register = (on, options) => {
           <Box flexDirection="row" gap={1} alignItems="center">
             <Text dimColor>{`${str.paneShould} (${hhmm(target.at)})`}</Text>
             {(['lookup', 'execute', 'decide'] as const).filter(t => t !== target.tier).map(t => (
-              <Button key={`wrong-${t}`} label={t} onPress={() => pressWrong($, session, lang, t)} />
+              <Button key={`wrong-${t}`} label={t} onPress={() => pressWrong($, session, lang, t, target.turnId)} />
             ))}
           </Box>
         )}

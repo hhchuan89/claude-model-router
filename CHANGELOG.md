@@ -23,8 +23,9 @@ routes, prompts and draws exactly as 1.0.1 does.
   count them. Option `learnFromCorrections` (on by default); see Privacy.
 - Weekly pacing: option `weeklyPacing` (`off`, `warn` by default, `steer`) and `/model-router pacing [mode|default]`. `warn`
   adds the pace to the status line and toasts once per weekly window; `steer` also routes an unsure decide to Sonnet
-  while ahead, never against a warm Opus cache, `#model`, a pin or a sure decision. `/model-router status` shows the mode
-  and figures; stats count steered turns.
+  while ahead, never against a warm Opus cache, `#model`, a pin or a sure decision. Steer deliberately overrides the
+  classifier's "an unsure verdict never downgrades" rule, and the model may escalate a steered turn back to Opus, which is
+  the safety valve. `/model-router status` shows the mode and figures; stats count steered turns.
 
 ### Changed
 

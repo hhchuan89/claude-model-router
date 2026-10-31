@@ -206,7 +206,7 @@ buttons for the last classified turn.
 ## Pin and corrections
 
 `#opus`, `#sonnet` or `#haiku` in a message still pins that one turn. `/model-router pin <model> [turns]` holds the main
-conversation on a model for the next `turns` person turns (no number: until `/model-router unpin` or the session ends).
+conversation on a model for the next `turns` person turns (no number: until `/model-router unpin` or the session ends; `pinned (n left)` counts the turn being started).
 A pinned turn behaves like a `#model` turn: no classifier call, no warm-cache keeping, and the band shows `📌`. The
 count goes down when the turn starts, so a prompt another plugin holds back does not use a pin up, and a `#model` in
 the message wins for its turn. Pinning needs `mainRouting`.

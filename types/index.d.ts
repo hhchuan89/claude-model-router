@@ -20,6 +20,9 @@ export type Route = {
   how?: TurnHow
   // A pacing steer moved this turn from decide to execute (counted once, unless the warm cache kept it on Opus).
   steered?: boolean
+  // The tier the classifier's verdict settled on before the pacing steer moved the turn; later routing starts from it, so a
+  // steer never changes the turns after it.
+  steeredFrom?: Tier
 }
 
 export type TurnHow = 'classified' | 'forced' | 'pinned' | 'inherited' | 'kept-tier' | 'warm-skip' | 'session-model'
