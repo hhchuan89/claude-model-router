@@ -39,6 +39,8 @@ export type TurnRecord = {
   // The turn's first request rewrote a cold cache (the same detection as the cacheExpiryRewrites counter).
   cold: boolean
   how: TurnHow
+  // Pacing moved the turn from decide to execute; it is not a classifier verdict to correct.
+  steered?: boolean
   corrected?: Tier
 }
 

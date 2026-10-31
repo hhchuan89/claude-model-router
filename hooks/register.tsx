@@ -1094,7 +1094,8 @@ async function recordCorrection($: EngineInterface, session: Session, c: Correct
 // The most recent completed turn the classifier sorted, the only kind a correction can apply to.
 async function lastClassified($: EngineInterface, session: Session): Promise<TurnRecord | undefined> {
   const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
-  return [...list].reverse().find(t => t.how === 'classified')
+  // A steered turn was routed by pacing, not by the classifier's tier: correcting it would teach a verdict it never gave.
+  return [...list].reverse().find(t => t.how === 'classified' && !t.steered)
 }
 
 // "/model-router wrong <tier>" and the pane's buttons. Answers with what was recorded, or why nothing was.
@@ -1143,6 +1144,7 @@ async function writeTurnRecord($: EngineInterface, session: Session, r: Route, t
     cost: Math.max(0, (m?.turn.cost ?? 0) - turnBase.cost),
     cold: turnCold,
     how: r.how ?? 'classified',
+    ...(r.steered ? { steered: true } : {}),
     ...(escalationRight.has(turnId) ? { corrected: escalationRight.get(turnId) } : {}),
   }
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? [...list, rec].slice(-MAX_TURNS) : list), undefined, retryFor(session, 'turn record'))
@@ -2229,7 +2231,7 @@ export const register: Register = (on, options) => {
     // Moving to a higher MODEL than the classified tier's own means the classifier sorted it too low. An effort-only
     // raise, or a turn the warm cache kept on a bigger model, is not a correction. Once per turn.
     const text = snippets.get(r.turnId)
-    if (learning && r.how === 'classified' && text !== undefined && !escalationRight.has(r.turnId) &&
+    if (learning && r.how === 'classified' && !r.steered && text !== undefined && !escalationRight.has(r.turnId) &&
       out.route.model !== r.model && MODELS.indexOf(out.route.model) > MODELS.indexOf(TIER_ROUTE[r.tier].model)) {
       const right = TIER_OF[out.route.model]
       escalationRight.set(r.turnId, right)

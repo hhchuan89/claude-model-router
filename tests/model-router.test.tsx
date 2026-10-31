@@ -6942,4 +6942,51 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(seen.asked).toEqual(['haiku'])
     })
   })
+
+  describe('steered turns and the terminal auto-open (1.1.0 review)', () => {
+    // WHY: a steered turn's tier is pacing's choice; a correction would teach Haiku "routed execute" for a decide verdict.
+    test('a steered turn cannot be corrected, by wrong or by an escalation', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe a design"}')
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(route(seen)).toContain('assigned to sonnet')
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'a design call' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('No classified turn')
+      expect(seen.store.corrections).toBeUndefined()
+    })
+
+    const FULL = { columns: 100, rows: 30, isFullscreen: true }
+    const bandWith = ($: any, viewport?: { columns: number; rows: number; isFullscreen: boolean }) =>
+      $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS, ...(viewport ? { viewport } : {}) })
+
+    test('a fullscreen terminal opens the pane once when autoOpenPane is on', { options: { autoOpenPane: true } }, async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      const first = await bandWith($, FULL)
+      expect(c.opened.map(o => o.id)).toEqual(['model-router'])
+      await first.unmount()
+      // The person closes it; a later redraw must not bring it back.
+      c.isOpen = false
+      const second = await bandWith($, FULL)
+      expect(c.opened).toHaveLength(1)
+      await second.unmount()
+    })
+
+    test('a terminal that is not fullscreen, or one that does not say, never opens it', { options: { autoOpenPane: true } }, async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      await (await bandWith($, { ...FULL, isFullscreen: false })).unmount()
+      await (await bandWith($)).unmount()
+      expect(c.opened).toEqual([])
+    })
+
+    test('with autoOpenPane off a fullscreen terminal opens nothing', async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      await (await bandWith($, FULL)).unmount()
+      expect(c.opened).toEqual([])
+    })
+  })
 })
