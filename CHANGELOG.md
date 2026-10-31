@@ -3,6 +3,34 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-10-31
+
+1.1.0 adds a router pane, a way to pin a model and teach the classifier from your corrections, and weekly usage pacing.
+Each has an off switch, and with `autoOpenPane` off, `learnFromCorrections` off and `weeklyPacing` off the router
+routes, prompts and draws exactly as 1.0.1 does.
+
+### Added
+
+- `/model-router pane` opens (or closes) a pane with this session's turns (time, model, effort, cost, tokens, cold-cache,
+  kept-cache, escalation, pinned and correction markers, reason), the session and today totals, a seven-day spend chart
+  (SVG on Desktop, a text sparkline on the terminal) and, with learning on, correction buttons. Option `autoOpenPane`
+  (off by default) also opens it once per session where it would be a sidebar.
+- `/model-router pin <haiku|sonnet|opus> [turns]` and `/model-router unpin`: hold the main conversation on a model like a
+  `#model` in every message, counted down when the turn starts. `📌` shows in the band and pane.
+- Learning from corrections: `/model-router wrong <tier>`, the pane buttons, or the model escalating itself above the
+  classified tier's model store the masked prompt snippet (up to 40, 200 characters each); the newest 8 are added to the
+  classifier prompt for the main thread and subagents. `/model-router corrections [clear]` lists or deletes them; stats
+  count them. Option `learnFromCorrections` (on by default); see Privacy.
+- Weekly pacing: option `weeklyPacing` (`off`, `warn` by default, `steer`) and `/model-router pacing [mode|default]`. `warn`
+  adds the pace to the status line and toasts once per weekly window; `steer` also routes an unsure decide to Sonnet
+  while ahead, never against a warm Opus cache, `#model`, a pin or a sure decision. Steer deliberately overrides the
+  classifier's "an unsure verdict never downgrades" rule, and the model may escalate a steered turn back to Opus, which is
+  the safety valve. `/model-router status` shows the mode and figures; stats count steered turns.
+
+### Changed
+
+- The command hint and usage line list the new subcommands (the old ones come first, unchanged).
+
 ## [1.0.1] - 2026-10-31
 
 ### Fixed

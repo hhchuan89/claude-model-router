@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Routes every Claude Code turn to the cheapest model that can do it well (Haiku lookups, Sonnet execution, Opus decisions), lets the model escalate itself, routes subagents too, keeps a warm cache when switching would cost more, and compares costs with the same work tokens at Opus prices. Classification runs on your own Anthropic account; no third party sees your prompts.",
   "author": {
     "name": "hhchuan89"
@@ -88,6 +88,29 @@
       "description": "0 (the default) is off; below 100000 also counts as off (the engine's own auto-compact window starts there). Otherwise, when a main turn ends with the context at or above this many tokens (for example 200000), compact it between turns while the cache is warm, so each later step does not re-read a huge cache.",
       "default": 0,
       "min": 0
+    },
+    "autoOpenPane": {
+      "type": "boolean",
+      "title": "Open the router pane automatically",
+      "description": "Off (the default): the router pane opens only when you run /model-router pane. On: it also opens by itself, once per session, where it would be a sidebar (Claude Code Desktop, or the terminal in fullscreen). Closing the pane is always the way to turn it off.",
+      "default": false
+    },
+    "learnFromCorrections": {
+      "type": "boolean",
+      "title": "Learn from routing corrections",
+      "description": "On (the default): when you correct a routing (/model-router wrong <tier>, the pane buttons, or the model escalating itself to a bigger model than the classifier chose) the masked prompt snippet is stored locally (up to 40) and the newest 8 are sent to Haiku with each classifier call. Off: nothing is recorded or sent; stored corrections stay on disk until /model-router corrections clear.",
+      "default": true
+    },
+    "weeklyPacing": {
+      "type": "string",
+      "title": "Weekly usage pacing",
+      "description": "warn (the default): the status line shows when your weekly usage runs ahead of an even pace, with one toast per weekly window. steer: also routes a decision the classifier was unsure of to Sonnet while ahead (a warm Opus cache, #model, a pin and a sure decision are never moved). off: no pacing text, toast or routing change. /model-router pacing <mode> overrides this and persists.",
+      "default": "warn",
+      "options": [
+        "off",
+        "warn",
+        "steer"
+      ]
     }
   }
 }

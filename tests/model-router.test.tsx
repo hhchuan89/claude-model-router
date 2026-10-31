@@ -6,6 +6,10 @@ import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
 import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
+import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
+import type { Correction } from '../hooks/learn'
+import { paceOf, sameWindow } from '../hooks/pace'
+import { barChartSvg, chartAlt, hhmm, sparkline, trailStep } from '../hooks/pane'
 import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
@@ -102,7 +106,7 @@ const BAND_PROPS = {
   view: {},
 } as never
 
-type Seen = { sessionId: string; clock: { advance: (ms: number) => Promise<void> }; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; maxTokens: (number | undefined)[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string>; store: Record<string, unknown>; statuses: (string | undefined)[]; stepMs?: number; tally?: Tally }
+type Seen = { sessionId: string; clock: { advance: (ms: number) => Promise<void>; now: () => number }; systems: string[]; submits: { text: string; context?: readonly string[] }[]; steps: { model: string; effort?: unknown; agentId?: string }[]; asked: string[]; maxTokens: (number | undefined)[]; prompts: string[]; usage: any[]; agents: (string | undefined)[]; files: Record<string, string>; store: Record<string, unknown>; statuses: (string | undefined)[]; stepMs?: number; tally?: Tally }
 
 const IDS: Record<string, string> = { haiku: 'claude-haiku-5-5', sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5' }
 
@@ -115,7 +119,7 @@ function world(
   classifier: Reply | Reply[],
   opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally } = {},
 ): Seen {
-  const seen: Seen = { sessionId: 'sess-1', clock: mock.clock(on), submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {}, statuses: [], store: { ...opts.store } }
+  const seen: Seen = { sessionId: 'sess-1', clock: mock.clock(on), systems: [], submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {}, statuses: [], store: { ...opts.store } }
   on('store.set', { key: /.*/ }, async (_$: unknown, e: any, next: any) => {
     const result = await next(e)
     seen.store[e.key] = e.value
@@ -131,8 +135,9 @@ function world(
     return next(e)
   })
   on('session.messages', async () => ({ value: (opts.messages ?? []).map(m => ({ ...m, toolUses: [] })) }))
-  on('model.complete', async (_$: unknown, e: { model: string; prompt: string; maxTokens?: number }) => {
+  on('model.complete', async (_$: unknown, e: { model: string; prompt: string; system?: string; maxTokens?: number }) => {
     seen.asked.push(e.model)
+    seen.systems.push(e.system ?? '')
     seen.maxTokens.push(e.maxTokens)
     seen.prompts.push(e.prompt)
     const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
@@ -1971,7 +1976,7 @@ describe('cost exposure and session commands (1.0)', () => {
     on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [{ kind: 'seven_day', percentUsed: 76 }] } }))
     on('session.model', async () => ({ value: 'opus' }))
     await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
-    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off]')
+    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off|pane|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]')
     expect(command.immediate).toBe(true)
     expect(command.description).toContain('status')
     expect(command.description).toContain('context')
@@ -6349,4 +6354,765 @@ describe('append-only event logs', () => {
     expect(log.stats.old).toEqual(addUsage(undefined, 'haiku', 'medium', U(100, 50)))
   })
 
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 1.1.0: the router pane, pin and corrections, weekly pacing
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('weekly pace math (1.1.0)', () => {
+  const DAY = 24 * 3600 * 1000
+  const now = Date.parse('2026-11-01T00:00:00Z')
+  // A window that has `gone` of its seven days behind it.
+  const at = (gone: number) => new Date(now + (1 - gone) * 7 * DAY).toISOString()
+
+  test('no seven_day window, no reset time or too early in the window is unknown', async () => {
+    expect(paceOf(undefined, now).state).toBe('unknown')
+    expect(paceOf({ kind: 'five_hour', percentUsed: 90, resetsAt: at(0.5) }, now).state).toBe('unknown')
+    expect(paceOf({ kind: 'seven_day', percentUsed: 90 }, now).state).toBe('unknown')
+    // A tenth of the week is the first moment a reading means anything.
+    expect(paceOf({ kind: 'seven_day', percentUsed: 90, resetsAt: at(0.09) }, now).state).toBe('unknown')
+    expect(paceOf({ kind: 'seven_day', percentUsed: 90, resetsAt: at(0.11) }, now).state).toBe('ahead')
+  })
+
+  test('ahead needs both 25% used and a pace of at least 1.2', async () => {
+    const limit = (used: number, gone: number) => ({ kind: 'seven_day', percentUsed: used, resetsAt: at(gone) })
+    expect(paceOf(limit(60, 0.5), now)).toMatchObject({ state: 'ahead', used: 60 })
+    expect(Math.abs(paceOf(limit(60, 0.5), now).pace - 1.2)).toBeLessThan(1e-9)
+    expect(paceOf(limit(59, 0.5), now).state).toBe('ok')
+    // 24% used at pace 2.4 is early noise, not a warning.
+    expect(paceOf(limit(24, 0.11), now).state).toBe('ok')
+    expect(paceOf(limit(25, 0.11), now).state).toBe('ahead')
+    expect(paceOf(limit(40, 0.9), now).state).toBe('ok')
+  })
+
+  test('a reset time in the past clamps elapsed to the whole window', async () => {
+    expect(paceOf({ kind: 'seven_day', percentUsed: 50, resetsAt: new Date(now - DAY).toISOString() }, now).elapsed).toBe(1)
+  })
+
+  test('two readings of one window are the same window, the next week is not', async () => {
+    expect(sameWindow(at(0.5), new Date(Date.parse(at(0.5)) + 5000).toISOString())).toBe(true)
+    expect(sameWindow(at(0.5), new Date(Date.parse(at(0.5)) + 7 * DAY).toISOString())).toBe(false)
+    expect(sameWindow(undefined, at(0.5))).toBe(false)
+  })
+})
+
+describe('corrections store and few-shot block (1.1.0)', () => {
+  const c = (text: string, right: 'lookup' | 'execute' | 'decide' = 'decide', at = 1): Correction => ({ at, text, routed: 'lookup', right, source: 'manual' })
+
+  test('the list keeps the newest 40 and a repeated text replaces its earlier entry', async () => {
+    let list: Correction[] = []
+    for (let i = 0; i < MAX_CORRECTIONS + 5; i++) list = addCorrection(list, c(`task ${i}`))
+    expect(list).toHaveLength(MAX_CORRECTIONS)
+    expect(list[0]!.text).toBe('task 5')
+    expect(list.at(-1)!.text).toBe(`task ${MAX_CORRECTIONS + 4}`)
+    const again = addCorrection(list, c('task 10', 'execute', 99))
+    expect(again).toHaveLength(MAX_CORRECTIONS)
+    expect(again.filter(x => x.text === 'task 10')).toEqual([c('task 10', 'execute', 99)])
+    expect(again.at(-1)!.text).toBe('task 10')
+  })
+
+  test('no corrections means no block at all; otherwise the 8 newest, newest last', async () => {
+    expect(fewShot([], 'en')).toBe('')
+    const list = Array.from({ length: 10 }, (_, i) => c(`job ${i}`))
+    const block = fewShot(list, 'en')
+    expect(block).toContain('Corrections this developer made to earlier routing (newest last)')
+    expect(block).toContain('- "job 9" → decide (was routed lookup)')
+    expect(block).not.toContain('"job 1"')
+    expect(block.indexOf('"job 2"')).toBeLessThan(block.indexOf('"job 9"'))
+    expect(block.match(/^- "/gm)).toHaveLength(8)
+  })
+
+  test('a snippet is masked, collapsed and cut to 200 characters', async () => {
+    const text = snippetOf(`fix   the\nbug with token=abcdefghijkl ${'x'.repeat(400)}`)
+    expect(text).not.toContain('abcdefghijkl')
+    expect(text).toContain('[REDACTED]')
+    expect(text).not.toContain('\n')
+    expect(text.length).toBeLessThanOrEqual(200)
+  })
+
+  test('what the store holds is not trusted', async () => {
+    expect(readCorrections('nope')).toEqual([])
+    expect(readCorrections([c('ok'), { text: 5 }, null, { ...c('bad'), right: 'huge' }])).toEqual([c('ok')])
+  })
+})
+
+describe('router pane helpers (1.1.0)', () => {
+  test('the sparkline scales to the largest day and an empty week is flat', async () => {
+    expect(sparkline([0, 1, 2, 4])).toBe('▁▃▅█')
+    expect(sparkline([0, 0, 0])).toBe('▁▁▁')
+    expect(sparkline([])).toBe('')
+  })
+
+  test('the bar chart draws a bar and a baseline marker per day and says its totals in the alt text', async () => {
+    const days = [{ day: '20261030', cost: 1, baseline: 4 }, { day: '20261031', cost: 2, baseline: 8 }]
+    const svg = barChartSvg(days)
+    expect(svg.startsWith('<svg')).toBe(true)
+    expect(svg.match(/fill="#4f8cff"/g)).toHaveLength(2)
+    expect(svg.match(/fill="#e0a030"/g)).toHaveLength(2)
+    expect(chartAlt(days)).toBe('Spend over the last 2 days: $3.00, against $12 for the same work tokens at Opus prices.')
+  })
+
+  test('a trail step is shortened to model/effort', async () => {
+    expect(trailStep('opus · high (the design turned out to need a call)')).toBe('opus/high')
+  })
+})
+
+describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
+  const DAY = 24 * 3600 * 1000
+  const LOOKUP = '{"tier":"lookup","reason":"find"}'
+  const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
+  const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
+
+  // The engine's side of toasts and the weekly window.
+  function ui($: any, on: any) {
+    const c = { toasts: [] as string[], opened: [] as any[], closed: [] as string[], isOpen: false }
+    on('ui.toast', async (_$: unknown, e: { text: string }) => {
+      c.toasts.push(e.text)
+      return { value: undefined }
+    })
+    on('ui.panes', async () => ({ value: c.isOpen ? [{ id: 'model-router', title: 'Router', isShown: true, hasFocus: false, isPlaced: true }] : [] }))
+    on('ui.open', async (_$: unknown, e: any) => {
+      c.opened.push(e)
+      c.isOpen = true
+      return { value: { isPlaced: true } }
+    })
+    on('ui.close', async (_$: unknown, e: any) => {
+      c.closed.push(e.id)
+      c.isOpen = false
+      return { value: undefined }
+    })
+    on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+    on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
+    on('tool.register', async () => ({ value: { tool: 'mcp__model-router__escalate' } }))
+    on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+    on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
+    return c
+  }
+
+  // A weekly window `gone` of the way through with `used` percent spent: pace = used / 100 / gone.
+  async function weekly($: any, seen: Seen, used: number, gone = 0.5, shift = 0) {
+    const resetsAt = new Date((seen.clock as any).now() + (1 - gone) * 7 * DAY + shift).toISOString()
+    await $.session.measure({ context: { window: 1e6 }, rateLimits: [{ kind: 'seven_day', percentUsed: used, resetsAt }], changed: ['rateLimits'] } as never)
+    return resetsAt
+  }
+
+  const route = (seen: Seen, i = 0) => seen.submits[i]!.context?.[0] ?? ''
+
+  describe('pin', () => {
+    test('a pin skips the classifier for the next n turns, counts down at turn start, then classifying resumes', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      expect(await cmd($, 'pin opus 2')).toContain('Pinned to Opus for the next 2 turns')
+      await $.prompt.submit({ text: 'first' } as never)
+      await $.prompt.submit({ text: 'second' } as never)
+      expect(seen.asked).toEqual([])
+      expect(route(seen, 0)).toContain('assigned to opus')
+      expect(route(seen, 0)).toContain('pinned (2 left)')
+      expect(route(seen, 1)).toContain('pinned (1 left)')
+      await $.prompt.submit({ text: 'third' } as never)
+      expect(seen.asked).toEqual(['haiku'])
+      expect(route(seen, 2)).toContain('assigned to haiku')
+    })
+
+    test('without a count a pin holds until unpin', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      expect(await cmd($, 'pin sonnet')).toContain('until /model-router unpin')
+      for (let i = 0; i < 4; i++) await $.prompt.submit({ text: `turn ${i}` } as never)
+      expect(seen.asked).toEqual([])
+      expect(route(seen, 3)).toContain('assigned to sonnet')
+      expect(await cmd($, 'unpin')).toBe('Unpinned.')
+      await $.prompt.submit({ text: 'after' } as never)
+      expect(seen.asked).toEqual(['haiku'])
+      expect(await cmd($, 'unpin')).toBe('No model is pinned.')
+    })
+
+    // WHY: a held-back prompt starts no turn, so it must not use up a person's pin.
+    test('a dropped prompt does not consume the pin', async ($, on) => {
+      const seen = world($, on, LOOKUP, { drop: true })
+      await cmd($, 'pin opus 1')
+      await $.prompt.submit({ text: 'held back' } as never)
+      await $.prompt.submit({ text: 'held back again' } as never)
+      expect(seen.asked).toEqual([])
+      expect(route(seen, 0)).toContain('assigned to opus')
+      expect(route(seen, 1)).toContain('assigned to opus')
+    })
+
+    test('a #model in the message wins for that turn and leaves the pin alone', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await cmd($, 'pin sonnet 1')
+      await $.prompt.submit({ text: 'quick one #haiku' } as never)
+      expect(route(seen, 0)).toContain('assigned to haiku')
+      await $.prompt.submit({ text: 'now the pinned one' } as never)
+      expect(route(seen, 1)).toContain('assigned to sonnet')
+      expect(seen.asked).toEqual([])
+    })
+
+    test('pinning needs main routing', { options: { mainRouting: false } }, async ($, on) => {
+      world($, on, LOOKUP)
+      expect(await cmd($, 'pin opus 3')).toContain('needs main routing')
+    })
+
+    test('a bad pin is answered with the usage text', async ($, on) => {
+      world($, on, LOOKUP)
+      expect(await cmd($, 'pin gpt')).toContain('Usage:')
+      expect(await cmd($, 'pin opus 0')).toContain('Usage:')
+    })
+
+    test('a pinned turn abandons a warm Opus cache for a cheaper model like #model does, and shows in the band', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'warm it up #opus' } as never)
+      seen.usage.push(U(1000, 500, 220_000))
+      await step($, 't1')
+      await cmd($, 'pin haiku 1')
+      await $.prompt.submit({ text: 'list the files' } as never)
+      expect(route(seen, 1)).toContain('assigned to haiku')
+      expect(route(seen, 1)).toContain('warm Opus cache abandoned')
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await band.find({ text: /📌 Haiku.*pinned/ })).toBeDefined()
+    })
+  })
+
+  describe('classifier prompt and corrections', () => {
+    const seeded = (text = 'rename the helper') => ({ corrections: [{ at: 1, text, routed: 'lookup', right: 'decide', source: 'manual' }] })
+
+    test('with no corrections the system prompt is the plain one', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'find every TODO' } as never)
+      expect(seen.systems).toEqual([classifierSystem('en')])
+    })
+
+    test('with corrections the block is appended to the system prompt for the main thread and for subagents', async ($, on) => {
+      const seen = world($, on, LOOKUP, { store: seeded('rename the helper') })
+      await $.prompt.submit({ text: 'find every TODO' } as never)
+      expect(seen.systems[0]!.startsWith(classifierSystem('en'))).toBe(true)
+      expect(seen.systems[0]).toContain('- "rename the helper" → decide (was routed lookup)')
+      await $.agent.spawn({ prompt: 'search the repo for usages of the helper', description: 'search', subagentType: 'general-purpose', parentModel: 'claude-opus-5-5' } as never)
+      expect(seen.systems).toHaveLength(2)
+      expect(seen.systems[1]).toContain('rename the helper')
+    })
+
+    test('learning off adds nothing even with stored corrections', { options: { learnFromCorrections: false } }, async ($, on) => {
+      const seen = world($, on, LOOKUP, { store: seeded() })
+      await $.prompt.submit({ text: 'find every TODO' } as never)
+      expect(seen.systems).toEqual([classifierSystem('en')])
+    })
+
+    test('wrong records the masked snippet of the last classified turn and counts it', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: `rename the helper  key sk-ant-api03-${'z'.repeat(30)}` } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('was routed lookup and should have been decide')
+      const stored = seen.store.corrections as Correction[]
+      expect(stored).toHaveLength(1)
+      expect(stored[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
+      expect(stored[0]!.text).toContain('rename the helper')
+      expect(stored[0]!.text).not.toContain('sk-ant')
+      expect(await statsOf($)).toContain('manual 1 · escalate 0')
+      // The next classification already carries it.
+      await $.prompt.submit({ text: 'rename another helper' } as never)
+      expect(seen.systems.at(-1)).toContain('rename the helper')
+    })
+
+    test('wrong refuses a turn the classifier did not sort, a same-tier answer and learning off', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'pick a database #opus' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong lookup')).toContain('No classified turn')
+      await cmd($, 'pin opus 1')
+      await $.prompt.submit({ text: 'pinned work' } as never)
+      await $.turn.complete(completion('t2'))
+      expect(await cmd($, 'wrong lookup')).toContain('No classified turn')
+      await $.prompt.submit({ text: 'find files' } as never)
+      await $.turn.complete(completion('t3'))
+      expect(await cmd($, 'wrong lookup')).toContain('already routed lookup')
+      expect(await cmd($, 'wrong')).toContain('Usage:')
+      expect(seen.store.corrections).toBeUndefined()
+    })
+
+    test('wrong says learning is off and records nothing', { options: { learnFromCorrections: false } }, async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'find files' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('learnFromCorrections')
+      expect(seen.store.corrections).toBeUndefined()
+    })
+
+    test('escalating to a bigger model than the classified tier records once; an effort-only raise does not', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'look at the auth flow' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', effort: 'high', reason: 'harder' } as never)
+      expect(seen.store.corrections).toBeUndefined()
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'needs code' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'a design call' } as never)
+      const stored = seen.store.corrections as Correction[]
+      expect(stored).toHaveLength(1)
+      // The highest model reached is what the entry says, still one entry and one count.
+      expect(stored[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'escalate' })
+      expect(await statsOf($)).toContain('manual 0 · escalate 1')
+    })
+
+    test('an escalation on a forced turn is not a correction, and neither is one with learning off', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'quick look #haiku' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)
+      expect(seen.store.corrections).toBeUndefined()
+    })
+
+    test('an escalation with learning off writes nothing', { options: { learnFromCorrections: false } }, async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'look at the auth flow' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)
+      expect(seen.store.corrections).toBeUndefined()
+    })
+
+    test('corrections lists them and clear deletes the key', async ($, on) => {
+      const seen = world($, on, LOOKUP, { store: seeded('rename the helper') })
+      expect(await cmd($, 'corrections')).toMatch(/1\. "rename the helper" lookup → decide · manual · \d{4}-\d{2}-\d{2}/)
+      expect(await cmd($, 'corrections clear')).toBe('Corrections cleared.')
+      expect(seen.store.corrections).toBeUndefined()
+      expect(await cmd($, 'corrections')).toBe('No corrections recorded.')
+    })
+  })
+
+  describe('weekly pacing', () => {
+    test('warn shows the pace in the status line and toasts once per weekly window, also across sessions', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      const c = ui($, on)
+      const resetsAt = await weekly($, seen, 80)
+      expect(seen.statuses.at(-1)).toContain('Weekly 80%')
+      expect(seen.statuses.at(-1)).toContain('pace 1.6× ahead')
+      expect(c.toasts).toHaveLength(1)
+      expect(c.toasts[0]).toContain('80%')
+      expect(seen.store.paceWarned).toBe(resetsAt)
+      await weekly($, seen, 85)
+      expect(c.toasts).toHaveLength(1)
+    })
+
+    test('a window the last toast was not about warns again', async ($, on) => {
+      // The mock clock starts at 0, so `weekly` puts the reset 3.5 days in: the stored one is a week-old window.
+      const seen = world($, on, LOOKUP, { store: { paceWarned: new Date(-4 * DAY).toISOString() } })
+      const c = ui($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      await weekly($, seen, 80)
+      expect(c.toasts).toHaveLength(1)
+    })
+
+    test('a window already warned about in an earlier session does not toast again', async ($, on) => {
+      // The mock clock starts at 0, so `weekly` puts the reset 3.5 days in: the stored one is this very window.
+      const seen = world($, on, LOOKUP, { store: { paceWarned: new Date(3.5 * DAY).toISOString() } })
+      const c = ui($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      await weekly($, seen, 80)
+      expect(c.toasts).toEqual([])
+    })
+
+    test('being on pace shows no pace text and no toast', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      const c = ui($, on)
+      await weekly($, seen, 40)
+      expect(seen.statuses.at(-1)).toBe(`Weekly 40% · resets ${seen.statuses.at(-1)!.split('resets ')[1]}`)
+      expect(seen.statuses.at(-1)).not.toContain('pace')
+      expect(c.toasts).toEqual([])
+    })
+
+    test('off adds no text, no toast and no routing change', { options: { weeklyPacing: 'off' } }, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe"}')
+      const c = ui($, on)
+      await weekly($, seen, 90)
+      expect(seen.statuses.at(-1)).not.toContain('pace')
+      expect(c.toasts).toEqual([])
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(route(seen)).toContain('assigned to opus')
+    })
+
+    test('steer moves an unsure decide to execute while ahead, and counts it', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe a design"}')
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(route(seen)).toContain('assigned to sonnet')
+      expect(route(seen)).toContain('(pacing: weekly 82%, 1.6× pace)')
+      expect(await statsOf($)).toContain('weekly pacing: 1')
+    })
+
+    // The controls: the same verdict is not steered when behind pace, in warn mode, or when sure.
+    test('steer leaves a verdict alone unless it is an unsure decide and the week is ahead', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
+      const seen = world($, on, ['{"tier":"decide","sure":false,"reason":"maybe"}', '{"tier":"decide","sure":true,"reason":"design"}', '{"tier":"execute","sure":false,"reason":"hmm"}'])
+      ui($, on)
+      await $.prompt.submit({ text: 'no weekly window yet' } as never)
+      expect(route(seen, 0)).toContain('assigned to opus')
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'a sure decision' } as never)
+      expect(route(seen, 1)).toContain('assigned to opus')
+      await $.prompt.submit({ text: 'unsure execute' } as never)
+      // An unsure execute after a decide is held at decide by the old rule, not by pacing.
+      expect(route(seen, 2)).toContain('assigned to opus')
+      expect(route(seen, 2)).not.toContain('pacing')
+    })
+
+    test('warn does not steer', async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe"}')
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(route(seen)).toContain('assigned to opus')
+    })
+
+    test('steer never overrides #model, a pin or a warm Opus cache, and counts nothing for them', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe"}')
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'decide this #opus' } as never)
+      expect(route(seen, 0)).toContain('assigned to opus')
+      await cmd($, 'pin opus 1')
+      await $.prompt.submit({ text: 'pinned decision' } as never)
+      expect(route(seen, 1)).toContain('assigned to opus')
+      seen.usage.push(U(1000, 500, 220_000))
+      await step($, 't2')
+      await $.prompt.submit({ text: 'think about it with a warm cache' } as never)
+      expect(route(seen, 2)).toContain('assigned to opus')
+      expect(route(seen, 2)).toContain('classifier skipped')
+      expect(seen.asked).toEqual([])
+      expect(await statsOf($)).toContain('weekly pacing: 0')
+    })
+
+    // The warm-cache keep applies after the classifier: a small warm Opus context is still kept on Opus when moving
+    // would cost more than it saves, so a steer must not cause a cache rewrite.
+    test('a steered turn on a warm Opus context stays on Opus and is not counted as steered', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe"}')
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'seed #opus' } as never)
+      seen.usage.push(U(1000, 500, 20_000))
+      await step($, 't1')
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(seen.asked).toEqual(['haiku'])
+      expect(route(seen, 1)).toContain('assigned to opus')
+      expect(await statsOf($)).toContain('weekly pacing: 0')
+    })
+
+    test('the override persists, wins over the option, and default removes it', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: warn (option)')
+      expect(await cmd($, 'pacing steer')).toBe('Weekly pacing set to steer.')
+      expect(seen.store.pacing).toBe('steer')
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: steer (override)')
+      expect(await cmd($, 'pacing nonsense')).toContain('Usage:')
+      expect(await cmd($, 'pacing default')).toContain('using the option: warn')
+      expect(seen.store.pacing).toBeUndefined()
+      expect(await cmd($, 'pacing')).toContain('(option)')
+    })
+
+    test('a stored override is read by a later session and status lists the mode and the figures', async ($, on) => {
+      const seen = world($, on, LOOKUP, { store: { pacing: 'off' } })
+      ui($, on)
+      await weekly($, seen, 80)
+      const status = await cmd($, 'status')
+      expect(status).toContain('Weekly pacing: off (override)')
+      expect(status).toContain('weeklyPacing: warn')
+      expect(status).toContain('learnFromCorrections: true')
+      expect(status).toContain('autoOpenPane: false')
+    })
+  })
+
+  describe('router pane', () => {
+    const PANE_PROPS = { title: 'Router', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 24 }, view: {} } as never
+    const mountPane = ($: any, surface: 'terminal' | 'desktop') =>
+      $.ui.mount({ plugin: 'model-router', surface, component: 'Pane', requestId: 'model-router', props: PANE_PROPS })
+
+    test('/model-router pane opens the pane, and the same command closes it', async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      expect(await cmd($, 'pane')).toBe('Router pane opened.')
+      expect(c.opened.map(o => o.id)).toEqual(['model-router'])
+      expect(await cmd($, 'pane')).toBe('Router pane closed.')
+      expect(c.closed).toEqual(['model-router'])
+    })
+
+    test('nothing opens by itself by default', async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'desktop', isInteractive: true })
+      expect(c.opened).toEqual([])
+    })
+
+    for (const [surface, opens] of [['desktop', true], ['terminal', false]] as const) {
+      test(`autoOpenPane opens the pane at start only where it is a sidebar (${surface})`, { options: { autoOpenPane: true } }, async ($, on) => {
+        world($, on, LOOKUP)
+        const c = ui($, on)
+        await $.session.start({ cwd: '/plugin', surface, isInteractive: true })
+        expect(c.opened.map(o => o.id)).toEqual(opens ? ['model-router'] : [])
+      })
+    }
+
+    for (const surface of ['terminal', 'desktop'] as const) {
+      test(`the pane lists the turn, its totals and the seven days (${surface})`, async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        // A turn on Haiku whose first request wrote a big cache from cold, then a day of earlier spend.
+        await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
+        seen.usage.push(U(1000, 500, 0, 150_000, 'claude-haiku-5-5'))
+        await step($, 't1')
+        await $.turn.complete(completion('t1'))
+        const ui = await mountPane($, surface)
+        expect(await ui.find({ type: 'Text', text: /Haiku medium/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /cold/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /\$\d+\.\d+ · 151\.5k/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /router on/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /session .* token/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /today .* token/ })).toBeDefined()
+        if (surface === 'desktop') {
+          expect(await ui.find({ type: 'Svg' } as never)).toBeDefined()
+        } else {
+          expect(await ui.find({ type: 'Text', text: /7-day spend: .*[▁▂▃▄▅▆▇█]{7}/ })).toBeDefined()
+        }
+        await ui.unmount()
+      })
+    }
+
+    test('the pane marks a kept cache, a forced turn, a pin and an escalation trail', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'quick #haiku' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'needs code' } as never)
+      await $.turn.complete(completion('t1'))
+      await cmd($, 'pin opus 1')
+      await $.prompt.submit({ text: 'pinned' } as never)
+      await $.turn.complete(completion('t2'))
+      const ui = await mountPane($, 'terminal')
+      expect(await ui.find({ type: 'Text', text: /forced.*→ sonnet\/medium|→ sonnet\/medium.*forced/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /pinned \(1 left\)/ })).toBeDefined()
+      expect(seen.store.corrections).toBeUndefined()
+    })
+
+    for (const surface of ['terminal', 'desktop'] as const) {
+      test(`correction buttons hide the tier the turn had, and pressing one records it (${surface})`, async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        ui($, on)
+        await $.prompt.submit({ text: 'rename the helper' } as never)
+        await $.turn.complete(completion('t1'))
+        const ui2 = await mountPane($, surface)
+        expect(await ui2.find({ key: 'wrong-decide' })).toBeDefined()
+        expect(await ui2.find({ key: 'wrong-execute' })).toBeDefined()
+        expect(await ui2.find({ key: 'wrong-lookup' })).toBeUndefined()
+        await ui2.press({ key: 'wrong-decide' })
+        expect((seen.store.corrections as Correction[])[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
+        await ui2.unmount()
+      })
+    }
+
+    test('with learning off the pane has no correction buttons', { options: { learnFromCorrections: false } }, async ($, on) => {
+      world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      const ui = await mountPane($, 'desktop')
+      expect(await ui.find({ key: 'wrong-decide' })).toBeUndefined()
+      expect(await ui.find({ type: 'Text', text: /Haiku medium/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test('the pane header shows the weekly pace and the pin, and an empty session says so', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      ui($, on)
+      await weekly($, seen, 80)
+      await cmd($, 'pin opus')
+      const ui2 = await mountPane($, 'terminal')
+      expect(await ui2.find({ type: 'Text', text: /router on · Weekly 80% .* pace 1\.6× ahead · 📌 Opus/ })).toBeDefined()
+      expect(await ui2.find({ type: 'Text', text: /No routed turns/ })).toBeDefined()
+      await ui2.unmount()
+    })
+
+    test('the turn list keeps at most 50 records', async ($, on) => {
+      world($, on, LOOKUP)
+      for (let i = 1; i <= 52; i++) {
+        await $.prompt.submit({ text: `job ${i} #haiku` } as never)
+        await $.turn.complete(completion(`t${i}`))
+      }
+      const big = { ...(PANE_PROPS as object), scroll: { offset: 0, bodyRows: 200 } } as never
+      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'Pane', requestId: 'model-router', props: big })
+      const rows = await ui.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })
+      expect(rows).toHaveLength(50)
+      await ui.unmount()
+    })
+
+    // WHY: the band must read exactly as before when nothing new is switched on.
+    test('without a pin the band text is the one the earlier versions drew', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
+      await step($, 't1')
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await band.find({ text: /^Haiku · medium — find/ })).toBeDefined()
+      expect(seen.asked).toEqual(['haiku'])
+    })
+  })
+
+  describe('steered turns and the terminal auto-open (1.1.0 review)', () => {
+    // WHY: a steered turn's tier is pacing's choice; a correction would teach Haiku "routed execute" for a decide verdict.
+    test('a steered turn cannot be corrected, by wrong or by an escalation', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe a design"}')
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(route(seen)).toContain('assigned to sonnet')
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'a design call' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('No classified turn')
+      expect(seen.store.corrections).toBeUndefined()
+    })
+
+    const FULL = { columns: 100, rows: 30, isFullscreen: true }
+    const bandWith = ($: any, viewport?: { columns: number; rows: number; isFullscreen: boolean }) =>
+      $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS, ...(viewport ? { viewport } : {}) })
+
+    test('a fullscreen terminal opens the pane once when autoOpenPane is on', { options: { autoOpenPane: true } }, async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      const first = await bandWith($, FULL)
+      expect(c.opened.map(o => o.id)).toEqual(['model-router'])
+      await first.unmount()
+      // The person closes it; a later redraw must not bring it back.
+      c.isOpen = false
+      const second = await bandWith($, FULL)
+      expect(c.opened).toHaveLength(1)
+      await second.unmount()
+    })
+
+    test('a terminal that is not fullscreen, or one that does not say, never opens it', { options: { autoOpenPane: true } }, async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      await (await bandWith($, { ...FULL, isFullscreen: false })).unmount()
+      await (await bandWith($)).unmount()
+      expect(c.opened).toEqual([])
+    })
+
+    test('with autoOpenPane off a fullscreen terminal opens nothing', async ($, on) => {
+      world($, on, LOOKUP)
+      const c = ui($, on)
+      await (await bandWith($, FULL)).unmount()
+      expect(c.opened).toEqual([])
+    })
+  })
+
+  describe('review fixes (1.1.0)', () => {
+    const FULL = { columns: 100, rows: 30, isFullscreen: true }
+    const PANE_PROPS = { title: 'Router', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 24 }, view: {} } as never
+    const STEER = { options: { weeklyPacing: 'steer' } }
+
+    // WHY: the buttons must correct the turn whose time they show, not whichever turn is latest when pressed.
+    test('the pane targets the latest correctable turn, skips a newer steered one, and a press hits exactly that turn', STEER, async ($, on) => {
+      const seen = world($, on, [LOOKUP, '{"tier":"decide","sure":false,"reason":"maybe"}', LOOKUP])
+      ui($, on)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      await seen.clock.advance(5 * 60_000)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'think about the design' } as never)
+      expect(route(seen, 1)).toContain('assigned to sonnet')
+      await $.turn.complete(completion('t2'))
+      const pane = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'Pane', requestId: 'model-router', props: PANE_PROPS })
+      // The first turn ran at minute 0 and the steered one at minute 5: the label is the first turn's time.
+      expect(await pane.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(0)}\\)`) })).toBeDefined()
+      expect(await pane.find({ key: 'wrong-decide' })).toBeDefined()
+      // A newer correctable turn completes: the pane redraws, and what it then shows is what a press corrects.
+      await seen.clock.advance(5 * 60_000)
+      await $.prompt.submit({ text: 'list the files' } as never)
+      await $.turn.complete(completion('t3'))
+      expect(await pane.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(10 * 60_000)}\\)`) })).toBeDefined()
+      await pane.press({ key: 'wrong-decide' })
+      const stored = seen.store.corrections as Correction[]
+      expect(stored).toHaveLength(1)
+      expect(stored[0]!.text).toBe('list the files')
+      await pane.unmount()
+    })
+
+    test('a steer does not leak into later routing: an unsure execute after it is held at decide as without a steer', STEER, async ($, on) => {
+      const seen = world($, on, ['{"tier":"decide","sure":false,"reason":"maybe"}', '{"tier":"execute","sure":false,"reason":"hmm"}'])
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(route(seen, 0)).toContain('assigned to sonnet')
+      await $.prompt.submit({ text: 'then do something' } as never)
+      expect(route(seen, 1)).toContain('assigned to opus')
+      expect(route(seen, 1)).toContain('unsure: not downgrading')
+    })
+
+    test('steering never touches a subagent spawn', STEER, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe a design"}')
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.agent.spawn({ prompt: 'work out how the retry design should behave', description: 'design', subagentType: 'general-purpose', parentModel: 'claude-opus-5-5' } as never)
+      // An unsure decide for a subagent is today's decision (inherit the parent: no model of its own), never sonnet.
+      expect(seen.asked).toEqual(['haiku'])
+      expect(seen.agents).toEqual([undefined])
+    })
+
+    test('a prompt another plugin drops is not counted as steered', STEER, async ($, on) => {
+      const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe"}', { drop: true })
+      ui($, on)
+      await weekly($, seen, 82, 0.5)
+      await $.prompt.submit({ text: 'think about it' } as never)
+      expect(await statsOf($)).toContain('weekly pacing: 0')
+    })
+
+    test('a pane closed by the person stays closed after /clear', { options: { autoOpenPane: true } }, async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      const c = ui($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'desktop', isInteractive: true })
+      expect(c.opened).toHaveLength(1)
+      c.isOpen = false
+      await $.session.end({ reason: 'clear', sessionId: 'sess-1' } as never)
+      seen.sessionId = 'sess-2'
+      await (await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS, viewport: FULL })).unmount()
+      await $.session.start({ cwd: '/plugin', surface: 'desktop', isInteractive: true })
+      expect(c.opened).toHaveLength(1)
+    })
+
+    test('a stored off override is respected from the first measurement, without a session.start', async ($, on) => {
+      const seen = world($, on, LOOKUP, { store: { pacing: 'off' } })
+      const c = ui($, on)
+      await weekly($, seen, 90)
+      expect(seen.statuses.at(-1)).not.toContain('pace')
+      expect(c.toasts).toEqual([])
+    })
+
+    test('a failed first read of the stored corrections is retried, not given up on', async ($, on) => {
+      let failing = true
+      on('store.get', { key: 'corrections' }, async (_$: unknown, e: any, next: any) => failing ? { deny: 'store unavailable' } : next(e))
+      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] } })
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(seen.systems[0]).toBe(classifierSystem('en'))
+      failing = false
+      await new Promise(resolve => (globalThis as any).setTimeout(resolve, 1100))
+      await $.prompt.submit({ text: 'find more files' } as never)
+      expect(seen.systems[1]).toContain('rename the helper')
+    })
+
+    test('clear and pacing say when the store write failed', async ($, on) => {
+      on('store.delete', { key: 'corrections' }, async () => ({ deny: 'disk full' }))
+      on('store.set', { key: 'pacing' }, async () => ({ deny: 'disk full' }))
+      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] } })
+      expect(await cmd($, 'corrections clear')).toContain('could not be deleted')
+      expect(await cmd($, 'pacing steer')).toContain('this session only')
+      // The in-memory list is empty either way: the next classification carries no block.
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(seen.systems.at(-1)).toBe(classifierSystem('en'))
+    })
+
+    test('an inherited turn lists only its own escalations and no earlier cache keep', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'look at the auth flow' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'needs code' } as never)
+      seen.usage.push(U(1000, 500, 5000, 0, 'claude-sonnet-5-5'))
+      await step($, 't1', 'claude-opus-5-5[1m]')
+      await $.turn.complete(completion('t1'))
+      // A turn with no person prompt continues the route within the cache window.
+      await $.turn.start({ text: 'task notification', turnId: 't2' } as never)
+      await $.turn.complete(completion('t2'))
+      const big = { ...(PANE_PROPS as object), scroll: { offset: 0, bodyRows: 40 } } as never
+      const pane = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'Pane', requestId: 'model-router', props: big })
+      const rows = (await pane.findAll({ type: 'Text', text: /^<?\$\d/ })).map(x => x.text)
+      expect(rows).toHaveLength(2)
+      expect(rows[0]).toContain('→ sonnet/medium')
+      expect(rows[1]).not.toContain('→ sonnet')
+      await pane.unmount()
+    })
+  })
 })
