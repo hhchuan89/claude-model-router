@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { FsEntry, FsStat } from 'claude-code'
 import type { Tally } from '../types'
-import { Backoff, EventLogs, mergeLogs } from '../hooks/log'
+import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
@@ -6116,6 +6116,29 @@ describe('append-only event logs', () => {
     expect(removed).toEqual([expired])
     expect((writer as any).pending.size).toBe(1)
     expect((await new EventLogs().read(io, 'old')).events.map(e => e.reason)).toEqual(['pending'])
+  })
+
+  // WHY: on Windows the engine cannot start rm (Git's usr/bin is not on the system PATH). Every daily attempt failed
+  // and printed "bookkeeping failed" in the chat; retention must not try there.
+  test('retention is skipped when the plugin is installed on Windows: no rm, no rmdir, no error', async ($, on) => {
+    const seen = world($, on, null)
+    const root = 'C:\\Users\\me\\.claude\\plugins\\cache\\model-router'
+    const io = ioOf(seen, root)
+    const writer = new EventLogs()
+    io.now = () => 0
+    writer.event('old', event('expired'))
+    await writer.flush(io)
+    const ran: string[][] = []
+    await writer.prune({ ...io, run: async argv => { ran.push(argv); throw new Error("Command 'rm' not found") } }, 31 * 24 * 3600_000, 30)
+    expect(ran).toEqual([])
+  })
+
+  test('Windows install paths are recognised; POSIX paths are not', async () => {
+    expect(isWindowsPath('C:\\Users\\me\\.claude')).toBe(true)
+    expect(isWindowsPath('c:/Users/me/.claude')).toBe(true)
+    expect(isWindowsPath('\\\\server\\share\\.claude')).toBe(true)
+    expect(isWindowsPath('/home/me/.claude')).toBe(false)
+    expect(isWindowsPath('/plugin')).toBe(false)
   })
 
   test('retention preserves batches written after its file listing', async ($, on) => {

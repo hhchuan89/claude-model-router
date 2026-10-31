@@ -2,5 +2,5 @@
   "name": "claude-model-router",
   "description": "A local, private model router for Claude Code: Haiku for lookups, Sonnet for execution, Opus for decisions, with token and cost estimates. An alternative to Jev / jev-router that never sends your prompts to a third party.",
   "owner": { "name": "hhchuan89" },
-  "plugins": [{ "name": "model-router", "version": "1.0.0", "source": "./" }]
+  "plugins": [{ "name": "model-router", "version": "1.0.1", "source": "./" }]
 }
