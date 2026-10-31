@@ -31,6 +31,8 @@ export class Backoff {
 
 const missing = (err: unknown) => /ENOENT|ENOTDIR|no file|not found/i.test(String(err))
 const safeName = (name: string) => /^[a-zA-Z0-9_-]+$/.test(name)
+// A drive letter (C:\ or C:/) or a UNC share: the plugin is installed on Windows.
+export const isWindowsPath = (path: string) => /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
 const attemptOf = (name: string) => /^([a-zA-Z0-9-]+)_(\d+)_(\d+)\.json$/.exec(name)
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 const finite = (value: unknown) => typeof value === 'number' && Number.isFinite(value)
@@ -182,6 +184,9 @@ export class EventLogs {
   }
 
   async prune(io: LogIO, now: number, days: number) {
+    // Deletion runs rm and rmdir, which the engine cannot start on Windows (Git's usr/bin is not on the system PATH):
+    // every attempt failed and logged "bookkeeping failed" in the chat. Skip it there; old batches stay on disk.
+    if (isWindowsPath(io.root)) return
     const root = logDir(io.root)
     const dirs = await io.list(root).catch(err => {
       if (!missing(err)) throw err

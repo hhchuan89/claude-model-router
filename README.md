@@ -197,6 +197,8 @@ and stats are deltas for that batch. Reading merges all batches by time, dedupli
 The timestamp is Unix time in milliseconds; the attempt number increases on every write, including retries.
 Legacy `events-<sessionId>.json` files are still read, never rewritten or deleted. Individual timestamped batches
 older than 30 days are pruned, including those in active sessions; empty batch directories are then removed.
+Pruning deletes with `rm` and `rmdir`, which the engine cannot start on Windows, so on Windows it is skipped and old
+batches stay on disk (they are small; delete them by hand if you want).
 Untimestamped batches are kept. Logs stay on your machine for your own analysis; writing is best effort and
 never affects a turn. Only unsaved batches stay in memory.
 

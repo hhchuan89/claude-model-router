@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-10-31
+
+### Fixed
+- Event-log retention is skipped on Windows. It deletes old batches with `rm` and `rmdir`, which the engine cannot start
+  there (Git's `usr\bin` is not on the system PATH), so every daily attempt failed and printed
+  `model-router: bookkeeping failed: … Command 'rm' not found` in the chat. Old batches now stay on disk on Windows.
+  A Windows install is recognised by its plugin path (a drive letter or a UNC share).
+
 ## [1.0.0] - 2026-10-30
 
 1.0.0 builds on 0.10.0, hardens compaction guards against races and the cache deadline, makes the meter honest about
