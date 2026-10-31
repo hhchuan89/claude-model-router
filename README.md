@@ -189,6 +189,50 @@ option is enabled. Pass `id` (the tool-use id), optionally `startLine` / `endLin
 at `shrinkToolOutput` characters, including continuation instructions; use the returned `offset` with the same
 selection to page through long lines without losing characters. Stats count reductions and characters removed.
 
+## Router pane
+
+`/model-router pane` opens a pane beside the chat (or above the prompt where the surface has no room for a sidebar) and
+the same command closes it. Closing the pane is the off switch; with `autoOpenPane` on it also opens by itself, once
+per session, on Claude Code Desktop and on the terminal in fullscreen. While it is closed the router only keeps a small
+per-turn record in memory-backed state (the last 50 main turns of the session); nothing else is computed for it.
+
+It shows, top to bottom: router on or off, weekly usage and pace, and the active pin; this session's main turns with
+time, model and effort (coloured by model), cost, tokens, and markers for a cold cache, a warm cache that was kept,
+the escalation trail, a pinned or forced turn and a correction, then the reason; the session and today totals with the
+difference against Opus prices; the last seven days of spend (a bar chart with an Opus-priced marker per day on
+Desktop, a one-line sparkline on the terminal); and, with learning on, `Should have been: [lookup] [execute] [decide]`
+buttons for the last classified turn.
+
+## Pin and corrections
+
+`#opus`, `#sonnet` or `#haiku` in a message still pins that one turn. `/model-router pin <model> [turns]` holds the main
+conversation on a model for the next `turns` person turns (no number: until `/model-router unpin` or the session ends).
+A pinned turn behaves like a `#model` turn: no classifier call, no warm-cache keeping, and the band shows `📌`. The
+count goes down when the turn starts, so a prompt another plugin holds back does not use a pin up, and a `#model` in
+the message wins for its turn. Pinning needs `mainRouting`.
+
+The classifier is not always right. When it sorted a turn too low, tell it: `/model-router wrong <tier>` (or the pane
+buttons) records the turn's masked prompt snippet with the tier it should have had; so does the model escalating itself
+to a bigger **model** than the classified tier's (an effort-only raise does not count). Only turns the classifier
+actually sorted can be corrected, not forced, pinned, inherited or failed-classification turns. With `learnFromCorrections`
+on (the default) the newest 8 corrections are added to the classifier's system prompt as examples, for the main
+conversation and for subagents. With no corrections, or with the option off, the prompt is exactly the plain one.
+`/model-router corrections` lists them, `/model-router corrections clear` deletes them, and stats count them.
+
+## Weekly pacing
+
+When the engine reports a weekly window, the router compares how much of it is used with how much of the week has gone.
+Ahead means at least 25% used and a pace (used over elapsed) of at least 1.2; before a tenth of the week has gone it
+does not judge. `weeklyPacing` sets what happens then, and `/model-router pacing <off|warn|steer>` overrides it across
+sessions (`pacing default` removes the override, `pacing` alone shows the mode and the figures):
+
+- `off`: nothing: no text, no toast, no routing change.
+- `warn` (the default): the status line appends `· pace 1.4× ahead`, and one toast says so, at most once per weekly window
+  (remembered across sessions).
+- `steer`: `warn`, plus one routing change while ahead, on the main thread only: a decision the classifier was unsure of
+  goes to Sonnet instead of Opus. `#model`, a pin, a sure decision, escalation and subagents are untouched, and a warm
+  large Opus context still stays on Opus, so steering never causes a cache rewrite. Stats count the steered turns.
+
 ## Events log
 
 The router writes new JSON batches to `~/.claude/model-router/<sessionId>/<writerId>-<sequence>_<timestamp>_<attempt>.json` (the `.claude`
@@ -239,6 +283,10 @@ own effort. `stats` covers routed subagents only.
 - **Nothing else is collected.** No telemetry and no analytics. The router makes no network call of its own: the only
   traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
   the events log are written to local files only.
+- **Corrections (on by default).** `/model-router wrong`, the pane buttons and a model-raising escalation store up to 40
+  masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the newest 8 are sent to
+  Haiku as part of every classifier call. Turn `learnFromCorrections` off to stop recording and sending, and run
+  `/model-router corrections clear` to delete what is stored. The pane keeps no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
   also sends a one-word probe to check the model exists. With `reviewModel` empty, none of this happens.
@@ -267,6 +315,11 @@ This is an estimate; see "Assumptions in the meter" below.
 | `/model-router checkpoint [note]` | Compact between tasks, preserving the information needed to continue |
 | `/model-router context` | Main context size and local category estimates, or an explicit unavailable message; makes no token-count requests |
 | `/model-router on` / `/model-router off` | Enable or disable routing and guards |
+| `/model-router pane` | Open the router pane, or close it if it is open (see "Router pane") |
+| `/model-router pin <haiku\|sonnet\|opus> [turns]` / `/model-router unpin` | Hold the main conversation on one model for the next `turns` turns, or until unpinned (see "Pin and corrections") |
+| `/model-router wrong <lookup\|execute\|decide>` | Tell the router the last classified turn should have been that tier |
+| `/model-router corrections` / `/model-router corrections clear` | List the stored corrections, or delete them |
+| `/model-router pacing [off\|warn\|steer\|default]` | Show or override the weekly pacing mode (see "Weekly pacing") |
 
 With no argument, `/model-router` shows stats. Other arguments, including `help`, show the usage line.
 The engine's `/compact` also works; it is separate from the router's commands.
@@ -312,6 +365,9 @@ values, including router on/off, idle minutes, the context cap and `compactMinCo
 | `compactMinContext` | `100000` | Tokens ≥ 0; no configured maximum | Minimum context for idle compaction and checkpoint hints (a small context is cheap to rewrite) |
 | `checkpointHints` | `false` (off) | `true`, `false` | Suggest a task-boundary checkpoint when estimated savings exceed its cost; never compacts automatically |
 | `shrinkToolOutput` | `0` (off) | 0–1,000,000 characters; active at 20,000–1,000,000 | Reduce large Bash/MCP logs and progress output, archive originals and fetch capped slices. Values outside the active range count as off |
+| `autoOpenPane` | `false` (off) | `true`, `false` | Also open the router pane by itself, once per session, where it would be a sidebar (Claude Code Desktop, or the terminal in fullscreen). Off: only `/model-router pane` opens it |
+| `learnFromCorrections` | `true` (on) | `true`, `false` | Record corrections and send the newest 8 to the classifier (see "Pin and corrections" and Privacy). Off: none are written or sent |
+| `weeklyPacing` | `warn` | `off`, `warn`, `steer` | What the router does when weekly usage runs ahead of an even pace (see "Weekly pacing"); `/model-router pacing` overrides it |
 | `compactAtContext` | `0` (off) | Tokens ≥ 0; active at ≥ 100,000; no configured maximum | Compact between turns when main context reaches this size (e.g. `200000`), so every step does not re-read a huge cache. Below `100000` counts as off |
 
 `checkpointHints` and `shrinkToolOutput` require opt-in. Existing option defaults are unchanged in 1.0.0.

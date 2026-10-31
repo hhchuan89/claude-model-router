@@ -16,6 +16,30 @@ export type Route = {
   // The classifier failed on a first turn and there was no earlier route to keep: this turn is unrouted and runs
   // on the session's own model and effort. tier/model/effort are placeholders and are never applied.
   sessionModel?: boolean
+  // How the route was reached; the pane shows it and only 'classified' turns can be corrected.
+  how?: TurnHow
+  // A pacing steer moved this turn from decide to execute (counted once, unless the warm cache kept it on Opus).
+  steered?: boolean
+}
+
+export type TurnHow = 'classified' | 'forced' | 'pinned' | 'inherited' | 'kept-tier' | 'warm-skip' | 'session-model'
+
+// One main turn as the pane lists it. The prompt snippet is never in here: it stays in memory for corrections.
+export type TurnRecord = {
+  turnId: string
+  at: number
+  tier: Tier
+  model: ModelKey | 'session'
+  effort?: Effort
+  keptFrom?: ModelKey
+  reason: string
+  trail: string[]
+  tokens: number
+  cost: number
+  // The turn's first request rewrote a cold cache (the same detection as the cacheExpiryRewrites counter).
+  cold: boolean
+  how: TurnHow
+  corrected?: Tier
 }
 
 export type Tally = {
@@ -39,6 +63,7 @@ declare module 'claude-code' {
       route: Route | null
       enabled: boolean
       meter: { turn: Tally; today: Tally }
+      turns: Shaped<TurnRecord[]>
     }
   }
 }
