@@ -141,8 +141,8 @@ let turnCold = false
 let turnBase = { tokens: 0, cost: 0 }
 // An inherited turn's route already carries earlier escalations: its own start at this many trail steps.
 let turnTrailBase = 0
-// The seven days behind the expanded band, cached by day and latest turn: no store scan per redraw.
-let weekCache: { day: string; key: string; series: DayCost[] } | undefined
+// The seven days behind the expanded band and this session's tokens, cached by day and latest turn: no store scan per redraw.
+let weekCache: { day: string; key: string; series: DayCost[]; sessionTokens: number } | undefined
 // Whether the band shows its details; a per-person choice, kept in the store (read with the other preferences).
 let bandExpanded = false
 // The turn a correction was just recorded for: the band thanks the person in place of the buttons.
@@ -283,6 +283,8 @@ const STR = {
     unrouted: (why: string) => `路由器没有为这一轮选择模型${why ? `（${why}）` : ''}`,
     thisReply: '本次回复',
     todayWord: '今天',
+    todayTokens: (n: string) => `${n} token`,
+    tokensUsed: (session: string, today: string, week: string) => `已用 token：本会话 ${session} · 今天 ${today} · 近 7 天 ${week}`,
     week: (pct: string) => `本周已用 ${pct}%`,
     aheadOfPace: '，进度偏快',
     underCent: '不足 $0.01',
@@ -415,6 +417,8 @@ const STR = {
     unrouted: (why: string) => `the router did not choose this turn${why ? ` (${why})` : ''}`,
     thisReply: 'This reply',
     todayWord: 'Today',
+    todayTokens: (n: string) => `${n} tok`,
+    tokensUsed: (session: string, today: string, week: string) => `Tokens used: this session ${session} · today ${today} · last 7 days ${week}`,
     week: (pct: string) => `Week ${pct}% used`,
     aheadOfPace: ', ahead of pace',
     underCent: 'under $0.01',
@@ -1203,7 +1207,7 @@ async function writeTurnRecord($: EngineInterface, session: Session, r: Route, t
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? [...list, rec].slice(-MAX_TURNS) : list), undefined, retryFor(session, 'turn record'))
 }
 
-// The seven days of spend and this session's total in one pass over the store keys.
+// The seven days of spend and tokens in one pass over the store keys.
 async function weekSeries($: EngineInterface, session: Session, now: number): Promise<DayCost[] | undefined> {
   const days = lastDays(now, PACE_DAYS, dayKey)
   const byDay = new Map<string, Tally>()
@@ -1214,7 +1218,7 @@ async function weekSeries($: EngineInterface, session: Session, now: number): Pr
     if (t) byDay.set(m[1]!, merge(byDay.get(m[1]!) ?? EMPTY, t))
   }
   if (await stillHere($, session) !== 'same') return undefined
-  return days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0 }))
+  return days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0, tokens: byDay.get(day)?.tokens ?? 0 }))
 }
 
 // A dollar amount in plain words: under a cent says so.
@@ -2553,7 +2557,7 @@ export const register: Register = (on, options) => {
 
     if (!(await read($, enabled))) {
       return (
-        <Box flexDirection="column">
+        <Box flexDirection="column" marginTop={1}>
           <Box flexDirection="row" gap={1} alignItems="center">
             <Box flexGrow={1} flexShrink={1} width={0}>
               <Text dimColor wrap="truncate-end">⚙ {str.paused}</Text>
@@ -2574,7 +2578,8 @@ export const register: Register = (on, options) => {
       const key = list.at(-1)?.turnId ?? ''
       if (weekCache === undefined || weekCache.day !== dayKey(now) || weekCache.key !== key) {
         const series = await bookkeeping($, () => weekSeries($, session, now), undefined, retryFor(session, 'band week'))
-        if (series !== undefined) weekCache = { day: dayKey(now), key, series }
+        const mine = series === undefined ? undefined : await bookkeeping<Tally | undefined>($, () => sessionTally($, session), undefined, retryFor(session, 'band session'))
+        if (series !== undefined && mine !== undefined && await stillHere($, session) === 'same') weekCache = { day: dayKey(now), key, series, sessionTokens: mine.tokens }
       }
     }
     if (await stillHere($, session) !== 'same') return below
@@ -2583,15 +2588,16 @@ export const register: Register = (on, options) => {
     const diff = saved(today).usd
     const w = weeklyLimit()
     const ahead = w !== undefined && pacingMode() !== 'off' && paceOf(w, now).state === 'ahead'
-    // Row 2, in the order it is cut at narrow widths: the comparison goes first, then the week, then the context.
+    // Row 2, in the order it is cut at narrow widths: the comparison goes first, then the week, then the context, and
+    // today's tokens only when nothing else is left to cut.
     const tokens = contextReading().tokens
     const warnAt = Math.min(contextWindow ? contextWindow * 0.8 : Infinity, capOn ? compactAtContext : Infinity)
     const contextPart = tokens === undefined ? undefined : { text: str.contextPart(compactTokens(tokens), contextWindow ? compactTokens(contextWindow) : undefined), warn: tokens >= warnAt }
     const cmp = Math.abs(diff) > 0 ? `${lang === 'zh' ? '' : ' '}${(diff >= 0 ? str.cmpLess : str.cmpMore)(fmtUsd(Math.abs(diff)))}` : ''
     type Seg = { text: string; warn?: boolean }
-    const row = (withCmp: boolean, withWeek: boolean, withContext: boolean): Seg[] => [
+    const row = (withCmp: boolean, withWeek: boolean, withContext: boolean, withTokens: boolean): Seg[] => [
       { text: `${str.thisReply} ${plainUsd(lang, m.turn.cost)}` },
-      { text: ` · ${str.todayWord} ${plainUsd(lang, today.cost)}${withCmp ? cmp : ''}` },
+      { text: ` · ${str.todayWord} ${withTokens ? `${str.todayTokens(fmtTokens(today.tokens))} · ` : ''}${plainUsd(lang, today.cost)}${withCmp ? cmp : ''}` },
       ...(withContext && contextPart ? [{ text: ` · ${contextPart.text}`, warn: contextPart.warn }] : []),
       ...(withWeek && w ? [{ text: ` · ${str.week(String(w.percentUsed))}` }] : []),
       ...(withWeek && w && ahead ? [{ text: str.aheadOfPace, warn: true }] : []),
@@ -2599,7 +2605,8 @@ export const register: Register = (on, options) => {
     const room = e.props.bodyColumns - 2
     const wide = (segs: Seg[]) => segs.reduce((sum, sg) => sum + cellWidth(sg.text), 0)
     // Whole parts only: the first arrangement that fits, else the shortest.
-    const costSegs = [row(true, true, true), row(false, true, true), row(false, false, true), row(false, false, false)].find(segs => wide(segs) <= room) ?? row(false, false, false)
+    const costSegs = [row(true, true, true, true), row(false, true, true, true), row(false, false, true, true), row(false, false, false, true), row(false, false, false, false)]
+      .find(segs => wide(segs) <= room) ?? row(false, false, false, false)
     const cache = cacheWarning(lang, now, compactMinContext > 0 ? compactMinContext : 100_000)
 
     // The terminal's table has no Svg (it would draw a fragment: nothing): it gets a labelled text chart instead.
@@ -2608,11 +2615,12 @@ export const register: Register = (on, options) => {
     const series = weekCache?.series ?? []
     const chart = Svg === undefined && series.length > 0 ? textChart(series, e.props.bodyColumns - 2, lang) : undefined
     const total = weekTotals(chart?.days ?? series)
+    const tokensLine = weekCache === undefined ? '' : str.tokensUsed(fmtTokens(weekCache.sessionTokens), fmtTokens(today.tokens), fmtTokens(series.reduce((sum, d) => sum + d.tokens, 0)))
     const target = learning ? [...shown].reverse().find(isCorrectable) : undefined
     const answers: [string, Tier][] = [['Haiku', 'lookup'], ['Sonnet', 'execute'], ['Opus', 'decide']]
 
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" marginTop={1}>
         {cache !== '' && <Text color="warning" wrap="truncate-end">{cache}</Text>}
         <Box flexDirection="row" gap={1} alignItems="center">
           <Box flexGrow={1} flexShrink={1} width={0}>
@@ -2627,6 +2635,7 @@ export const register: Register = (on, options) => {
         {expanded && (
           <Box flexDirection="column" paddingLeft={2}>
             {contextLine(lang, now) !== '' && <Text dimColor wrap="truncate-end">{contextLine(lang, now)}</Text>}
+            {tokensLine !== '' && <Text dimColor wrap="truncate-end">{tokensLine}</Text>}
             {shown.length === 0 && <Text dimColor>{str.histNone}</Text>}
             {shown.map(t => {
               const p = turnParts(t, lang)

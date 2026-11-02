@@ -12,8 +12,8 @@ routes and prompts exactly as 1.0.1 does.
 
 ### Added
 
-- A plainer band. Two rows (what the router chose and why, and `This reply $0.74 · Today $28.00 (−$8.94 vs all-Opus) · Context 106k of
-  1M · Week 20% used`, whole parts dropped on a narrow terminal, the context in warning colour from 80% of the window), a **Details** button that opens the last 5 replies, a conversation line first (size, window, percent, how long the cache stays warm), a titled 7-day chart with its total
+- A plainer band. Two rows under one empty row that sets them off from the conversation (what the router chose and why, and `This reply $0.74 · Today 49.2M tok · $28.00 (−$8.94 vs all-Opus) · Context 106k of
+  1M · Week 20% used`, whole parts dropped on a narrow terminal, today's tokens last, the context in warning colour from 80% of the window), a **Details** button that opens the last 5 replies, a conversation line first (size, window, percent, how long the cache stays warm), then `Tokens used: this session … · today … · last 7 days …`, a titled 7-day chart with its total
   (three aligned rows on the terminal: amounts, bars, weekdays, today in bold), and `Wrong model for
   the last reply? Should have been: [Haiku] [Sonnet] [Opus]` buttons (with learning on), and **Pause router** / **Resume
   router**. The choice to show details is remembered. A third line appears only when it matters: `⏳ Reply within 12 min to

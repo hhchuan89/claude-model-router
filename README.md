@@ -17,26 +17,27 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 ![The router's band above the Claude Code prompt](docs/band.png)
 
-The screenshot is from an earlier version. The band is two plain rows, and every word is meant to be understood without this README:
+The screenshot is from an earlier version. The band is two plain rows, set off from the conversation by one empty row above it, and every word is meant to be understood without this README:
 
 ```
 ⚙ Opus · medium — design work                                   [Details] [Pause router]
-  This reply $0.74 · Today $28.00 (−$8.94 vs all-Opus) · Context 106k of 1M · Week 20% used
+  This reply $0.74 · Today 49.2M tok · $28.00 (−$8.94 vs all-Opus) · Context 106k of 1M · Week 20% used
 ```
 
 Row 1 is what the router chose and why: `📌 Sonnet · medium — pinned, 2 more replies`, `📌 Haiku · medium — you chose it (#haiku)`,
 or `⚙ Opus · medium — kept on Opus: switching would re-read the whole conversation`. Row 2 is what it costs: this reply,
-today against the same work on Opus (API-equivalent estimates at the rates in `hooks/meter.ts`, not subscription
+today's tokens and cost against the same work on Opus (API-equivalent estimates at the rates in `hooks/meter.ts`, not subscription
 charges), how big the conversation is (and the model's window, when the engine gives it; shown as a warning from 80% of
 the window, or from `compactAtContext` if that is nearer), and the week's usage from the engine's rate-limit window
 (`, ahead of pace` is added only when you are ahead and pacing is not off). On a narrow terminal whole parts are dropped:
-the comparison first, then the week, then the context. Only when it matters a third line appears above them: with a conversation of 100k tokens or more
+the comparison first, then the week, then the context, and today's tokens only when nothing else is left. Only when it matters a third line appears above them: with a conversation of 100k tokens or more
 (`compactMinContext`), `⏳ Reply within 12 min to keep the conversation cached — after that the next reply costs ≈$2.38 more`
 in the last 15 minutes of the cache, and `⏳ The cache expired — your next reply re-reads 298k tokens (≈$2.38)` after it.
 Nothing is shown when the cache's age is unknown (after a reload).
 
 **Details** opens, in the same band, a line on the conversation (`Context 106k of 1M tokens (11%) · cache warm for 44 more
-min`, the one place the cache is shown when no warning is due), the last 5 replies (time, model and effort coloured by
+min`, the one place the cache is shown when no warning is due), the tokens used (`Tokens used: this session 45.4M ·
+today 49.2M · last 7 days 812.0M`), the last 5 replies (time, model and effort coloured by
 model, cost, a short reason and markers such as `(pinned)`, `(you chose)`, `(raised to Opus)`, `(cache expired)`,
 `(corrected)`), a titled 7-day spend chart with `Total $777.22 · all-Opus would be $928.25` (on the terminal three aligned
 rows: dollar amounts, bars scaled to the week's biggest day, weekdays, with today in bold; four-character columns or the

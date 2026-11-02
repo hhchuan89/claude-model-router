@@ -1,7 +1,7 @@
 // Pure helpers for /model-router history: no engine calls, so they are unit tested directly.
 export const SPARK = '▁▂▃▄▅▆▇█'
 
-export type DayCost = { day: string; cost: number; baseline: number }
+export type DayCost = { day: string; cost: number; baseline: number; tokens: number }
 
 export function hhmm(ms: number): string {
   const d = new Date(ms)
