@@ -41,7 +41,7 @@ today 49.2M · last 7 days 812.0M`), the last 5 replies (time, model and effort 
 model, cost, a short reason and markers such as `(pinned)`, `(you chose)`, `(raised to Opus)`, `(cache expired)`,
 `(corrected)`), a titled 7-day spend chart with `Total $777.22 · all-Opus would be $928.25` (on the terminal three aligned
 rows: dollar amounts, bars scaled to the week's biggest day, weekdays, with today in bold; four-character columns or the
-last four days on a narrow terminal; on desktop an SVG with an amount over each bar) and, with learning on, `Wrong model for the last reply? Should have been:
+last four days on a narrow terminal; on desktop an SVG with an amount over each bar) and, with `learnFromCorrections` on, `Wrong model for the last reply? Should have been:
 [Haiku] [Sonnet] [Opus]`. Your choice (open or closed) is remembered. **Pause router** (or `/model-router off`) leaves
 every request on your own model; the band then says so and offers **Resume router**. No flow needs a command: they are
 shortcuts.
@@ -223,13 +223,21 @@ A pinned turn behaves like a `#model` turn: no classifier call, no warm-cache ke
 count goes down when the turn starts, so a prompt another plugin holds back does not use a pin up, and a `#model` in
 the message wins for its turn. Pinning needs `mainRouting`.
 
-The classifier is not always right. When it sorted a turn too low, tell it: `/model-router wrong <tier>` (or the history
-buttons) records the turn's masked prompt snippet with the tier it should have had; so does the model escalating itself
-to a bigger **model** than the classified tier's (an effort-only raise does not count). Only turns the classifier
-actually sorted can be corrected, not forced, pinned, inherited or failed-classification turns. With `learnFromCorrections`
-on (the default) the newest 8 corrections are added to the classifier's system prompt as examples, for the main
-conversation and for subagents. With no corrections, or with the option off, the prompt is exactly the plain one.
-`/model-router corrections` lists them, `/model-router corrections clear` deletes them, and stats count them.
+The classifier is not always right. When it sorted a reply wrongly, say so: `/model-router wrong <tier>` (or the
+band's `Should have been:` buttons) pins the main conversation to that tier's model for the rest of the session, exactly
+like `/model-router pin <model>` (📌 in the band, until `/model-router unpin` or the session ends), and answers e.g.
+`Thanks — the rest of this session stays on Sonnet. /model-router unpin to undo.` It also records the turn's masked
+prompt snippet with the tier it should have had. The model escalating itself to a bigger **model** than the classified
+tier's is recorded too (an effort-only raise does not count), but never pins. Only turns the classifier actually sorted
+can be corrected, not forced, pinned, inherited or failed-classification turns.
+
+Corrections are **not** sent to the classifier: its system prompt is always the plain one, for the main conversation
+and for subagents. (Earlier 1.1.0 builds added them as few-shot examples; on 102 labelled prompts that lowered accuracy
+from 69.6% to 65.7%, and since escalation corrections only ever say "should have been higher", it ratcheted routing
+upward over time.) The stored corrections are an evaluation dataset for revising the classifier prompt offline.
+`/model-router corrections` lists them, `/model-router corrections clear` deletes them, and stats count them. With
+`learnFromCorrections` off there are no buttons, `wrong` says it is off, and nothing is recorded or pinned by
+corrections.
 
 ## Weekly pacing
 
@@ -296,8 +304,8 @@ own effort. `stats` covers routed subagents only.
   traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
   the events log are written to local files only.
 - **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store up to 40
-  masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the newest 8 are sent to
-  Haiku as part of every classifier call. Turn `learnFromCorrections` off to stop recording and sending, and run
+  masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, as an offline evaluation set.
+  They are never sent anywhere, including the classifier. Turn `learnFromCorrections` off to stop recording, and run
   `/model-router corrections clear` to delete what is stored. The band and history keep no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
@@ -329,7 +337,7 @@ This is an estimate; see "Assumptions in the meter" below.
 | `/model-router on` / `/model-router off` | Enable or disable routing and guards |
 | `/model-router history` | The last 10 replies of this session and the 7-day total, as plain text (the band's Details button shows the same, with a chart and correction buttons) |
 | `/model-router pin <haiku\|sonnet\|opus> [turns]` / `/model-router unpin` | Hold the main conversation on one model for the next `turns` turns, or until unpinned (see "Pin and corrections") |
-| `/model-router wrong <lookup\|execute\|decide>` | Tell the router the last classified turn should have been that tier |
+| `/model-router wrong <lookup\|execute\|decide>` | Record that the last classified turn should have been that tier, and pin the rest of the session to its model (see "Pin and corrections") |
 | `/model-router corrections` / `/model-router corrections clear` | List the stored corrections, or delete them |
 | `/model-router pacing [off\|warn\|steer\|default]` | Show or override the weekly pacing mode (see "Weekly pacing") |
 
@@ -377,7 +385,7 @@ values, including router on/off, idle minutes, the context cap and `compactMinCo
 | `compactMinContext` | `100000` | Tokens ≥ 0; no configured maximum | Minimum context for idle compaction and checkpoint hints (a small context is cheap to rewrite) |
 | `checkpointHints` | `false` (off) | `true`, `false` | Suggest a task-boundary checkpoint when estimated savings exceed its cost; never compacts automatically |
 | `shrinkToolOutput` | `0` (off) | 0–1,000,000 characters; active at 20,000–1,000,000 | Reduce large Bash/MCP logs and progress output, archive originals and fetch capped slices. Values outside the active range count as off |
-| `learnFromCorrections` | `true` (on) | `true`, `false` | Record corrections and send the newest 8 to the classifier (see "Pin and corrections" and Privacy). Off: none are written or sent |
+| `learnFromCorrections` | `true` (on) | `true`, `false` | A manual correction pins the session to the right model; corrections are recorded as an offline evaluation set, never sent to the classifier (see "Pin and corrections" and Privacy). Off: no buttons, nothing recorded or pinned by corrections |
 | `weeklyPacing` | `warn` | `off`, `warn`, `steer` | What the router does when weekly usage runs ahead of an even pace (see "Weekly pacing"); `/model-router pacing` overrides it |
 | `compactAtContext` | `0` (off) | Tokens ≥ 0; active at ≥ 100,000; no configured maximum | Compact between turns when main context reaches this size (e.g. `200000`), so every step does not re-read a huge cache. Below `100000` counts as off |
 

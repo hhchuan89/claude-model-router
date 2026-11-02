@@ -6,7 +6,7 @@ import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
 import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
-import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
+import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
@@ -6458,7 +6458,7 @@ describe('weekly pace math (1.1.0)', () => {
   })
 })
 
-describe('corrections store and few-shot block (1.1.0)', () => {
+describe('corrections store (1.1.0)', () => {
   const c = (text: string, right: 'lookup' | 'execute' | 'decide' = 'decide', at = 1): Correction => ({ at, text, routed: 'lookup', right, source: 'manual' })
 
   test('the list keeps the newest 40 and a repeated text replaces its earlier entry', async () => {
@@ -6471,17 +6471,6 @@ describe('corrections store and few-shot block (1.1.0)', () => {
     expect(again).toHaveLength(MAX_CORRECTIONS)
     expect(again.filter(x => x.text === 'task 10')).toEqual([c('task 10', 'execute', 99)])
     expect(again.at(-1)!.text).toBe('task 10')
-  })
-
-  test('no corrections means no block at all; otherwise the 8 newest, newest last', async () => {
-    expect(fewShot([], 'en')).toBe('')
-    const list = Array.from({ length: 10 }, (_, i) => c(`job ${i}`))
-    const block = fewShot(list, 'en')
-    expect(block).toContain('Corrections this developer made to earlier routing (newest last)')
-    expect(block).toContain('- "job 9" → decide (was routed lookup)')
-    expect(block).not.toContain('"job 1"')
-    expect(block.indexOf('"job 2"')).toBeLessThan(block.indexOf('"job 9"'))
-    expect(block.match(/^- "/gm)).toHaveLength(8)
   })
 
   test('a snippet is masked, collapsed and cut to 200 characters', async () => {
@@ -6685,14 +6674,13 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(seen.systems).toEqual([classifierSystem('en')])
     })
 
-    test('with corrections the block is appended to the system prompt for the main thread and for subagents', async ($, on) => {
+    // WHY: corrections as few-shot examples made the classifier less accurate and ratcheted routing upward (escalation
+    // corrections only ever say "should have been higher"). They are an offline evaluation set, never prompt input.
+    test('stored corrections never reach the classifier prompt, for the main thread or for subagents', async ($, on) => {
       const seen = world($, on, LOOKUP, { store: seeded('rename the helper') })
       await $.prompt.submit({ text: 'find every TODO' } as never)
-      expect(seen.systems[0]!.startsWith(classifierSystem('en'))).toBe(true)
-      expect(seen.systems[0]).toContain('- "rename the helper" → decide (was routed lookup)')
       await $.agent.spawn({ prompt: 'search the repo for usages of the helper', description: 'search', subagentType: 'general-purpose', parentModel: 'claude-opus-5-5' } as never)
-      expect(seen.systems).toHaveLength(2)
-      expect(seen.systems[1]).toContain('rename the helper')
+      expect(seen.systems).toEqual([classifierSystem('en'), classifierSystem('en')])
     })
 
     test('learning off adds nothing even with stored corrections', { options: { learnFromCorrections: false } }, async ($, on) => {
@@ -6712,9 +6700,30 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(stored[0]!.text).toContain('rename the helper')
       expect(stored[0]!.text).not.toContain('sk-ant')
       expect(await statsOf($)).toContain('manual 1 · escalate 0')
-      // The next classification already carries it.
-      await $.prompt.submit({ text: 'rename another helper' } as never)
-      expect(seen.systems.at(-1)).toContain('rename the helper')
+    })
+
+    // WHY: the person said this work needs a bigger model; the rest of the session should get it without asking again,
+    // through the same pin /model-router pin sets, so unpin is the one way back.
+    test('a manual correction pins the session to that model until unpin, and the band shows it', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong execute')).toContain('The rest of this session stays on Sonnet. /model-router unpin to undo.')
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await band.find({ text: /📌 Sonnet.*pinned until you unpin/ })).toBeDefined()
+      await band.unmount()
+      for (let i = 0; i < 3; i++) await $.prompt.submit({ text: `next ${i}` } as never)
+      expect(seen.asked).toEqual(['haiku'])
+      expect(seen.systems).toHaveLength(1)
+      for (const i of [1, 2, 3]) {
+        expect(route(seen, i)).toContain('assigned to sonnet')
+        expect(route(seen, i)).toContain('pinned')
+      }
+      expect(await cmd($, 'unpin')).toBe('Unpinned.')
+      await $.prompt.submit({ text: 'after unpin' } as never)
+      expect(seen.asked).toEqual(['haiku', 'haiku'])
+      expect(route(seen, 4)).toContain('assigned to haiku')
+      expect(route(seen, 4)).not.toContain('pinned')
     })
 
     test('wrong refuses a turn the classifier did not sort, a same-tier answer and learning off', async ($, on) => {
@@ -6739,6 +6748,10 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.turn.complete(completion('t1'))
       expect(await cmd($, 'wrong decide')).toContain('learnFromCorrections')
       expect(seen.store.corrections).toBeUndefined()
+      // Nothing is pinned either: the next turn is classified as usual.
+      await $.prompt.submit({ text: 'find more files' } as never)
+      expect(seen.asked).toEqual(['haiku', 'haiku'])
+      expect(route(seen, 1)).not.toContain('pinned')
     })
 
     test('escalating to a bigger model than the classified tier records once; an effort-only raise does not', async ($, on) => {
@@ -6753,6 +6766,23 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       // The highest model reached is what the entry says, still one entry and one count.
       expect(stored[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'escalate' })
       expect(await statsOf($)).toContain('manual 0 · escalate 1')
+    })
+
+    // WHY: the model raising itself is not the person asking for a model; only a person's correction may hold the session.
+    test('an escalation correction is recorded but does not pin', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'look at the auth flow' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'a design call' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(seen.store.corrections as Correction[]).toHaveLength(1)
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await band.find({ text: /📌/ })).toBeUndefined()
+      await band.unmount()
+      await $.prompt.submit({ text: 'find the config file' } as never)
+      expect(seen.asked).toEqual(['haiku', 'haiku'])
+      expect(route(seen, 1)).toContain('assigned to haiku')
+      expect(route(seen, 1)).not.toContain('pinned')
+      expect(await cmd($, 'unpin')).toBe('No model is pinned.')
     })
 
     test('an escalation on a forced turn is not a correction, and neither is one with learning off', async ($, on) => {
@@ -7597,7 +7627,8 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         const band = await classifiedLookup($)
         await pressLabel(band, 'Opus')
         expect((seen.store.corrections as Correction[]).at(-1)).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
-        expect(await band.find({ type: 'Text', text: /^Thanks — the router will use this$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^Thanks — the rest of this session stays on Opus\. \/model-router unpin to undo\.$/ })).toBeDefined()
+        expect(await band.find({ text: /📌 Opus.*pinned until you unpin/ })).toBeDefined()
         expect(await band.find({ key: 'wrong-decide' })).toBeUndefined()
         expect(await band.find({ type: 'Text', text: /Wrong model/ })).toBeUndefined()
         await band.unmount()
@@ -7709,27 +7740,22 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(c.toasts).toEqual([])
     })
 
-    test('a failed first read of the stored corrections is retried, not given up on', async ($, on) => {
+    test('a failed first read of the stored preferences is retried, not given up on', async ($, on) => {
       let failing = true
-      on('store.get', { key: 'corrections' }, async (_$: unknown, e: any, next: any) => failing ? { deny: 'store unavailable' } : next(e))
-      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] } })
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(seen.systems[0]).toBe(classifierSystem('en'))
+      on('store.get', { key: 'pacing' }, async (_$: unknown, e: any, next: any) => failing ? { deny: 'store unavailable' } : next(e))
+      world($, on, LOOKUP, { store: { pacing: 'steer' } })
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: warn (option)')
       failing = false
       await new Promise(resolve => (globalThis as any).setTimeout(resolve, 1100))
-      await $.prompt.submit({ text: 'find more files' } as never)
-      expect(seen.systems[1]).toContain('rename the helper')
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: steer (override)')
     })
 
     test('clear and pacing say when the store write failed', async ($, on) => {
       on('store.delete', { key: 'corrections' }, async () => ({ deny: 'disk full' }))
       on('store.set', { key: 'pacing' }, async () => ({ deny: 'disk full' }))
-      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] } })
+      world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] } })
       expect(await cmd($, 'corrections clear')).toContain('could not be deleted')
       expect(await cmd($, 'pacing steer')).toContain('this session only')
-      // The in-memory list is empty either way: the next classification carries no block.
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(seen.systems.at(-1)).toBe(classifierSystem('en'))
     })
 
     test('an inherited turn lists only its own escalations and no earlier cache keep', async ($, on) => {
