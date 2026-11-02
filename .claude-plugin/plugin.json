@@ -89,16 +89,10 @@
       "default": 0,
       "min": 0
     },
-    "autoOpenPane": {
-      "type": "boolean",
-      "title": "Open the router pane automatically",
-      "description": "Off (the default): the router pane opens only when you run /model-router pane. On: it also opens by itself, once per session, where it would be a sidebar (Claude Code Desktop, or the terminal in fullscreen). Closing the pane is always the way to turn it off.",
-      "default": false
-    },
     "learnFromCorrections": {
       "type": "boolean",
       "title": "Learn from routing corrections",
-      "description": "On (the default): when you correct a routing (/model-router wrong <tier>, the pane buttons, or the model escalating itself to a bigger model than the classifier chose) the masked prompt snippet is stored locally (up to 40) and the newest 8 are sent to Haiku with each classifier call. Off: nothing is recorded or sent; stored corrections stay on disk until /model-router corrections clear.",
+      "description": "On (the default): when you correct a routing (/model-router wrong <tier>, the history buttons, or the model escalating itself to a bigger model than the classifier chose) the masked prompt snippet is stored locally (up to 40) and the newest 8 are sent to Haiku with each classifier call. Off: nothing is recorded or sent; stored corrections stay on disk until /model-router corrections clear.",
       "default": true
     },
     "weeklyPacing": {

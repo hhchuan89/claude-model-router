@@ -189,19 +189,16 @@ option is enabled. Pass `id` (the tool-use id), optionally `startLine` / `endLin
 at `shrinkToolOutput` characters, including continuation instructions; use the returned `offset` with the same
 selection to page through long lines without losing characters. Stats count reductions and characters removed.
 
-## Router pane
+## History
 
-`/model-router pane` opens a pane beside the chat (or above the prompt where the surface has no room for a sidebar) and
-the same command closes it. Closing the pane is the off switch; with `autoOpenPane` on it also opens by itself, once
-per session, on Claude Code Desktop and on the terminal in fullscreen. While it is closed the router only keeps a small
-per-turn record in memory-backed state (the last 50 main turns of the session); nothing else is computed for it.
-
-It shows, top to bottom: router on or off, weekly usage and pace, and the active pin; this session's main turns with
-time, model and effort (coloured by model), cost, tokens, and markers for a cold cache, a warm cache that was kept,
-the escalation trail, a pinned or forced turn and a correction, then the reason; the session and today totals with the
-difference against Opus prices; the last seven days of spend (a bar chart with an Opus-priced marker per day on
-Desktop, a one-line sparkline on the terminal); and, with learning on, `Should have been: [lookup] [execute] [decide]`
-buttons for the last classified turn.
+The band above the prompt stays the glance view: route, this turn and today against all-Opus, and nothing else.
+Details are on demand: `/model-router history` prints, in the transcript, the last 10 main turns of this session (time,
+model and effort coloured by model, cost, tokens, and markers for a cold cache, a warm cache that was kept, a pin or
+`#model`, a correction and the escalation trail, then the reason); a small 7-day spend chart (bars with the dollar amount
+above each, a thin marker for the same work at Opus prices; a text sparkline on the terminal) with a one-line total; and,
+with learning on, `Should have been: [lookup] [execute] [decide]` buttons for the last classified turn. The command's text
+(about 11 plain lines) is what the model reads; a surface that cannot draw the tree shows that text. Nothing is
+computed for it until you run the command, apart from a small per-turn record the router keeps for the last 50 main turns.
 
 ## Pin and corrections
 
@@ -211,7 +208,7 @@ A pinned turn behaves like a `#model` turn: no classifier call, no warm-cache ke
 count goes down when the turn starts, so a prompt another plugin holds back does not use a pin up, and a `#model` in
 the message wins for its turn. Pinning needs `mainRouting`.
 
-The classifier is not always right. When it sorted a turn too low, tell it: `/model-router wrong <tier>` (or the pane
+The classifier is not always right. When it sorted a turn too low, tell it: `/model-router wrong <tier>` (or the history
 buttons) records the turn's masked prompt snippet with the tier it should have had; so does the model escalating itself
 to a bigger **model** than the classified tier's (an effort-only raise does not count). Only turns the classifier
 actually sorted can be corrected, not forced, pinned, inherited or failed-classification turns. With `learnFromCorrections`
@@ -283,10 +280,10 @@ own effort. `stats` covers routed subagents only.
 - **Nothing else is collected.** No telemetry and no analytics. The router makes no network call of its own: the only
   traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
   the events log are written to local files only.
-- **Corrections (on by default).** `/model-router wrong`, the pane buttons and a model-raising escalation store up to 40
+- **Corrections (on by default).** `/model-router wrong`, the history buttons and a model-raising escalation store up to 40
   masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the newest 8 are sent to
   Haiku as part of every classifier call. Turn `learnFromCorrections` off to stop recording and sending, and run
-  `/model-router corrections clear` to delete what is stored. The pane keeps no prompt text.
+  `/model-router corrections clear` to delete what is stored. The history keeps no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
   also sends a one-word probe to check the model exists. With `reviewModel` empty, none of this happens.
@@ -315,7 +312,7 @@ This is an estimate; see "Assumptions in the meter" below.
 | `/model-router checkpoint [note]` | Compact between tasks, preserving the information needed to continue |
 | `/model-router context` | Main context size and local category estimates, or an explicit unavailable message; makes no token-count requests |
 | `/model-router on` / `/model-router off` | Enable or disable routing and guards |
-| `/model-router pane` | Open the router pane, or close it if it is open (see "Router pane") |
+| `/model-router history` | The last 10 turns of this session, a small 7-day spend chart and, with learning on, correction buttons, drawn in the transcript (see "History") |
 | `/model-router pin <haiku\|sonnet\|opus> [turns]` / `/model-router unpin` | Hold the main conversation on one model for the next `turns` turns, or until unpinned (see "Pin and corrections") |
 | `/model-router wrong <lookup\|execute\|decide>` | Tell the router the last classified turn should have been that tier |
 | `/model-router corrections` / `/model-router corrections clear` | List the stored corrections, or delete them |
@@ -365,7 +362,6 @@ values, including router on/off, idle minutes, the context cap and `compactMinCo
 | `compactMinContext` | `100000` | Tokens ≥ 0; no configured maximum | Minimum context for idle compaction and checkpoint hints (a small context is cheap to rewrite) |
 | `checkpointHints` | `false` (off) | `true`, `false` | Suggest a task-boundary checkpoint when estimated savings exceed its cost; never compacts automatically |
 | `shrinkToolOutput` | `0` (off) | 0–1,000,000 characters; active at 20,000–1,000,000 | Reduce large Bash/MCP logs and progress output, archive originals and fetch capped slices. Values outside the active range count as off |
-| `autoOpenPane` | `false` (off) | `true`, `false` | Also open the router pane by itself, once per session, where it would be a sidebar (Claude Code Desktop, or the terminal in fullscreen). Off: only `/model-router pane` opens it |
 | `learnFromCorrections` | `true` (on) | `true`, `false` | Record corrections and send the newest 8 to the classifier (see "Pin and corrections" and Privacy). Off: none are written or sent |
 | `weeklyPacing` | `warn` | `off`, `warn`, `steer` | What the router does when weekly usage runs ahead of an even pace (see "Weekly pacing"); `/model-router pacing` overrides it |
 | `compactAtContext` | `0` (off) | Tokens ≥ 0; active at ≥ 100,000; no configured maximum | Compact between turns when main context reaches this size (e.g. `200000`), so every step does not re-read a huge cache. Below `100000` counts as off |
@@ -375,7 +371,7 @@ values, including router on/off, idle minutes, the context cap and `compactMinCo
 ## Assumptions in the meter
 
 The dollar figures are **estimates**, computed from the price table in `hooks/meter.ts` (Anthropic first-party API
-rates, as of 2026-10). They may differ from your actual pricing or plan: on a subscription you pay in usage limits, not
+rates, as of 2026-11-02). They may differ from your actual pricing or plan: on a subscription you pay in usage limits, not
 dollars, and another model would not have used exactly the same tokens. The dollar difference and percentage are
 same-token comparisons, not measured savings.
 
@@ -388,9 +384,12 @@ increments. Records are kept for 30 calendar days. Stats aggregate those records
 daily and all-time totals unchanged; the retained total includes the legacy all-time figure once. Legacy baseline
 figures cannot be corrected retrospectively because they do not separate classifier usage.
 
-Prices per million tokens in the table: Opus 5.5 $4 in / $20 out, Sonnet 5.5 $2 / $10, Haiku 5.5 $0.10 / $0.50; cache
-reads $0.20 (Haiku assumed at 10% of input); cache writes at 2× input (Claude Code's 1-hour cache TTL). Change
-`hooks/meter.ts` if your rates differ.
+Prices per million tokens in the table follow the official pricing page (https://platform.claude.com/docs/en/about-claude/pricing,
+checked 2026-11-02), request by request: Opus 5.5 $4 in / $20 out / $0.20 cache read / $8 cache write (1-hour); Sonnet 5.5
+$2 / $10 / $0.10 / $4; Haiku 5.5 $0.10 / $0.50 / $0.01 / $0.20 for a prompt of up to 100,000 tokens and $0.50 / $2.50 /
+$0.05 / $1 above that; Fable 5.1 $10 / $50 / $0.25 / $20. A prompt's length counts all its input: uncached input, cache
+reads and cache writes together, and each request is priced on its own size (a context-only estimate such as the
+cold-resume cost uses the context size the same way). Change `hooks/meter.ts` if your rates differ.
 
 **The baseline is switch-aware.** When a main-thread request changes model family within the cache TTL (down to a
 cheaper model, or back up to Opus), its cache writes exist only because of the switch: staying on Opus all along would

@@ -3,33 +3,44 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
-## [1.1.0] - 2026-10-31
+## [1.1.0] - 2026-11-02
 
-1.1.0 adds a router pane, a way to pin a model and teach the classifier from your corrections, and weekly usage pacing.
-Each has an off switch, and with `autoOpenPane` off, `learnFromCorrections` off and `weeklyPacing` off the router
-routes, prompts and draws exactly as 1.0.1 does.
+1.1.0 adds `/model-router history`, a way to pin a model and teach the classifier from your corrections, weekly usage
+pacing, and a corrected price table. The band above the prompt stays three rows; details are on demand. Pin and
+corrections can be switched off or left idle (`learnFromCorrections`, `weeklyPacing`), and with both off the router
+routes and prompts exactly as 1.0.1 does.
 
 ### Added
 
-- `/model-router pane` opens (or closes) a pane with this session's turns (time, model, effort, cost, tokens, cold-cache,
-  kept-cache, escalation, pinned and correction markers, reason), the session and today totals, a seven-day spend chart
-  (SVG on Desktop, a text sparkline on the terminal) and, with learning on, correction buttons. Option `autoOpenPane`
-  (off by default) also opens it once per session where it would be a sidebar.
+- `/model-router history`: the last 10 main turns of the session (time, model and effort coloured by model, cost,
+  tokens, cold-cache, kept-cache, pin or forced, correction and escalation markers, reason), a small 7-day spend chart
+  (SVG with the dollar amount above each bar and an Opus-priced marker; a sparkline on the terminal) with a one-line
+  total, and, with learning on, correction buttons. It draws inline in the transcript; its text is about 11 plain lines.
 - `/model-router pin <haiku|sonnet|opus> [turns]` and `/model-router unpin`: hold the main conversation on a model like a
-  `#model` in every message, counted down when the turn starts. `📌` shows in the band and pane.
-- Learning from corrections: `/model-router wrong <tier>`, the pane buttons, or the model escalating itself above the
+  `#model` in every message, counted down when the turn starts (`pinned (n left)` counts the turn being started). The band
+  shows `📌` before the model.
+- Learning from corrections: `/model-router wrong <tier>`, the history buttons, or the model escalating itself above the
   classified tier's model store the masked prompt snippet (up to 40, 200 characters each); the newest 8 are added to the
   classifier prompt for the main thread and subagents. `/model-router corrections [clear]` lists or deletes them; stats
   count them. Option `learnFromCorrections` (on by default); see Privacy.
 - Weekly pacing: option `weeklyPacing` (`off`, `warn` by default, `steer`) and `/model-router pacing [mode|default]`. `warn`
-  adds the pace to the status line and toasts once per weekly window; `steer` also routes an unsure decide to Sonnet
-  while ahead, never against a warm Opus cache, `#model`, a pin or a sure decision. Steer deliberately overrides the
-  classifier's "an unsure verdict never downgrades" rule, and the model may escalate a steered turn back to Opus, which is
-  the safety valve. `/model-router status` shows the mode and figures; stats count steered turns.
+  adds the pace to the status line only when ahead, and toasts once per weekly window; `steer` also routes an unsure
+  decide to Sonnet while ahead, never against a warm Opus cache, `#model`, a pin or a sure decision. Steer deliberately
+  overrides the classifier's "an unsure verdict never downgrades" rule, and the model may escalate a steered turn back to
+  Opus, which is the safety valve. `/model-router status` shows the mode and figures; stats count steered turns.
 
 ### Changed
 
+- The band's meter row says it in plain words: `turn 1.9M tok · $0.74   today 12.2M tok · $10.94 · ≈$3.51 (24%) below all-Opus`.
+  The exact wording (work tokens at Opus prices, switch-adjusted) stays in `/model-router stats`.
 - The command hint and usage line list the new subcommands (the old ones come first, unchanged).
+
+### Fixed
+
+- Prices follow the official pricing page (checked 2026-11-02): Sonnet 5.5 cache reads are $0.10 per million, not $0.20,
+  and Haiku 5.5 requests with a prompt over 100,000 tokens (input, cache reads and cache writes together) are priced at
+  $0.50 / $2.50 / $0.05 / $1. Each request is priced on its own size, in the meter, the baseline, the cold-resume and
+  abandoned-cache estimates, checkpoint hints and the warm-cache keep decision. Spend already recorded keeps the old figures.
 
 ## [1.0.1] - 2026-10-31
 

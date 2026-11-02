@@ -1,15 +1,29 @@
 import type { ModelKey, SpendRole, SpendUsage, Tally } from '../types'
 
-// USD per million tokens, Anthropic first-party API rates (claude-api skill table, cached 2026-10-06).
-// Cache writes are priced at 2x input: Claude Code caches with a 1-hour TTL. Haiku 5.5's cache
-// read is not listed; 10% of input, as for the other models, is assumed.
+// USD per million tokens, Anthropic first-party API rates as listed on
+// https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-11-02): input, output, cache read and the 1-hour
+// cache write (Claude Code caches with a 1-hour TTL, priced at 2x input).
 type Price = { input: number; output: number; read: number; write: number }
 export const PRICES: Record<ModelKey | 'fable', Price> = {
   haiku: { input: 0.1, output: 0.5, read: 0.01, write: 0.2 },
-  sonnet: { input: 2, output: 10, read: 0.2, write: 4 },
+  sonnet: { input: 2, output: 10, read: 0.1, write: 4 },
   opus: { input: 4, output: 20, read: 0.2, write: 8 },
   fable: { input: 10, output: 50, read: 0.25, write: 20 },
 }
+// Haiku 5.5 is priced higher for a prompt over 100,000 tokens. The prompt is all of a request's input: uncached input,
+// cache reads and cache writes together, and each request is priced on its own.
+export const LONG_PROMPT_TOKENS = 100_000
+const HAIKU_LONG: Price = { input: 0.5, output: 2.5, read: 0.05, write: 1 }
+
+// The rates for one request (or, for a context-only estimate, a context) of `prompt` tokens.
+export function priceOf(key: keyof typeof PRICES, prompt: number): Price {
+  return key === 'haiku' && prompt > LONG_PROMPT_TOKENS ? HAIKU_LONG : PRICES[key]
+}
+
+export function promptOf(u: Usage): number {
+  return u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+}
+
 export const CACHE_TTL_MS = 60 * 60 * 1000
 // A warm main-thread context this big is never moved to a lower model: leaving Opus and coming back within the
 // cache TTL rewrote the whole Opus cache (200k-800k tokens), which cost far more than the cheaper model saved.
@@ -24,7 +38,7 @@ export const CHECKPOINT_COOLDOWN_MS = 30 * 60_000
 export const CHECKPOINT_GROWTH = 1.5
 
 export function checkpointPays(context: number, model: keyof typeof PRICES): boolean {
-  const p = PRICES[model]
+  const p = priceOf(model, context)
   const cost = context * p.read + CHECKPOINT_OUTPUT * p.output + CHECKPOINT_SUMMARY * p.write
   const saving = (context - CHECKPOINT_SUMMARY) * p.read * CHECKPOINT_STEPS
   return saving > cost
@@ -46,7 +60,7 @@ export function priceKey(modelId: string): keyof typeof PRICES {
 }
 
 export function costOf(u: Usage, key: keyof typeof PRICES): number {
-  const p = PRICES[key]
+  const p = priceOf(key, promptOf(u))
   return (
     (u.input_tokens * p.input +
       u.output_tokens * p.output +
@@ -84,10 +98,11 @@ export function add(t: Tally, modelId: string, u: Usage, switched = false, overh
   const prev = t.byModel[key] ?? { tokens: 0, cost: 0 }
   const prevRole = t.byRole?.[role] ?? { tokens: 0, cost: 0 }
   const byUsage = { ...t.byUsage }
+  const rates = priceOf(key, promptOf(u))
   const amounts: Record<SpendUsage, number> = { read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, input: u.input_tokens, output: u.output_tokens }
   for (const kind of Object.keys(amounts) as SpendUsage[]) {
     const prev = byUsage[kind] ?? { tokens: 0, cost: 0 }
-    byUsage[kind] = { tokens: prev.tokens + amounts[kind], cost: prev.cost + amounts[kind] * PRICES[key][kind] / 1e6 }
+    byUsage[kind] = { tokens: prev.tokens + amounts[kind], cost: prev.cost + amounts[kind] * rates[kind] / 1e6 }
   }
   return {
     ...t,
@@ -155,9 +170,10 @@ export function keepWarm(target: ModelKey, last: LastRequest | null, now: number
   const steps = Math.max(1, shape.steps)
   const out = Math.max(0, shape.output)
   const ctx = last.context
-  const stay = steps * (ctx * PRICES[last.model].read + out * PRICES[last.model].output)
-  const move =
-    ctx * PRICES[target].write + (steps - 1) * ctx * PRICES[target].read + steps * out * PRICES[target].output
+  const from = priceOf(last.model, ctx)
+  const to = priceOf(target, ctx)
+  const stay = steps * (ctx * from.read + out * from.output)
+  const move = ctx * to.write + (steps - 1) * ctx * to.read + steps * out * to.output
   return stay < move ? last.model : target
 }
 

@@ -3,15 +3,15 @@ import type { ElementConstructor, EngineInterface, Register, SessionRateLimit, S
 
 import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier, TurnHow, TurnRecord } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, saved, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
 import { addCorrection, fewShot, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
 import type { PaceMode } from './pace'
-import { barChartSvg, chartAlt, hhmm, lastDays, sparkline, trailStep } from './pane'
-import type { DayCost } from './pane'
+import { barChartSvg, chartAlt, hhmm, lastDays, sparkline, trailStep } from './history'
+import type { DayCost } from './history'
 import { redact } from './redact'
 import type { Lang } from './route'
 import {
@@ -26,6 +26,7 @@ import {
   settleTier,
   reviewSystem,
   routeFor,
+  shorten,
   TIER_ROUTE,
   withSuffixOf,
 } from './route'
@@ -56,7 +57,8 @@ const PROBE_EVERY_MS = 24 * 3600 * 1000
 // The verdict is a JSON object with a tier, a confidence and a reason; 120 tokens cut it off mid-reply.
 const CLASSIFY_MAX_TOKENS = 300
 const SNIPPET_CHARS = 120
-const PANE = 'model-router'
+// The turns /model-router history lists.
+const HISTORY_ROWS = 10
 const MAX_TURNS = 50
 const PACE_DAYS = 7
 
@@ -64,7 +66,7 @@ const PACE_DAYS = 7
 const route = atom({ plugin: 'model-router', key: 'route' } as const, null)
 const enabled = atom({ plugin: 'model-router', key: 'enabled' } as const, true)
 const meter = atom({ plugin: 'model-router', key: 'meter' } as const, { turn: EMPTY, today: EMPTY })
-// The pane's turn list. Change the shape tag when a record's fields change: it declines what an earlier version stored.
+// The per-turn records /model-router history lists. Change the shape tag when a record's fields change: it declines what an earlier version stored.
 const turns = atom({ plugin: 'model-router', key: 'turns' } as const, [], { shape: 'turns-1' })
 
 // The route chosen for a submitted prompt, waiting for its turn to start.
@@ -129,19 +131,14 @@ let pacingOption: PaceMode = 'warn'
 let pacingOverride: PaceMode | undefined
 // The weekly window (its resetsAt) the pace toast last fired for.
 let paceWarned: string | undefined
-// Once per process, not per session: a pane the person closed stays closed across /clear.
-let paneAutoTried = false
-// Whether the model-router pane is open, so a closed pane costs no redraw requests.
-let paneOpen = false
 // The running main turn's first request rewrote a cold cache; and the turn tally the turn started from (an inherited
 // turn does not reset the tally, so its figures are the difference).
 let turnCold = false
 let turnBase = { tokens: 0, cost: 0 }
 // An inherited turn's route already carries earlier escalations: its own start at this many trail steps.
 let turnTrailBase = 0
-// What the pane shows beyond the turn list, computed when it opens and after each main turn, never per render.
-let paneData: { day: string; series: DayCost[]; session: Tally } | undefined
-let paneDirty = true
+// The seven days of spend and the session total behind /model-router history, cached by day and turn count.
+let weekCache: { day: string; count: number; series: DayCost[]; session: Tally } | undefined
 // A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
 const REWRITE_MIN_TOKENS = 100_000
 // A cache read below this on a request with no earlier one in this process means the cache was cold.
@@ -206,8 +203,6 @@ const STR = {
     kept: '保缓存',
     turn: '本轮',
     today: '今日',
-    save: '差额',
-    vs: '对比工作 token 按 Opus 计价（含切换调整）',
     idleCompacted: (size: string) => `空闲压缩：已压缩 ${size} 上下文（缓存仍热）`,
     capCompacted: (size: string) => `上下文达到上限：已压缩 ${size}`,
     checkpointCompacted: (size: string) => `任务检查点：已压缩 ${size}`,
@@ -246,8 +241,8 @@ const STR = {
     routerOff: '路由已关闭',
     vetoed: '压缩被钩子跳过',
     rejected: '引擎拒绝压缩',
-    usage: '用法：/model-router stats | status | context | checkpoint [备注] | on | off | pane | pin <haiku|sonnet|opus> [轮数] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default]',
-    commandDescription: '模型路由：stats 查看费用，status 查看设置，context 查看上下文，checkpoint [备注] 创建检查点，pane 侧栏，pin / unpin 固定模型，wrong 纠正路由，corrections 纠正记录，pacing 每周节奏，on / off 开关',
+    usage: '用法：/model-router stats | status | context | checkpoint [备注] | on | off | history | pin <haiku|sonnet|opus> [轮数] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default]',
+    commandDescription: '模型路由：stats 查看费用，status 查看设置，context 查看上下文，checkpoint [备注] 创建检查点，history 查看详情，pin / unpin 固定模型，wrong 纠正路由，corrections 纠正记录，pacing 每周节奏，on / off 开关',
     pinned: (left?: number) => left === undefined ? '已固定模型' : `已固定模型（剩 ${left} 轮）`,
     pinNeedsRouting: '固定模型需要主会话路由（mainRouting 已关闭）。',
     pinSet: (model: string, left?: number) => left === undefined ? `已固定为 ${model}，直到 /model-router unpin 或会话结束。` : `已固定为 ${model}，接下来 ${left} 轮。`,
@@ -275,17 +270,11 @@ const STR = {
     pacingNoWindow: '没有每周用量窗口',
     paceAhead: (x: string) => ` · 节奏 ${x} 超前`,
     paceToast: (used: string, x: string, steer: boolean) => `每周用量 ${used}%，节奏 ${x}，超过均匀消耗。${steer ? '未确定的决策将改用 Sonnet。' : ''}`,
-    paneTitle: '路由器',
-    paneNoTurns: '本会话还没有路由记录。',
-    paneOn: '路由开',
-    paneOff: '路由关',
-    paneToday: '今日',
-    paneSession: '本会话',
-    paneWeek: '7 天花费',
-    paneShould: '应为：',
-    paneOpened: '已打开路由器侧栏。',
-    paneClosed: '已关闭路由器侧栏。',
-    paneUnavailable: '无法打开路由器侧栏。',
+    histNone: '本会话还没有路由记录。',
+    histTotal: (cost: string, base: string) => `7 天 ${cost} · 全 Opus ${base}`,
+    below: '低于全 Opus',
+    above: '高于全 Opus',
+    shouldBe: '应为：',
     tagCold: '冷',
     tagKept: '保缓存',
     tagPinned: '固定',
@@ -327,8 +316,6 @@ const STR = {
     kept: 'cache kept',
     turn: 'turn',
     today: 'today',
-    save: 'difference',
-    vs: 'vs work tokens at Opus prices (switch-adjusted)',
     idleCompacted: (size: string) => `Idle compact: compacted ${size} of context while the cache was warm`,
     capCompacted: (size: string) => `Context cap reached: compacted ${size}`,
     checkpointCompacted: (size: string) => `Checkpoint: compacted ${size}`,
@@ -367,8 +354,8 @@ const STR = {
     routerOff: 'router off',
     vetoed: 'compaction skipped by hook',
     rejected: 'engine refused compaction',
-    usage: 'Usage: /model-router stats | status | context | checkpoint [note] | on | off | pane | pin <haiku|sonnet|opus> [turns] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default]',
-    commandDescription: 'Model router: stats for spend, status for settings, context for context size, checkpoint [note] to compact, pane for the side pane, pin / unpin to hold a model, wrong to correct a route, corrections to list them, pacing for weekly pace, on / off to toggle',
+    usage: 'Usage: /model-router stats | status | context | checkpoint [note] | on | off | history | pin <haiku|sonnet|opus> [turns] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default]',
+    commandDescription: 'Model router: stats for spend, status for settings, context for context size, checkpoint [note] to compact, history for the details, pin / unpin to hold a model, wrong to correct a route, corrections to list them, pacing for weekly pace, on / off to toggle',
     pinned: (left?: number) => left === undefined ? 'pinned' : `pinned (${left} left)`,
     pinNeedsRouting: 'Pinning needs main routing (mainRouting is off).',
     pinSet: (model: string, left?: number) => left === undefined ? `Pinned to ${model} until /model-router unpin or the session ends.` : `Pinned to ${model} for the next ${left} turn${left === 1 ? '' : 's'}.`,
@@ -396,17 +383,11 @@ const STR = {
     pacingNoWindow: 'no weekly usage window',
     paceAhead: (x: string) => ` · pace ${x} ahead`,
     paceToast: (used: string, x: string, steer: boolean) => `Weekly usage ${used}% is using the week ${x} faster than an even pace.${steer ? ' Unsure decisions now route to Sonnet.' : ''}`,
-    paneTitle: 'Router',
-    paneNoTurns: 'No routed turns in this session yet.',
-    paneOn: 'router on',
-    paneOff: 'router off',
-    paneToday: 'today',
-    paneSession: 'session',
-    paneWeek: '7-day spend',
-    paneShould: 'Should have been:',
-    paneOpened: 'Router pane opened.',
-    paneClosed: 'Router pane closed.',
-    paneUnavailable: 'The router pane could not be opened.',
+    histNone: 'No routed turns in this session yet.',
+    histTotal: (cost: string, base: string) => `7 days ${cost} · all-Opus ${base}`,
+    below: 'below all-Opus',
+    above: 'above all-Opus',
+    shouldBe: 'Should have been:',
     tagCold: 'cold',
     tagKept: 'kept',
     tagPinned: 'pinned',
@@ -522,7 +503,7 @@ function weeklyLimit(): SessionRateLimit | undefined {
   return rateLimits.find(w => w.kind === 'seven_day')
 }
 
-// One redraw request for the pane (and the band); a missing surface must not affect the caller.
+// One redraw request for the band and the history row; a missing surface must not affect the caller.
 function redraw($: EngineInterface) {
   try {
     $.ui.invalidate('ui.render')
@@ -535,11 +516,6 @@ function redraw($: EngineInterface) {
 // with the other loads' backoff, and defaults stand until it succeeds.
 function ensurePrefs($: EngineInterface, session: Session) {
   return loadPart($, session.prefs, () => loadPrefs($, session))
-}
-
-// A redraw for the pane's own content (turns, corrections): nothing to redraw while it is closed.
-function redrawPane($: EngineInterface) {
-  if (paneOpen) redraw($)
 }
 
 // The persisted choices: corrections, the pacing override and the window the pace toast last fired for.
@@ -743,8 +719,7 @@ function resetSession($: EngineInterface, cancel = true) {
   turnCold = false
   turnBase = { tokens: 0, cost: 0 }
   turnTrailBase = 0
-  paneData = undefined
-  paneDirty = true
+  weekCache = undefined
   rateLimits = []
   lastSkipped = null
   skippedEpoch = -1
@@ -781,11 +756,11 @@ function exposureText(lang: Lang, now: number, columns: number): string {
   const { tokens: context, model } = contextReading()
   if (context === undefined) return str.unknownContext
   const size = fmtTokens(context)
-  const cold = fmtUsd(context * PRICES[model].write / 1e6)
+  const cold = fmtUsd(context * priceOf(model, context).write / 1e6)
   const label = model === 'fable' ? 'Fable' : LABEL[model]
   const prefix = `${columns >= 55 ? `${label} · ` : ''}${str.ctx} ${size}`
   if (lastMain && now >= lastMain.at + CACHE_TTL_MS) return `${prefix} │ ${str.expired(size, cold)}`
-  const read = columns >= 90 ? ` · ≈$${(context * PRICES[model].read / 1e6).toFixed(3)}/${str.step}` : ''
+  const read = columns >= 90 ? ` · ≈$${(context * priceOf(model, context).read / 1e6).toFixed(3)}/${str.step}` : ''
   const warmth = columns >= 65 ? ` · ${lastMain ? str.warm(Math.max(0, Math.ceil((lastMain.at + CACHE_TTL_MS - now) / 60_000))) : str.unknownCache}` : ''
   return `${prefix}${read} │ ${str.cold} ≈${cold}${warmth}`
 }
@@ -1106,19 +1081,19 @@ async function recordCorrection($: EngineInterface, session: Session, c: Correct
 }
 
 // The only turns a correction can apply to: the classifier sorted them and nothing moved them since. A steered turn
-// was routed by pacing, so correcting it would teach a verdict the classifier never gave. The pane's buttons and the
+// was routed by pacing, so correcting it would teach a verdict the classifier never gave. The history row's buttons and the
 // command both choose by this.
 function isCorrectable(t: TurnRecord): boolean {
   return t.how === 'classified' && !t.steered
 }
 
-// The turn a correction applies to: the one named (a pane button names the turn it drew), else the latest correctable.
+// The turn a correction applies to: the one named (a history button names the turn it drew), else the latest correctable.
 async function correctionTarget($: EngineInterface, session: Session, turnId?: string): Promise<TurnRecord | undefined> {
   const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
   return turnId === undefined ? [...list].reverse().find(isCorrectable) : list.find(t => t.turnId === turnId && isCorrectable(t))
 }
 
-// "/model-router wrong <tier>" and the pane's buttons. Answers with what was recorded, or why nothing was.
+// "/model-router wrong <tier>" and the history buttons. Answers with what was recorded, or why nothing was.
 async function correctTurn($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId?: string): Promise<string> {
   const str = STR[lang]
   if (!learning) return str.wrongOff
@@ -1132,8 +1107,7 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   if (!(await recordCorrection($, session, { at, text, routed: rec.tier, right, source: 'manual' }))) return str.wrongFailed
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
-  paneDirty = true
-  redrawPane($)
+  redraw($)
   return str.wrongDone(hhmm(rec.at), rec.tier, right)
 }
 
@@ -1146,7 +1120,7 @@ async function pressWrong($: EngineInterface, session: Session, lang: Lang, righ
   }
 }
 
-// The small per-turn record the pane lists, written when a main turn the route governs completes.
+// The small per-turn record /model-router history lists, written when a main turn the route governs completes.
 async function writeTurnRecord($: EngineInterface, session: Session, r: Route, turnId: string) {
   const m = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), undefined)
   const at = await $.clock.now()
@@ -1170,12 +1144,10 @@ async function writeTurnRecord($: EngineInterface, session: Session, r: Route, t
     ...(escalationRight.has(turnId) ? { corrected: escalationRight.get(turnId) } : {}),
   }
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? [...list, rec].slice(-MAX_TURNS) : list), undefined, retryFor(session, 'turn record'))
-  paneDirty = true
-  redrawPane($)
 }
 
-// The seven-day series and the session total in one pass over the store keys.
-async function refreshPaneData($: EngineInterface, session: Session, now: number) {
+// The seven days of spend and this session's total in one pass over the store keys.
+async function refreshWeek($: EngineInterface, session: Session, now: number, count: number) {
   const days = lastDays(now, PACE_DAYS, dayKey)
   const byDay = new Map<string, Tally>()
   let mine = EMPTY
@@ -1191,34 +1163,48 @@ async function refreshPaneData($: EngineInterface, session: Session, now: number
     if (own) mine = merge(mine, t)
   }
   if (await stillHere($, session) !== 'same') return
-  paneData = { day: dayKey(now), series: days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0 })), session: mine }
-  paneDirty = false
+  weekCache = { day: dayKey(now), count, series: days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0 })), session: mine }
 }
 
-async function openPane($: EngineInterface, title: string): Promise<boolean> {
-  paneDirty = true
-  try {
-    const opened = await $.ui.open({ id: PANE, title })
-    paneOpen = true
-    return opened.isPlaced
-  } catch {
-    return false
-  }
-}
-
-async function togglePane($: EngineInterface, lang: Lang): Promise<string> {
+// One turn as a row: the pieces the tree colours and the plain text joins.
+function turnParts(t: TurnRecord, lang: Lang) {
   const str = STR[lang]
-  try {
-    if ((await $.ui.panes()).some(p => p.id === PANE)) {
-      await $.ui.close({ id: PANE })
-      paneOpen = false
-      return str.paneClosed
-    }
-  } catch {
-    // Not listed: try to open it.
+  const tags = [
+    t.cold ? str.tagCold : '',
+    t.keptFrom ? str.tagKept : '',
+    t.trail.length > 0 ? `→ ${t.trail.map(trailStep).join(' → ')}` : '',
+    t.how === 'pinned' ? `📌 ${str.tagPinned}` : t.how === 'forced' ? str.tagForced : '',
+    t.corrected ? `${str.tagCorrected} → ${t.corrected}` : '',
+  ].filter(Boolean)
+  return {
+    time: hhmm(t.at),
+    label: t.model === 'session' ? str.sessionRow : `${LABEL[t.model]}·${t.effort ?? ''}`.replace(/·$/, ''),
+    detail: `${fmtUsd(t.cost)} · ${fmtTokens(t.tokens)}${tags.length > 0 ? ` · ${tags.join(' · ')}` : ''}`,
+    reason: t.reason,
   }
-  // An answer to the person's own command is placed at any width.
-  return (await openPane($, str.paneTitle)) ? str.paneOpened : str.paneUnavailable
+}
+
+function weekTotals(series: readonly DayCost[]): { cost: number; base: number } {
+  return { cost: series.reduce((sum, d) => sum + d.cost, 0), base: series.reduce((sum, d) => sum + d.baseline, 0) }
+}
+
+// The command's own text, which the model reads too: the last turns, one short row each, and the week's total.
+function historyText(lang: Lang, list: readonly TurnRecord[], series: readonly DayCost[]): string {
+  const str = STR[lang]
+  const rows = list.map(t => {
+    const p = turnParts(t, lang)
+    return `${p.time} ${p.label} ${p.detail}${p.reason ? ` — ${shorten(p.reason, 40)}` : ''}`
+  })
+  const w = weekTotals(series)
+  return [...(rows.length > 0 ? rows : [str.histNone]), str.histTotal(fmtUsd(w.cost), fmtUsd(w.base))].join('\n')
+}
+
+async function historyCommand($: EngineInterface, session: Session, lang: Lang): Promise<string> {
+  const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
+  const now = await $.clock.now()
+  await bookkeeping($, () => refreshWeek($, session, now, list.length), undefined, retryFor(session, 'history week'))
+  if (await stillHere($, session) !== 'same') return STR[lang].checkpointCancelled
+  return historyText(lang, list.slice(-HISTORY_ROWS), weekCache?.series ?? [])
 }
 
 async function pinCommand($: EngineInterface, lang: Lang, arg: string, mainRouting: boolean): Promise<string> {
@@ -1718,9 +1704,6 @@ export const register: Register = (on, options) => {
   const capOn = Number.isFinite(compactAtContext) && compactAtContext >= CAP_MIN_CONTEXT
   const checkpointHints = options.checkpointHints === true
   const shrinkToolOutput = outputLimit(options.shrinkToolOutput)
-  // Off (the default): the pane opens only when the person asks (/model-router pane). On: it also opens by itself where it
-  // would be a sidebar, once per session.
-  const autoOpenPane = options.autoOpenPane === true
   // On (the default): corrections are recorded and sent to the classifier. Off: none are written or sent.
   learning = options.learnFromCorrections !== false
   // off | warn (the default) | steer; /model-router pacing overrides it and persists.
@@ -1735,7 +1718,7 @@ export const register: Register = (on, options) => {
   const settings = {
     language: lang, mainRouting, blockFable, haikuModel: ids.haiku, sonnetModel: ids.sonnet, opusModel: ids.opus,
     reviewModel, idleCompactMinutes: idleMinutes, compactMinContext, compactAtContext, checkpointHints, shrinkToolOutput,
-    autoOpenPane, learnFromCorrections: learning, weeklyPacing: pacingOption,
+    learnFromCorrections: learning, weeklyPacing: pacingOption,
   }
 
   on('session.end', async ($, e, next) => {
@@ -1753,7 +1736,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'model-router',
       description: str.commandDescription,
-      argumentHint: '[stats|status|context|checkpoint [note]|on|off|pane|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]',
+      argumentHint: '[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]',
       immediate: true,
     })
     await $.tool.register({
@@ -1815,18 +1798,7 @@ export const register: Register = (on, options) => {
     await ensurePrefs($, session)
     if (await stillHere($, session) !== 'same') return next(e)
     refreshUi($, session, now)
-    try {
-      paneOpen = (await $.ui.panes()).some(p => p.id === PANE)
-    } catch {
-      // Not listed: treated as closed until it is opened or drawn.
-    }
-    if (await stillHere($, session) !== 'same') return next(e)
     await paceNotice($, session, now)
-    // Desktop docks a pane beside the chat. The terminal says so only when it draws (see the AbovePrompt hook).
-    if (autoOpenPane && !paneAutoTried && e.surface === 'desktop' && e.isInteractive) {
-      paneAutoTried = true
-      void openPane($, str.paneTitle)
-    }
     return next(e)
   })
 
@@ -1872,7 +1844,7 @@ export const register: Register = (on, options) => {
       return { text: arg === 'status' ? await statusScreen($, session, lang, settings, compaction) : await statsText($, session, lang, compaction) }
     }
     if (arg === 'context') return { text: await contextText($, session, lang, e.presentation?.columns ?? 80) }
-    if (arg === 'pane') return { text: await togglePane($, lang) }
+    if (arg === 'history') return { text: await historyCommand($, session, lang) }
     if (arg === 'unpin' || /^pin(?:\s|$)/.test(arg)) return { text: await pinCommand($, lang, arg, mainRouting) }
     if (/^wrong(?:\s|$)/.test(arg)) {
       const tier = /^wrong\s+(lookup|execute|decide)$/i.exec(arg)?.[1]?.toLowerCase()
@@ -1980,7 +1952,7 @@ export const register: Register = (on, options) => {
     const pinned = r.how === 'forced' || r.how === 'pinned'
     const warm = warmRequest()
     if (pinned && r.model !== 'opus' && isWarmOpus(warm, now)) {
-      const cost = fmtUsd((warm!.context * (PRICES[r.model].write + PRICES.opus.write)) / 1e6)
+      const cost = fmtUsd((warm!.context * (priceOf(r.model, warm!.context).write + priceOf('opus', warm!.context).write)) / 1e6)
       r = { ...r, reason: `${r.reason}; ${str.abandoned(cost)}` }
     }
     const model = pinned ? r.model : keepWarm(r.model, warm, now, shape)
@@ -2124,7 +2096,7 @@ export const register: Register = (on, options) => {
         // The turn started on an expired cache: its first request is the one that rewrote it.
         if (rewrote && turnSteps === 0) turnCold = true
         if (rewrote) {
-          const cost = (u.cache_creation_input_tokens * PRICES[key].write) / 1e6
+          const cost = (u.cache_creation_input_tokens * priceOf(key, promptOf(u)).write) / 1e6
           await count($, session, c => ({
             ...c,
             cacheExpiryRewrites: (c.cacheExpiryRewrites ?? 0) + 1,
@@ -2283,7 +2255,6 @@ export const register: Register = (on, options) => {
         escalationRight.set(r.turnId, right)
       }
     }
-    redrawPane($)
     return {
       result: `Route updated: from your next step this turn runs on ${out.route.model} at ${out.route.effort} effort. Now do the work.`,
     }
@@ -2416,7 +2387,7 @@ export const register: Register = (on, options) => {
       await bookkeeping($, () => $.store.set('shape', { steps: prev.steps * 0.8 + turnSteps * 0.2, output: prev.output * 0.8 + output * 0.2 }), undefined, retryFor(session, 'shape write'))
       if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     }
-    // New with 1.1.0, after everything main did before it: the pane's record of this turn.
+    // New with 1.1.0, after everything main did before it: the record of this turn that history lists.
     if (e.agentId === undefined && r && r.turnId === e.turnId) await writeTurnRecord($, session, r, e.turnId)
     if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     const isOn = await read($, enabled)
@@ -2459,84 +2430,54 @@ export const register: Register = (on, options) => {
     return done
   })
 
-  // A close (the person's mark, a command, an unload) leaves nothing to redraw.
-  on('ui.close', async ($, e, next) => {
-    const closed = await next(e)
-    if (e.id === PANE) paneOpen = false
-    return closed
-  })
-
-  // The router pane: this session's turns, the totals, the last seven days and, with learning on, correction buttons.
-  // Drawn only while the person has it open (/model-router pane, or autoOpenPane), so a closed pane costs nothing here.
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+  // /model-router history draws its details inline in the transcript; every other model-router command keeps the
+  // engine's own row. A surface that cannot draw the tree shows the command's plain text instead.
+  on('ui.render', { component: 'CommandOutput', props: { command: 'model-router' } }, async ($, e, next) => {
+    if (e.props.args.trim() !== 'history' || e.props.isErrored) return next(e)
     const session = await useSession($)
     if (!here(session)) return next(e)
-    // Being asked to draw means it is open.
-    paneOpen = true
     const now = await $.clock.now()
+    const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
+    // Computed when the command ran or the turns changed since, never on every redraw.
+    if (weekCache === undefined || weekCache.day !== dayKey(now) || weekCache.count !== list.length) {
+      await bookkeeping($, () => refreshWeek($, session, now, list.length), undefined, retryFor(session, 'history week'))
+    }
     if (await stillHere($, session) !== 'same') return next(e)
     await ensurePrefs($, session)
-    const isOn = await read($, enabled)
-    const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
-    const m = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), { turn: EMPTY, today: session.today ?? EMPTY })
-    // Recomputed when the pane opened or a main turn completed since, or the day turned; never per render.
-    if (paneDirty || paneData?.day !== dayKey(now)) await bookkeeping($, () => refreshPaneData($, session, now), undefined, retryFor(session, 'pane data'))
-    if (await stillHere($, session) !== 'same') return next(e)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     // The terminal's table has no Svg (it would draw a fragment: nothing): it gets a text sparkline instead.
     const Svg = e.surface === 'terminal' ? undefined : (table as unknown as { Svg?: ElementConstructor<SvgProps> }).Svg
-    const room = Math.max(3, (e.props.scroll?.bodyRows ?? 24) - 9)
-    const shown = list.slice(-room)
-    const today = session.today ?? m.today
-    const mine = paneData?.session ?? EMPTY
-    const series = paneData?.series ?? []
-    const weekCost = series.reduce((sum, d) => sum + d.cost, 0)
-    const weekBase = series.reduce((sum, d) => sum + d.baseline, 0)
-    const weekLine = `${str.paneWeek}: ${fmtUsd(weekCost)} (Opus ${fmtUsd(weekBase)})`
+    const shown = list.slice(-HISTORY_ROWS)
+    const series = weekCache?.series ?? []
+    const w = weekTotals(series)
     const target = learning ? [...list].reverse().find(isCorrectable) : undefined
-    const head = [isOn ? str.paneOn : str.paneOff, weeklyText(lang), pin ? `📌 ${LABEL[pin.model]}${pin.left === undefined ? '' : ` (${pin.left})`}` : ''].filter(Boolean).join(' · ')
-    const figures = (name: string, t: Tally) => `${name} ${fmtTokens(t.tokens)} token · ${fmtUsd(t.cost)}, ${str.save} ≈${fmtUsd(saved(t).usd)} (${saved(t).pct}%)`
     return (
       <Box flexDirection="column">
-        <Text dimColor wrap="truncate-end">{head}</Text>
-        {shown.length === 0 && <Text dimColor>{str.paneNoTurns}</Text>}
+        {shown.length === 0 && <Text dimColor>{str.histNone}</Text>}
         {shown.map(t => {
-          const tags = [
-            t.cold ? str.tagCold : '',
-            t.keptFrom ? str.tagKept : '',
-            t.trail.length > 0 ? `→ ${t.trail.map(trailStep).join(' → ')}` : '',
-            t.how === 'pinned' ? str.tagPinned : t.how === 'forced' ? str.tagForced : '',
-            t.corrected ? `${str.tagCorrected} → ${t.corrected}` : '',
-          ].filter(Boolean)
-          const detail = `${fmtUsd(t.cost)} · ${fmtTokens(t.tokens)}${tags.length > 0 ? ` · ${tags.join(' · ')}` : ''}${t.reason ? ` — ${t.reason}` : ''}`
+          const p = turnParts(t, lang)
           return (
             <Box key={t.turnId} flexDirection="row" gap={1}>
               <Box flexShrink={0}>
-                <Text dimColor>{hhmm(t.at)}</Text>
+                <Text dimColor>{p.time}</Text>
               </Box>
               <Box flexShrink={0}>
-                <Text color={TURN_COLOR[t.model]}>{t.model === 'session' ? str.sessionRow : `${LABEL[t.model]} ${t.effort ?? ''}`.trim()}</Text>
+                <Text color={TURN_COLOR[t.model]}>{p.label}</Text>
               </Box>
               <Box flexGrow={1} flexShrink={1} width={0}>
-                <Text dimColor wrap="truncate-end">{detail}</Text>
+                <Text dimColor wrap="truncate-end">{`${p.detail}${p.reason ? ` — ${p.reason}` : ''}`}</Text>
               </Box>
             </Box>
           )
         })}
-        <Text dimColor wrap="truncate-end">{figures(str.paneSession, mine)}</Text>
-        <Text dimColor wrap="truncate-end">{figures(str.paneToday, today)}</Text>
         {series.length > 0 && (Svg
-          ? (
-            <Box flexDirection="column">
-              <Text dimColor wrap="truncate-end">{weekLine}</Text>
-              <Svg source={barChartSvg(series)} alt={chartAlt(series)} />
-            </Box>
-          )
-          : <Text dimColor wrap="truncate-end">{`${weekLine}  ${sparkline(series.map(d => d.cost))}`}</Text>)}
+          ? <Svg source={barChartSvg(series)} alt={chartAlt(series)} />
+          : <Text dimColor>{sparkline(series.map(d => d.cost))}</Text>)}
+        <Text dimColor wrap="truncate-end">{str.histTotal(fmtUsd(w.cost), fmtUsd(w.base))}</Text>
         {target && (
           <Box flexDirection="row" gap={1} alignItems="center">
-            <Text dimColor>{`${str.paneShould} (${hhmm(target.at)})`}</Text>
+            <Text dimColor>{`${str.shouldBe} (${hhmm(target.at)})`}</Text>
             {(['lookup', 'execute', 'decide'] as const).filter(t => t !== target.tier).map(t => (
               <Button key={`wrong-${t}`} label={t} onPress={() => pressWrong($, session, lang, t, target.turnId)} />
             ))}
@@ -2552,11 +2493,6 @@ export const register: Register = (on, options) => {
     const below = await next(e)
     if (await stillHere($, session) !== 'same') return below
     if (e.props.hasSurvey) return below
-    // The terminal says whether it docks a pane; a pane opened unasked is then a sidebar. Once per session.
-    if (autoOpenPane && !paneAutoTried && e.viewport?.isFullscreen === true) {
-      paneAutoTried = true
-      void openPane($, str.paneTitle)
-    }
     const { Box, Text, Button } = $.ui.resolve(e)
     const exposure = exposureText(lang, await $.clock.now(), e.props.bodyColumns)
     if (await stillHere($, session) !== 'same') return below
@@ -2588,12 +2524,12 @@ export const register: Register = (on, options) => {
           (r.reason ? ` — ${r.reason}` : '')
     // A pin shows in front of the route, and without one nothing here changes.
     const pinTag = pin ? `📌 ${LABEL[pin.model]}${pin.left === undefined ? '' : ` (${pin.left})`}` : ''
-    const routeText = r?.how === 'pinned' ? `📌 ${routeBase}` : pinTag === '' ? routeBase : `${pinTag} │ ${routeBase}`
+    const routeText = pin || r?.how === 'pinned' ? `📌 ${routeBase}` : routeBase
     const today = session.today ?? m.today
     const s = saved(today)
     const meterText =
-      `${str.turn} ${fmtTokens(m.turn.tokens)} token · ${fmtUsd(m.turn.cost)}   ` +
-      `${str.today} ${fmtTokens(today.tokens)} token · ${fmtUsd(today.cost)}, ${str.save} ≈${fmtUsd(s.usd)} (${s.pct}%) ${str.vs}`
+      `${str.turn} ${fmtTokens(m.turn.tokens)} tok · ${fmtUsd(m.turn.cost)}   ` +
+      `${str.today} ${fmtTokens(today.tokens)} tok · ${fmtUsd(today.cost)} · ≈${fmtUsd(Math.abs(s.usd))} (${Math.abs(s.pct)}%) ${s.usd >= 0 ? str.below : str.above}`
 
     // No route, or no room for it: the meter takes the gear's row, so there is no empty route row.
     if (!r || narrow) {

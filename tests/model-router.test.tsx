@@ -5,11 +5,11 @@ import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
-import { add, baselineOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
+import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMPTY, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
 import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
-import { barChartSvg, chartAlt, hhmm, sparkline, trailStep } from '../hooks/pane'
+import { barChartSvg, chartAlt, hhmm, sparkline, trailStep } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
@@ -397,10 +397,43 @@ describe('meter', () => {
   test('prices tokens per model and the Opus baseline', async () => {
     expect(Math.round(costOf(U(1e6, 0), 'opus') * 1000) / 1000).toBe(4)
     expect(Math.round((costOf(U(0, 1e6), 'haiku')) * 1000) / 1000).toBe(0.5)
-    const t = add(add(EMPTY, 'claude-haiku-5-5', U(1e6, 0)), 'claude-opus-5-5', U(1e6, 0))
-    expect(Math.round((t.cost) * 1000) / 1000).toBe(4.1)
-    expect(Math.round((t.baseline) * 1000) / 1000).toBe(8)
-    expect(saved(t).pct).toBe(49)
+    // 99,999 prompt tokens or fewer: Haiku's base rates.
+    const t = add(add(EMPTY, 'claude-haiku-5-5', U(1e5, 0)), 'claude-opus-5-5', U(1e6, 0))
+    expect(Math.round((t.cost) * 1000) / 1000).toBe(4.01)
+    expect(Math.round((t.baseline) * 1000) / 1000).toBe(4.4)
+    expect(saved(t).pct).toBe(9)
+  })
+
+  // WHY: the official pricing page (checked 2026-11-02) lists Sonnet 5.5 cache reads at $0.10 per million, not $0.20.
+  test('Sonnet 5.5 cache reads are priced at $0.10 per million', async () => {
+    expect(Math.round(costOf(U(0, 0, 1e6), 'sonnet') * 1e6) / 1e6).toBe(0.1)
+    expect(add(EMPTY, 'claude-sonnet-5-5', U(0, 0, 1e6)).byUsage?.read?.cost).toBe(0.1)
+  })
+
+  // WHY: Haiku 5.5 costs more once a request's prompt (input + cache reads + cache writes) passes 100,000 tokens, and each
+  // request is priced on its own size, so the boundary is exact.
+  test('a Haiku request is priced at the long-prompt rates only above 100,000 prompt tokens', async () => {
+    expect(LONG_PROMPT_TOKENS).toBe(100_000)
+    const micro = (n: number) => Math.round(n * 1e6)
+    // Input alone.
+    expect(micro(costOf(U(99_999, 0), 'haiku'))).toBe(micro(99_999 * 0.1 / 1e6))
+    expect(micro(costOf(U(100_000, 0), 'haiku'))).toBe(micro(100_000 * 0.1 / 1e6))
+    expect(micro(costOf(U(100_001, 0), 'haiku'))).toBe(micro(100_001 * 0.5 / 1e6))
+    // The prompt counts reads and writes too; output is not part of it but is priced at the tier's output rate.
+    expect(micro(costOf(U(1000, 0, 98_999), 'haiku'))).toBe(micro((1000 * 0.1 + 98_999 * 0.01) / 1e6))
+    expect(micro(costOf(U(1000, 0, 99_001), 'haiku'))).toBe(micro((1000 * 0.5 + 99_001 * 0.05) / 1e6))
+    expect(micro(costOf(U(1000, 0, 0, 99_001), 'haiku'))).toBe(micro((1000 * 0.5 + 99_001 * 1) / 1e6))
+    expect(micro(costOf(U(99_999, 1000), 'haiku'))).toBe(micro((99_999 * 0.1 + 1000 * 0.5) / 1e6))
+    expect(micro(costOf(U(100_001, 1000), 'haiku'))).toBe(micro((100_001 * 0.5 + 1000 * 2.5) / 1e6))
+    // The usage breakdown follows the same tier, and Sonnet and Opus have none.
+    expect(micro(add(EMPTY, 'claude-haiku-5-5', U(100_001, 0)).cost)).toBe(micro(100_001 * 0.5 / 1e6))
+    expect(micro(costOf(U(100_001, 0), 'sonnet'))).toBe(micro(100_001 * 2 / 1e6))
+    expect(priceOf('opus', 5e6)).toEqual(priceOf('opus', 1))
+  })
+
+  test('a context-only estimate for Haiku uses the context size the same way', async () => {
+    expect(priceOf('haiku', 100_000).write).toBe(0.2)
+    expect(priceOf('haiku', 100_001).write).toBe(1)
   })
 
   // Changed from v0.6: the haiku line used to follow the cost comparison; a 200k context is now never moved down.
@@ -421,8 +454,8 @@ test('each step goes on the meter, shown in the band and in /model-router stats'
   seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /本轮 21\.2k token · / })).toBeDefined()
-  expect(await ui.find({ text: /差额 ≈/ })).toBeDefined()
+  expect(await ui.find({ text: /本轮 21\.2k tok · / })).toBeDefined()
+  expect(await ui.find({ text: /≈\$[\d.]+ \(\d+%\) 低于全 Opus/ })).toBeDefined()
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('haiku')
   expect(r.text).toContain('same work tokens at Opus prices')
@@ -812,7 +845,7 @@ test('parallel subagent steps all land on the meter, and the turn includes the c
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('| sonnet | 5.0k |')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /本轮 5\.0k token/ })).toBeDefined()
+  expect(await ui.find({ text: /本轮 5\.0k tok/ })).toBeDefined()
 })
 
 test('the band speaks English by default', async ($, on) => {
@@ -822,10 +855,11 @@ test('the band speaks English by default', async ($, on) => {
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /Haiku · medium — find files/ })).toBeDefined()
-  expect(await ui.find({ text: /turn 21\.2k token · / })).toBeDefined()
-  expect(await ui.find({ text: /today 21\.2k token · / })).toBeDefined()
-  expect(await ui.find({ text: /difference ≈/ })).toBeDefined()
-  expect(await ui.find({ text: /vs work tokens at Opus prices/ })).toBeDefined()
+  expect(await ui.find({ text: /turn 21\.2k tok · / })).toBeDefined()
+  expect(await ui.find({ text: /today 21\.2k tok · / })).toBeDefined()
+  expect(await ui.find({ text: /· ≈\$[\d.]+ \(\d+%\) below all-Opus$/ })).toBeDefined()
+  // The precise wording lives in /model-router stats, not in the band.
+  expect(await ui.find({ text: /work tokens at Opus prices/ })).toBeUndefined()
 })
 
 // Changed from v0.6 ("classifier failed, defaulted to Sonnet"): the band names the reason and what happened instead.
@@ -1153,8 +1187,8 @@ describe('mainRouting off (subagent-only mode)', () => {
     await step($, 't1')
     await $.prompt.submit({ text: 'second' } as never)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /turn 0 token/ })).toBeDefined()
-    expect(await ui.find({ text: /today 21\.2k token/ })).toBeDefined()
+    expect(await ui.find({ text: /turn 0 tok/ })).toBeDefined()
+    expect(await ui.find({ text: /today 21\.2k tok/ })).toBeDefined()
   })
 
   test('on by default', async ($, on) => {
@@ -1177,7 +1211,7 @@ describe('the band without a route', () => {
     const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
     expect(texts.filter(t => t.trim() === '')).toEqual([])
     expect(texts.some(t => t.includes('⚙'))).toBe(true)
-    expect(await ui.find({ text: /today 21\.2k token/ })).toBeDefined()
+    expect(await ui.find({ text: /today 21\.2k tok/ })).toBeDefined()
     expect(await ui.find({ key: 'router-disable' })).toBeDefined()
   })
 
@@ -1491,7 +1525,7 @@ describe('phase 1 routing and meter fixes', () => {
       await step($, 't1')
       await $.prompt.submit({ text: `next #${model}` } as never)
       await step($, 't2')
-      const cost = fmtUsd(300_000 * (PRICES[model].write + PRICES.opus.write) / 1e6)
+      const cost = fmtUsd(300_000 * (priceOf(model, 300_000).write + priceOf('opus', 300_000).write) / 1e6)
       expect(seen.steps.at(-1)!.model).toContain(model)
       expect(seen.asked).toEqual(['haiku'])
       expect(seen.submits.at(-1)!.context?.[0]).toContain(`warm Opus cache abandoned, estimated round-trip rewrite ${cost}`)
@@ -1779,8 +1813,8 @@ describe('cost exposure and session commands (1.0)', () => {
       seen.usage.push(U(1000, 500, 220_000, 0, `claude-${model}-5-5`))
       await step($, 't1', `claude-${model}-5-5`)
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: `cold resume ≈${fmtUsd(221_000 * PRICES[model].write / 1e6)}` })).toBeDefined()
-      expect(await ui.find({ text: `≈$${(221_000 * PRICES[model].read / 1e6).toFixed(3)}/step` })).toBeDefined()
+      expect(await ui.find({ text: `cold resume ≈${fmtUsd(221_000 * priceOf(model, 221_000).write / 1e6)}` })).toBeDefined()
+      expect(await ui.find({ text: `≈$${(221_000 * priceOf(model, 221_000).read / 1e6).toFixed(3)}/step` })).toBeDefined()
     })
   }
 
@@ -1826,7 +1860,7 @@ describe('cost exposure and session commands (1.0)', () => {
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
       const cost = fmtUsd(60_000 * PRICES[model].write / 1e6)
       expect(await ui.find({ text: `cold resume ≈${cost} · cache warm ~44m` })).toBeDefined()
-      expect(await ui.find({ text: `≈$${(60_000 * PRICES[model].read / 1e6).toFixed(3)}/step` })).toBeDefined()
+      expect(await ui.find({ text: `≈$${(60_000 * priceOf(model, 60_000).read / 1e6).toFixed(3)}/step` })).toBeDefined()
       await seen.clock.advance(44 * 60_000)
       expect(await ui.find({ text: `cache expired: next prompt rewrites ≈60.0k (≈${cost})` })).toBeDefined()
     })
@@ -1976,7 +2010,7 @@ describe('cost exposure and session commands (1.0)', () => {
     on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [{ kind: 'seven_day', percentUsed: 76 }] } }))
     on('session.model', async () => ({ value: 'opus' }))
     await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
-    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off|pane|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]')
+    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]')
     expect(command.immediate).toBe(true)
     expect(command.description).toContain('status')
     expect(command.description).toContain('context')
@@ -2204,7 +2238,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(lists).toBe(1)
         expect(totals).toBe(failed === 'totals' ? 2 : 1)
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /today 1.0M token/ })).toBeDefined()
+        expect(await ui.find({ text: /today 1.0M tok/ })).toBeDefined()
         await measure()
         expect(scans).toBe(failed === 'history' ? 2 : 1)
         expect(totals).toBe(failed === 'totals' ? 2 : 1)
@@ -2463,7 +2497,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         failing = true
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
         expect(failures).toBe(1)
-        expect(await ui.find({ text: /turn 0 token/ })).toBeDefined()
+        expect(await ui.find({ text: /turn 0 tok/ })).toBeDefined()
         expect(await ui.find({ text: /other mods/ })).toBeDefined()
       })
     }
@@ -2791,7 +2825,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await step($, 't2')
       expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: /turn 150 token/ })).toBeDefined()
+      expect(await ui.find({ text: /turn 150 tok/ })).toBeDefined()
       await seen.clock.advance(20 * MIN)
       expect(c.instructions).toHaveLength(0)
     })
@@ -2857,7 +2891,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         retainState(on)
         const seen = world($, on, null, { store })
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /turn 0 token.*today 450 token/ })).toBeDefined()
+        expect(await ui.find({ text: /turn 0 tok.*today 450 tok/ })).toBeDefined()
         await $.prompt.submit({ text: 'work after reload' } as never)
         expect(seen.prompts[0]).toContain('<previous_tier>none</previous_tier>')
         await step($, 't3')
@@ -3024,7 +3058,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
             expect(day).toContain(`same work tokens at Opus prices (switch-adjusted): ${fmtUsd(today.baseline)}`)
           }
           const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-          expect(await ui.find({ text: new RegExp(`turn 0 token.*today .*${fmtUsd(today.cost).replace('$', '\\$')}`) })).toBeDefined()
+          expect(await ui.find({ text: new RegExp(`turn 0 tok.*today .*${fmtUsd(today.cost).replace('$', '\\$')}`) })).toBeDefined()
         })
       }
     }
@@ -6357,7 +6391,7 @@ describe('append-only event logs', () => {
 })
 
 // ---------------------------------------------------------------------------------------------------------------------
-// 1.1.0: the router pane, pin and corrections, weekly pacing
+// 1.1.0: history, pin and corrections, weekly pacing
 // ---------------------------------------------------------------------------------------------------------------------
 
 describe('weekly pace math (1.1.0)', () => {
@@ -6437,7 +6471,7 @@ describe('corrections store and few-shot block (1.1.0)', () => {
   })
 })
 
-describe('router pane helpers (1.1.0)', () => {
+describe('history helpers (1.1.0)', () => {
   test('the sparkline scales to the largest day and an empty week is flat', async () => {
     expect(sparkline([0, 1, 2, 4])).toBe('▁▃▅█')
     expect(sparkline([0, 0, 0])).toBe('▁▁▁')
@@ -6458,7 +6492,7 @@ describe('router pane helpers (1.1.0)', () => {
   })
 })
 
-describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
+describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
   const DAY = 24 * 3600 * 1000
   const LOOKUP = '{"tier":"lookup","reason":"find"}'
   const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
@@ -6811,65 +6845,81 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(status).toContain('Weekly pacing: off (override)')
       expect(status).toContain('weeklyPacing: warn')
       expect(status).toContain('learnFromCorrections: true')
-      expect(status).toContain('autoOpenPane: false')
     })
   })
 
-  describe('router pane', () => {
-    const PANE_PROPS = { title: 'Router', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 24 }, view: {} } as never
-    const mountPane = ($: any, surface: 'terminal' | 'desktop') =>
-      $.ui.mount({ plugin: 'model-router', surface, component: 'Pane', requestId: 'model-router', props: PANE_PROPS })
-
-    test('/model-router pane opens the pane, and the same command closes it', async ($, on) => {
-      world($, on, LOOKUP)
-      const c = ui($, on)
-      expect(await cmd($, 'pane')).toBe('Router pane opened.')
-      expect(c.opened.map(o => o.id)).toEqual(['model-router'])
-      expect(await cmd($, 'pane')).toBe('Router pane closed.')
-      expect(c.closed).toEqual(['model-router'])
-    })
-
-    test('nothing opens by itself by default', async ($, on) => {
-      world($, on, LOOKUP)
-      const c = ui($, on)
-      await $.session.start({ cwd: '/plugin', surface: 'desktop', isInteractive: true })
-      expect(c.opened).toEqual([])
-    })
-
-    for (const [surface, opens] of [['desktop', true], ['terminal', false]] as const) {
-      test(`autoOpenPane opens the pane at start only where it is a sidebar (${surface})`, { options: { autoOpenPane: true } }, async ($, on) => {
-        world($, on, LOOKUP)
-        const c = ui($, on)
-        await $.session.start({ cwd: '/plugin', surface, isInteractive: true })
-        expect(c.opened.map(o => o.id)).toEqual(opens ? ['model-router'] : [])
-      })
+  describe('history', () => {
+    const HIST = (surface: 'terminal' | 'desktop', args = 'history') =>
+      ({ plugin: 'model-router', surface, component: 'CommandOutput', props: { command: 'model-router', args, text: 'x', isErrored: false } }) as never
+    const mountHistory = ($: any, surface: 'terminal' | 'desktop', args?: string) => $.ui.mount(HIST(surface, args))
+    // The turn a classified lookup ran as: one cold Haiku request.
+    async function lookupTurn($: any, seen: Seen, text: string, turnId: string) {
+      await $.prompt.submit({ text } as never)
+      seen.usage.push(U(1000, 500, 0, 150_000, 'claude-haiku-5-5'))
+      await step($, turnId)
+      await $.turn.complete(completion(turnId))
     }
 
+    test('the command text is short plain lines: the last turns, then the week total', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await lookupTurn($, seen, 'find every TODO in the repo', 't1')
+      const text = await cmd($, 'history')
+      const lines = text.split('\n')
+      expect(lines).toHaveLength(2)
+      expect(lines[0]).toMatch(/^\d\d:\d\d Haiku·medium \$\d+\.\d\d · 151\.5k · cold — find/)
+      expect(lines[1]).toMatch(/^7 days \$\d+\.\d\d · all-Opus \$\d+\.\d\d$/)
+    })
+
+    test('an empty session says so, and the text never has more than 10 turn rows plus the total', async ($, on) => {
+      world($, on, LOOKUP)
+      expect((await cmd($, 'history')).split('\n')[0]).toBe('No routed turns in this session yet.')
+      for (let i = 1; i <= 12; i++) {
+        await $.prompt.submit({ text: `job ${i} #haiku` } as never)
+        await $.turn.complete(completion(`t${i}`))
+      }
+      expect((await cmd($, 'history')).split('\n')).toHaveLength(11)
+    })
+
+    test('the 7-day total in the text is the sum of the retained days', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await lookupTurn($, seen, 'find files', 't1')
+      const total = (await cmd($, 'history')).split('\n').at(-1)!
+      expect(total).toContain(`7 days ${fmtUsd(seen.tally!.cost)}`)
+    })
+
     for (const surface of ['terminal', 'desktop'] as const) {
-      test(`the pane lists the turn, its totals and the seven days (${surface})`, async ($, on) => {
+      test(`the tree lists the turn and the week with a one-line total (${surface})`, async ($, on) => {
         const seen = world($, on, LOOKUP)
-        // A turn on Haiku whose first request wrote a big cache from cold, then a day of earlier spend.
-        await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
-        seen.usage.push(U(1000, 500, 0, 150_000, 'claude-haiku-5-5'))
-        await step($, 't1')
-        await $.turn.complete(completion('t1'))
-        const ui = await mountPane($, surface)
-        expect(await ui.find({ type: 'Text', text: /Haiku medium/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /cold/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /\$\d+\.\d+ · 151\.5k/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /router on/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /session .* token/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /today .* token/ })).toBeDefined()
+        await lookupTurn($, seen, 'find every TODO in the repo', 't1')
+        const ui = await mountHistory($, surface)
+        expect(await ui.find({ type: 'Text', text: /^Haiku·medium$/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /\$\d+\.\d\d · 151\.5k · cold — find/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /^7 days \$\d+\.\d\d · all-Opus \$\d+\.\d\d$/ })).toBeDefined()
         if (surface === 'desktop') {
-          expect(await ui.find({ type: 'Svg' } as never)).toBeDefined()
+          const svg = await ui.find({ type: 'Svg' } as never)
+          expect(svg).toBeDefined()
         } else {
-          expect(await ui.find({ type: 'Text', text: /7-day spend: .*[▁▂▃▄▅▆▇█]{7}/ })).toBeDefined()
+          expect(await ui.find({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]{7}$/ })).toBeDefined()
         }
         await ui.unmount()
       })
     }
 
-    test('the pane marks a kept cache, a forced turn, a pin and an escalation trail', async ($, on) => {
+    test('any other model-router command keeps the engine row', async ($, on) => {
+      world($, on, LOOKUP)
+      on('ui.render', { component: 'CommandOutput' }, async ($$: any, e: any) => {
+        const { Text } = $$.ui.resolve(e)
+        return <Text>engine row</Text>
+      })
+      for (const args of ['stats', '', 'status', 'pacing']) {
+        const ui = await mountHistory($, 'terminal', args)
+        expect(await ui.find({ type: 'Text', text: /engine row/ })).toBeDefined()
+        expect(await ui.find({ type: 'Text', text: /all-Opus/ })).toBeUndefined()
+        await ui.unmount()
+      }
+    })
+
+    test('the row marks a forced turn, a pin and the turn\'s own escalation', async ($, on) => {
       const seen = world($, on, LOOKUP)
       await $.prompt.submit({ text: 'quick #haiku' } as never)
       await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'needs code' } as never)
@@ -6877,10 +6927,11 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       await cmd($, 'pin opus 1')
       await $.prompt.submit({ text: 'pinned' } as never)
       await $.turn.complete(completion('t2'))
-      const ui = await mountPane($, 'terminal')
-      expect(await ui.find({ type: 'Text', text: /forced.*→ sonnet\/medium|→ sonnet\/medium.*forced/ })).toBeDefined()
-      expect(await ui.find({ type: 'Text', text: /pinned \(1 left\)/ })).toBeDefined()
+      const ui = await mountHistory($, 'terminal')
+      expect(await ui.find({ type: 'Text', text: /→ sonnet\/medium · forced/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /📌 pinned — pinned \(1 left\)/ })).toBeDefined()
       expect(seen.store.corrections).toBeUndefined()
+      await ui.unmount()
     })
 
     for (const surface of ['terminal', 'desktop'] as const) {
@@ -6889,62 +6940,55 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
         ui($, on)
         await $.prompt.submit({ text: 'rename the helper' } as never)
         await $.turn.complete(completion('t1'))
-        const ui2 = await mountPane($, surface)
-        expect(await ui2.find({ key: 'wrong-decide' })).toBeDefined()
-        expect(await ui2.find({ key: 'wrong-execute' })).toBeDefined()
-        expect(await ui2.find({ key: 'wrong-lookup' })).toBeUndefined()
-        await ui2.press({ key: 'wrong-decide' })
+        const hist = await mountHistory($, surface)
+        expect(await hist.find({ key: 'wrong-decide' })).toBeDefined()
+        expect(await hist.find({ key: 'wrong-execute' })).toBeDefined()
+        expect(await hist.find({ key: 'wrong-lookup' })).toBeUndefined()
+        await hist.press({ key: 'wrong-decide' })
         expect((seen.store.corrections as Correction[])[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
-        await ui2.unmount()
+        await hist.unmount()
       })
     }
 
-    test('with learning off the pane has no correction buttons', { options: { learnFromCorrections: false } }, async ($, on) => {
+    test('with learning off there are no correction buttons', { options: { learnFromCorrections: false } }, async ($, on) => {
       world($, on, LOOKUP)
       await $.prompt.submit({ text: 'rename the helper' } as never)
       await $.turn.complete(completion('t1'))
-      const ui = await mountPane($, 'desktop')
-      expect(await ui.find({ key: 'wrong-decide' })).toBeUndefined()
-      expect(await ui.find({ type: 'Text', text: /Haiku medium/ })).toBeDefined()
-      await ui.unmount()
+      const hist = await mountHistory($, 'desktop')
+      expect(await hist.find({ key: 'wrong-decide' })).toBeUndefined()
+      expect(await hist.find({ type: 'Text', text: /^Haiku·medium$/ })).toBeDefined()
+      await hist.unmount()
     })
 
-    test('the pane header shows the weekly pace and the pin, and an empty session says so', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      ui($, on)
-      await weekly($, seen, 80)
-      await cmd($, 'pin opus')
-      const ui2 = await mountPane($, 'terminal')
-      expect(await ui2.find({ type: 'Text', text: /router on · Weekly 80% .* pace 1\.6× ahead · 📌 Opus/ })).toBeDefined()
-      expect(await ui2.find({ type: 'Text', text: /No routed turns/ })).toBeDefined()
-      await ui2.unmount()
-    })
-
-    test('the turn list keeps at most 50 records', async ($, on) => {
+    test('the tree lists the last 10 turns of the 50 kept', async ($, on) => {
       world($, on, LOOKUP)
       for (let i = 1; i <= 52; i++) {
         await $.prompt.submit({ text: `job ${i} #haiku` } as never)
         await $.turn.complete(completion(`t${i}`))
       }
-      const big = { ...(PANE_PROPS as object), scroll: { offset: 0, bodyRows: 200 } } as never
-      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'Pane', requestId: 'model-router', props: big })
-      const rows = await ui.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })
-      expect(rows).toHaveLength(50)
-      await ui.unmount()
-    })
-
-    // WHY: the band must read exactly as before when nothing new is switched on.
-    test('without a pin the band text is the one the earlier versions drew', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
-      await step($, 't1')
-      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await band.find({ text: /^Haiku · medium — find/ })).toBeDefined()
-      expect(seen.asked).toEqual(['haiku'])
+      const hist = await mountHistory($, 'terminal')
+      expect(await hist.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(10)
+      await hist.unmount()
     })
   })
 
-  describe('steered turns and the terminal auto-open (1.1.0 review)', () => {
+  describe('band wording (1.1.0)', () => {
+    // WHY: the band is the glance view: a pin shows as a marker before the model, and nothing else is added to its rows.
+    test('an active pin puts a marker before the model, and the meter says it in plain words', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await cmd($, 'pin sonnet 2')
+      await $.prompt.submit({ text: 'do the thing' } as never)
+      seen.usage.push(U(1000, 500, 20_000, 0, 'claude-sonnet-5-5'))
+      await step($, 't1')
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await band.find({ text: /^📌 Sonnet · medium — pinned \(2 left\)$/ })).toBeDefined()
+      expect(await band.find({ text: /^turn 21\.5k tok · <\$0\.01 {3}today 21\.5k tok · <\$0\.01 · ≈<\$0\.01 \(50%\) below all-Opus$/ })).toBeDefined()
+      // Only the enable/disable button.
+      expect((await band.findAll({ type: 'Button' } as never))).toHaveLength(1)
+    })
+  })
+
+  describe('steered turns (1.1.0 review)', () => {
     // WHY: a steered turn's tier is pacing's choice; a correction would teach Haiku "routed execute" for a decide verdict.
     test('a steered turn cannot be corrected, by wrong or by an escalation', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
       const seen = world($, on, '{"tier":"decide","sure":false,"reason":"maybe a design"}')
@@ -6957,47 +7001,14 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(await cmd($, 'wrong decide')).toContain('No classified turn')
       expect(seen.store.corrections).toBeUndefined()
     })
-
-    const FULL = { columns: 100, rows: 30, isFullscreen: true }
-    const bandWith = ($: any, viewport?: { columns: number; rows: number; isFullscreen: boolean }) =>
-      $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS, ...(viewport ? { viewport } : {}) })
-
-    test('a fullscreen terminal opens the pane once when autoOpenPane is on', { options: { autoOpenPane: true } }, async ($, on) => {
-      world($, on, LOOKUP)
-      const c = ui($, on)
-      const first = await bandWith($, FULL)
-      expect(c.opened.map(o => o.id)).toEqual(['model-router'])
-      await first.unmount()
-      // The person closes it; a later redraw must not bring it back.
-      c.isOpen = false
-      const second = await bandWith($, FULL)
-      expect(c.opened).toHaveLength(1)
-      await second.unmount()
-    })
-
-    test('a terminal that is not fullscreen, or one that does not say, never opens it', { options: { autoOpenPane: true } }, async ($, on) => {
-      world($, on, LOOKUP)
-      const c = ui($, on)
-      await (await bandWith($, { ...FULL, isFullscreen: false })).unmount()
-      await (await bandWith($)).unmount()
-      expect(c.opened).toEqual([])
-    })
-
-    test('with autoOpenPane off a fullscreen terminal opens nothing', async ($, on) => {
-      world($, on, LOOKUP)
-      const c = ui($, on)
-      await (await bandWith($, FULL)).unmount()
-      expect(c.opened).toEqual([])
-    })
   })
 
   describe('review fixes (1.1.0)', () => {
-    const FULL = { columns: 100, rows: 30, isFullscreen: true }
-    const PANE_PROPS = { title: 'Router', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 24 }, view: {} } as never
+    const HIST = { plugin: 'model-router', surface: 'terminal', component: 'CommandOutput', props: { command: 'model-router', args: 'history', text: 'x', isErrored: false } } as never
     const STEER = { options: { weeklyPacing: 'steer' } }
 
     // WHY: the buttons must correct the turn whose time they show, not whichever turn is latest when pressed.
-    test('the pane targets the latest correctable turn, skips a newer steered one, and a press hits exactly that turn', STEER, async ($, on) => {
+    test('history targets the latest correctable turn, skips a newer steered one, and a press hits exactly that turn', STEER, async ($, on) => {
       const seen = world($, on, [LOOKUP, '{"tier":"decide","sure":false,"reason":"maybe"}', LOOKUP])
       ui($, on)
       await $.prompt.submit({ text: 'rename the helper' } as never)
@@ -7007,14 +7018,16 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.prompt.submit({ text: 'think about the design' } as never)
       expect(route(seen, 1)).toContain('assigned to sonnet')
       await $.turn.complete(completion('t2'))
-      const pane = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'Pane', requestId: 'model-router', props: PANE_PROPS })
+      let pane = await $.ui.mount(HIST)
       // The first turn ran at minute 0 and the steered one at minute 5: the label is the first turn's time.
       expect(await pane.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(0)}\\)`) })).toBeDefined()
       expect(await pane.find({ key: 'wrong-decide' })).toBeDefined()
-      // A newer correctable turn completes: the pane redraws, and what it then shows is what a press corrects.
+      await pane.unmount()
+      // A newer correctable turn completes; the next history shows it, and a press corrects exactly that turn.
       await seen.clock.advance(5 * 60_000)
       await $.prompt.submit({ text: 'list the files' } as never)
       await $.turn.complete(completion('t3'))
+      pane = await $.ui.mount(HIST)
       expect(await pane.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(10 * 60_000)}\\)`) })).toBeDefined()
       await pane.press({ key: 'wrong-decide' })
       const stored = seen.store.corrections as Correction[]
@@ -7050,19 +7063,6 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       await weekly($, seen, 82, 0.5)
       await $.prompt.submit({ text: 'think about it' } as never)
       expect(await statsOf($)).toContain('weekly pacing: 0')
-    })
-
-    test('a pane closed by the person stays closed after /clear', { options: { autoOpenPane: true } }, async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      const c = ui($, on)
-      await $.session.start({ cwd: '/plugin', surface: 'desktop', isInteractive: true })
-      expect(c.opened).toHaveLength(1)
-      c.isOpen = false
-      await $.session.end({ reason: 'clear', sessionId: 'sess-1' } as never)
-      seen.sessionId = 'sess-2'
-      await (await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS, viewport: FULL })).unmount()
-      await $.session.start({ cwd: '/plugin', surface: 'desktop', isInteractive: true })
-      expect(c.opened).toHaveLength(1)
     })
 
     test('a stored off override is respected from the first measurement, without a session.start', async ($, on) => {
@@ -7106,8 +7106,7 @@ describe('router pane, pin, corrections and weekly pacing (1.1.0)', () => {
       // A turn with no person prompt continues the route within the cache window.
       await $.turn.start({ text: 'task notification', turnId: 't2' } as never)
       await $.turn.complete(completion('t2'))
-      const big = { ...(PANE_PROPS as object), scroll: { offset: 0, bodyRows: 40 } } as never
-      const pane = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'Pane', requestId: 'model-router', props: big })
+      const pane = await $.ui.mount(HIST)
       const rows = (await pane.findAll({ type: 'Text', text: /^<?\$\d/ })).map(x => x.text)
       expect(rows).toHaveLength(2)
       expect(rows[0]).toContain('→ sonnet/medium')

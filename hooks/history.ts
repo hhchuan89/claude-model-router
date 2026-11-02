@@ -1,4 +1,4 @@
-// Pure helpers for the router pane: no engine calls, so they are unit tested directly.
+// Pure helpers for /model-router history: no engine calls, so they are unit tested directly.
 export const SPARK = '▁▂▃▄▅▆▇█'
 
 export type DayCost = { day: string; cost: number; baseline: number }
@@ -34,22 +34,25 @@ export function chartAlt(days: readonly DayCost[]): string {
   return `Spend over the last ${days.length} days: ${usd(cost)}, against ${usd(base)} for the same work tokens at Opus prices.`
 }
 
-// Bars are the cost; a thin marker across each is the Opus-priced baseline. Fixed mid-tone colours that read on a
-// light and a dark surface alike, since an image cannot follow the theme.
-export function barChartSvg(days: readonly DayCost[], width = 320, height = 96): string {
-  const top = 6
-  const bottom = 16
+// Bars are the cost, each with its dollar amount above it; a thin marker across each is the Opus-priced baseline. Fixed
+// mid-tone colours that read on a light and a dark surface alike, since an image cannot follow the theme. About 66px
+// tall: room for the label, the bars and the day.
+export function barChartSvg(days: readonly DayCost[], width = 320, height = 66): string {
+  const top = 12
+  const bottom = 12
   const plot = height - top - bottom
   const max = Math.max(0.0001, ...days.flatMap(d => [d.cost, d.baseline]))
   const slot = width / Math.max(1, days.length)
-  const barW = Math.max(4, Math.floor(slot * 0.55))
+  const barW = Math.max(4, Math.floor(slot * 0.5))
   const y = (v: number) => top + plot - (v / max) * plot
   const parts = days.map((d, i) => {
     const x = Math.round(i * slot + (slot - barW) / 2)
     const h = Math.max(d.cost > 0 ? 1 : 0, (d.cost / max) * plot)
-    return `<rect x="${x}" y="${(top + plot - h).toFixed(1)}" width="${barW}" height="${h.toFixed(1)}" rx="2" fill="#4f8cff"/>` +
+    const barTop = top + plot - h
+    return `<rect x="${x}" y="${barTop.toFixed(1)}" width="${barW}" height="${h.toFixed(1)}" rx="2" fill="#4f8cff"/>` +
       (d.baseline > 0 ? `<rect x="${x - 2}" y="${(y(d.baseline) - 1).toFixed(1)}" width="${barW + 4}" height="2" fill="#e0a030"/>` : '') +
-      `<text x="${x + barW / 2}" y="${height - 4}" font-size="9" text-anchor="middle" fill="#8a8f98">${d.day.slice(6)}</text>`
+      (d.cost > 0 ? `<text x="${x + barW / 2}" y="${Math.max(8, Math.min(barTop, y(d.baseline)) - 2).toFixed(1)}" font-size="8" text-anchor="middle" fill="#8a8f98">${usd(d.cost)}</text>` : '') +
+      `<text x="${x + barW / 2}" y="${height - 2}" font-size="8" text-anchor="middle" fill="#8a8f98">${d.day.slice(6)}</text>`
   })
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">${parts.join('')}</svg>`
 }
