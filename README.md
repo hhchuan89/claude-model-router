@@ -24,7 +24,7 @@ The screenshot is from an earlier version. The band is two plain rows, and every
   This reply $0.74 · Today $28.00, $8.94 less than all-Opus · Week 20% used
 ```
 
-Row 1 is what the router chose and why: `📌 Sonnet · medium — pinned, 2 more turns`, `📌 Haiku · medium — you chose it (#haiku)`,
+Row 1 is what the router chose and why: `📌 Sonnet · medium — pinned, 2 more replies`, `📌 Haiku · medium — you chose it (#haiku)`,
 or `⚙ Opus · medium — kept on Opus: switching would re-read the whole conversation`. Row 2 is what it costs: this reply,
 today against the same work on Opus (API-equivalent estimates at the rates in `hooks/meter.ts`, not subscription
 charges), and the week's usage from the engine's rate-limit window (`, ahead of pace` is added only when you are ahead

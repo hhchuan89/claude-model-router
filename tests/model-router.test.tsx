@@ -6996,7 +6996,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         seen.usage.push(U(1000, 500, 20_000, 0, 'claude-sonnet-5-5'))
         await step($, 't1')
         const band = await mountBand($)
-        expect(await band.find({ type: 'Text', text: /^📌 Sonnet · medium — pinned, 1 more turn$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^📌 Sonnet · medium — pinned, 1 more reply$/ })).toBeDefined()
         await band.unmount()
       })
 
