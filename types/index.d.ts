@@ -23,6 +23,9 @@ export type Route = {
   // The tier the classifier's verdict settled on before the pacing steer moved the turn; later routing starts from it, so a
   // steer never changes the turns after it.
   steeredFrom?: Tier
+  // What the classifier said about this turn (calibrated replies only), kept for /model-router tune: p and risk as returned,
+  // tier and sure the pick the bars made from them (before any settling or steer), guard when the risk guard decided.
+  calib?: { p: Record<Tier, number>; risk: number; tier: Tier; sure: boolean; guard?: 'risk' }
 }
 
 export type TurnHow = 'classified' | 'forced' | 'pinned' | 'inherited' | 'kept-tier' | 'warm-skip' | 'session-model'

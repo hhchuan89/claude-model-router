@@ -12,6 +12,8 @@ import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, pickTier, RISK_BAR, routeFor, settleTier, shorten, TIER_BARS, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath } from '../hooks/replay'
+import { BAR_MAX, BAR_MIN, evaluate, fitBars, labelledSamples, parseLabels, planFor, readBars, readCalib, STEP_MAX, stepBars, tuneReport } from '../hooks/tune'
+import type { Sample } from '../hooks/tune'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
@@ -2027,7 +2029,7 @@ describe('cost exposure and session commands (1.0)', () => {
     on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [{ kind: 'seven_day', percentUsed: 76 }] } }))
     on('session.model', async () => ({ value: 'opus' }))
     await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
-    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]')
+    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]|tune [apply|reset]]')
     expect(command.immediate).toBe(true)
     expect(command.description).toContain('status')
     expect(command.description).toContain('context')
@@ -8378,5 +8380,338 @@ describe('classifier prompt with similar examples (1.2.0)', () => {
     for (let i = 0; i < 3; i++) await $.prompt.submit({ text: `rename the helper in utils ${i}` } as never)
     expect(seen.systems.every(s => s.includes('rename the helper in utils'))).toBe(true)
     expect(reads).toBeLessThanOrEqual(1)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 1.2.0 (C): calibration records and /model-router tune
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('tuning math (1.2.0)', () => {
+  type T = 'lookup' | 'execute' | 'decide'
+  const s = (n: number, p: [number, number, number], right: T, risk = 0): Sample[] =>
+    Array.from({ length: n }, () => ({ p: { lookup: p[0], execute: p[1], decide: p[2] }, risk, right }))
+  // The optimum is known: 20 lookups the classifier gives 0.75, 20 executes it gives 0.70 for lookup, and 10 decisions.
+  // The default lookup bar (0.85) over-routes the first group; the lowest bar that does not under-route the second is 0.75.
+  const SYNTHETIC: Sample[] = [...s(20, [0.75, 0.25, 0], 'lookup'), ...s(20, [0.7, 0.3, 0], 'execute'), ...s(10, [0.1, 0.2, 0.7], 'decide')]
+
+  test('evaluate counts right, under-routed, over-routed and the cost proxy', async () => {
+    const e = evaluate(SYNTHETIC, TIER_BARS, RISK_BAR)
+    expect(e).toMatchObject({ n: 50, accuracy: 30 / 50, under: 0, over: 20 / 50 })
+    expect(Math.abs(e.cost - (20 * 3 + 20 * 3 + 10 * 6) / 50) < 1e-12).toBe(true)
+    expect(evaluate([], TIER_BARS)).toEqual({ n: 0, accuracy: 0, under: 0, over: 0, cost: 0 })
+    // A risky message goes to decide: over-routing when the right tier was lower.
+    expect(evaluate(s(1, [1, 0, 0], 'lookup', 0.9), TIER_BARS)).toMatchObject({ over: 1, accuracy: 0 })
+  })
+
+  test('the fit finds the known optimum and does not raise under-routing', async () => {
+    const fit = fitBars(SYNTHETIC, TIER_BARS)
+    expect(fit.bars).toEqual({ lookup: 0.75, execute: 0.6, decide: 0.3 })
+    expect(fit.suggested.under).toBeLessThanOrEqual(fit.current.under)
+    expect(fit.suggested.cost).toBeLessThan(fit.current.cost)
+    expect(fit.suggested.accuracy).toBe(1)
+  })
+
+  // WHY: cheaper is only an improvement if it does not send more work to a model too small for it. Without the
+  // constraint the cheapest bars are 0.70, which routes the second group to Haiku.
+  test('the under-routing limit holds the bar at 0.75 even though 0.70 is cheaper', async () => {
+    const cheaper = evaluate(SYNTHETIC, { lookup: 0.7, execute: 0.6, decide: 0.3 })
+    expect(cheaper.cost).toBeLessThan(fitBars(SYNTHETIC, TIER_BARS).suggested.cost)
+    expect(cheaper.under).toBeGreaterThan(0)
+    expect(fitBars(SYNTHETIC, TIER_BARS).bars.lookup).toBe(0.75)
+  })
+
+  test('with current bars already under-routing, the fit may keep that rate but never exceed it', async () => {
+    const data = [...SYNTHETIC, ...s(5, [0.9, 0.1, 0], 'execute')]
+    const fit = fitBars(data, TIER_BARS)
+    expect(fit.current.under).toBeGreaterThan(0)
+    expect(fit.suggested.under).toBeLessThanOrEqual(fit.current.under + 1e-12)
+    expect(fit.suggested.cost).toBeLessThanOrEqual(fit.current.cost + 1e-12)
+  })
+
+  test('the fit leaves already-best bars alone', async () => {
+    const best = { lookup: 0.75, execute: 0.6, decide: 0.3 }
+    expect(fitBars(SYNTHETIC, best).bars).toEqual(best)
+  })
+
+  // WHY: one apply must not swing the classifier on a small or lucky sample.
+  test('a bar moves at most 0.05 per apply and stays inside 0.2 to 0.95', async () => {
+    expect(STEP_MAX).toBe(0.05)
+    expect(stepBars({ lookup: 0.85, execute: 0.6, decide: 0.3 }, { lookup: 0.5, execute: 0.6, decide: 0.3 })).toEqual({ lookup: 0.8, execute: 0.6, decide: 0.3 })
+    expect(stepBars({ lookup: 0.5, execute: 0.6, decide: 0.3 }, { lookup: 0.95, execute: 0.2, decide: 0.9 })).toEqual({ lookup: 0.55, execute: 0.55, decide: 0.35 })
+    expect(stepBars({ lookup: 0.75, execute: 0.6, decide: 0.3 }, { lookup: 0.75, execute: 0.6, decide: 0.3 })).toEqual({ lookup: 0.75, execute: 0.6, decide: 0.3 })
+    // The clamp: a stored bar outside the range is pulled in.
+    expect(stepBars({ lookup: 0.98, execute: 0.15, decide: 0.3 }, { lookup: 0.95, execute: 0.2, decide: 0.3 })).toEqual({ lookup: 0.95, execute: 0.2, decide: 0.3 })
+    expect(BAR_MIN).toBe(0.2)
+    expect(BAR_MAX).toBe(0.95)
+  })
+
+  test('three apply steps from 0.85 reach 0.75 and stop there, without float drift', async () => {
+    let bars = { lookup: 0.85, execute: 0.6, decide: 0.3 }
+    const goal = { lookup: 0.75, execute: 0.6, decide: 0.3 }
+    bars = stepBars(bars, goal)
+    expect(bars.lookup).toBe(0.8)
+    bars = stepBars(bars, goal)
+    expect(bars.lookup).toBe(0.75)
+    expect(stepBars(bars, goal)).toEqual(bars)
+  })
+
+  test('a stored override is read only when it is three numbers in range', async () => {
+    expect(readBars({ lookup: 0.7, execute: 0.5, decide: 0.3 })).toEqual({ lookup: 0.7, execute: 0.5, decide: 0.3 })
+    expect(readBars({ lookup: 0.1, execute: 0.5, decide: 0.3 })).toBeUndefined()
+    expect(readBars({ lookup: 0.99, execute: 0.5, decide: 0.3 })).toBeUndefined()
+    expect(readBars({ lookup: 0.7, execute: 0.5 })).toBeUndefined()
+    expect(readBars('x')).toBeUndefined()
+    expect(readBars(null)).toBeUndefined()
+  })
+
+  test('the stored records are not trusted: malformed ones are dropped', async () => {
+    const ok = { at: 1, turnId: 't1', p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0, tier: 'lookup', sure: true }
+    expect(readCalib([ok, { ...ok, tier: 'huge' }, null, { ...ok, p: 'x' }, { at: 'now' }])).toEqual([ok])
+    expect(readCalib('nope')).toEqual([])
+  })
+
+  test('labels join a replay results file by id, and only answered current rows count', async () => {
+    const rows = [
+      { id: 'a', variant: 'current', ok: true, p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0 },
+      { id: 'a', variant: 'legacy', ok: true },
+      { id: 'b', variant: 'current', ok: false },
+      { id: 'c', variant: 'current+examples', ok: true, p: { lookup: 1, execute: 0, decide: 0 }, risk: 0 },
+    ]
+    const calib = [{ at: 1, turnId: 't', p: { lookup: 0.5, execute: 0.5, decide: 0 }, risk: 0, tier: 'execute' as const, sure: false, right: 'decide' as const }, { at: 2, turnId: 'u', p: { lookup: 1, execute: 0, decide: 0 }, risk: 0, tier: 'lookup' as const, sure: true }]
+    const out = labelledSamples(calib, [{ id: 'a', right: 'execute' }, { id: 'b', right: 'lookup' }, { id: 'c', right: 'lookup' }, { id: 'zz', right: 'lookup' }], rows)
+    expect(out).toMatchObject({ fromCorrections: 1, fromReplay: 1 })
+    expect(out.samples).toEqual([{ p: { lookup: 0.5, execute: 0.5, decide: 0 }, risk: 0, right: 'decide' }, { p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0, right: 'execute' }])
+    expect(parseLabels('[{"id":"a","right":"lookup"},{"id":2,"right":"decide"}]')).toEqual({ ok: true, labels: [{ id: 'a', right: 'lookup' }, { id: '2', right: 'decide' }] })
+    expect(parseLabels('[{"id":"a","right":"huge"}]')).toMatchObject({ ok: false })
+    expect(parseLabels('{')).toMatchObject({ ok: false })
+  })
+
+  test('below 30 labelled turns there is no suggestion and the report says how many more', async () => {
+    const few = { samples: SYNTHETIC.slice(0, 12), fromCorrections: 12, fromReplay: 0 }
+    const plan = planFor(few, TIER_BARS)
+    expect(plan).toEqual({ enough: false, labelled: 12, need: 18 })
+    const text = tuneReport('en', [], TIER_BARS, RISK_BAR, few, plan)
+    expect(text).toContain('Not enough labelled turns to suggest bars: 12 of 30, 18 more needed.')
+    expect(text).not.toContain('Suggested bars')
+    expect(planFor({ samples: SYNTHETIC.slice(0, 30), fromCorrections: 30, fromReplay: 0 }, TIER_BARS).enough).toBe(true)
+  })
+
+  test('with enough turns the report sets current and suggested side by side', async () => {
+    const labelled = { samples: SYNTHETIC, fromCorrections: 0, fromReplay: 50 }
+    const text = tuneReport('en', [], TIER_BARS, RISK_BAR, labelled, planFor(labelled, TIER_BARS))
+    expect(text).toContain('Suggested bars: lookup 0.75 · execute 0.6 · decide 0.3 · risk 0.7')
+    expect(text).toContain('accuracy: 60.0% → 100.0%')
+    expect(text).toContain('under-routing: 0.0% → 0.0%')
+    expect(text).toContain('over-routing: 40.0% → 0.0%')
+    expect(text).toContain('cost proxy (current = 100%): 100% → 78%')
+    expect(text).toContain('Nothing has changed.')
+    expect(tuneReport('zh', [], TIER_BARS, RISK_BAR, labelled, planFor(labelled, TIER_BARS))).toContain('建议阈值')
+  })
+})
+
+describe('calibration records and /model-router tune (1.2.0)', () => {
+  const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
+  const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
+  const route = (seen: Seen, i = 0) => seen.submits[i]!.context?.[0] ?? ''
+  const calibKeys = (seen: Seen) => Object.keys(seen.store).filter(k => k.startsWith('calib:'))
+  const calibAll = (seen: Seen) => calibKeys(seen).flatMap(k => seen.store[k] as any[])
+  const rec = (i: number, p: [number, number, number], right: 'lookup' | 'execute' | 'decide') => ({
+    at: i, turnId: `s${i}`, p: { lookup: p[0], execute: p[1], decide: p[2] }, risk: 0, tier: 'execute', sure: true, right,
+  })
+  // 50 labelled turns whose best lookup bar is 0.75 (see the math tests).
+  const seeded = () => ({
+    [`calib:${storeDay(0)}:sess-x`]: [
+      ...Array.from({ length: 20 }, (_, i) => rec(i, [0.75, 0.25, 0], 'lookup')),
+      ...Array.from({ length: 20 }, (_, i) => rec(20 + i, [0.7, 0.3, 0], 'execute')),
+      ...Array.from({ length: 10 }, (_, i) => rec(40 + i, [0.1, 0.2, 0.7], 'decide')),
+    ],
+  })
+
+  describe('the record', () => {
+    test('a classified turn keeps its numbers and pick, with no prompt text', async ($, on) => {
+      const seen = world($, on, P(0.9, 0.1, 0, 0.2, 'find files'))
+      await $.prompt.submit({ text: 'find every TODO in the secret project' } as never)
+      expect(calibKeys(seen)).toEqual([`calib:${storeDay(0)}:sess-1`])
+      const [r] = calibAll(seen)
+      expect(r).toMatchObject({ turnId: 't1', p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0.2, tier: 'lookup', sure: true })
+      expect(Object.keys(r).sort()).toEqual(['at', 'p', 'risk', 'sure', 'tier', 'turnId'])
+      expect(JSON.stringify(seen.store[calibKeys(seen)[0]!])).not.toContain('secret')
+    })
+
+    test('a guard decision is marked, and an unsure pick says so', async ($, on) => {
+      const seen = world($, on, [P(0.95, 0.05, 0, 0.9, 'push'), P(0.5, 0.1, 0.4, 0, 'maybe')])
+      await $.prompt.submit({ text: 'push to main' } as never)
+      await $.turn.complete(completion('t1'))
+      await $.prompt.submit({ text: 'think about it' } as never)
+      const records = calibAll(seen)
+      expect(records[0]).toMatchObject({ tier: 'decide', sure: true, guard: 'risk', risk: 0.9 })
+      expect(records[1]).toMatchObject({ tier: 'decide', sure: false })
+      expect(records[1].guard).toBeUndefined()
+    })
+
+    test('forced, pinned and old-shape turns leave no record', async ($, on) => {
+      const seen = world($, on, '{"tier":"lookup","reason":"old"}')
+      await $.prompt.submit({ text: 'pick a database #opus' } as never)
+      await $.turn.complete(completion('t1'))
+      await cmd($, 'pin opus 1')
+      await $.prompt.submit({ text: 'pinned work' } as never)
+      await $.turn.complete(completion('t2'))
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(calibKeys(seen)).toEqual([])
+    })
+
+    test('a correction attaches its right tier, an escalation the model it reached, to that turn alone', async ($, on) => {
+      const seen = world($, on, [P(0.9, 0.1, 0), P(0.9, 0.1, 0)])
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      await $.prompt.submit({ text: 'look at the auth flow' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)
+      await $.turn.complete(completion('t2'))
+      expect(await cmd($, 'wrong decide')).toContain('should have been decide')
+      const [first, second] = calibAll(seen)
+      expect(first.right).toBeUndefined()
+      expect(first.escalatedTo).toBeUndefined()
+      expect(second).toMatchObject({ turnId: 't2', right: 'decide', escalatedTo: 'opus' })
+    })
+
+    test('an effort-only raise is no escalation record', async ($, on) => {
+      const seen = world($, on, P(0.9, 0.1, 0))
+      await $.prompt.submit({ text: 'look at the auth flow' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', effort: 'high', reason: 'harder' } as never)
+      expect(calibAll(seen)[0].escalatedTo).toBeUndefined()
+    })
+
+    test('records older than the 30-day retention are pruned with the meter, newer ones stay', async ($, on) => {
+      const recent = `calib:${storeDay(0)}:sess-old`
+      const seen = world($, on, P(0.9, 0.1, 0), { store: { 'calib:19000101:sess-old': [rec(1, [1, 0, 0], 'lookup')], [recent]: [rec(2, [1, 0, 0], 'lookup')] } })
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(seen.store['calib:19000101:sess-old']).toBeUndefined()
+      expect(seen.store[recent]).toBeDefined()
+    })
+  })
+
+  describe('the report', () => {
+    test('with too little data it shows the per-tier numbers, the bars and how many more labels are needed', async ($, on) => {
+      const seen = world($, on, [P(0.9, 0.1, 0), P(0.1, 0.1, 0.8)])
+      await $.prompt.submit({ text: 'find files' } as never)
+      await $.turn.complete(completion('t1'))
+      await $.prompt.submit({ text: 'design the queue' } as never)
+      await $.turn.complete(completion('t2'))
+      const text = await cmd($, 'tune')
+      expect(text).toContain('2 classified turns recorded')
+      expect(text).toContain('lookup: 1 routed · corrected 0 (0%) · escalated to a higher model 0 (0%)')
+      expect(text).toContain('decide: 1 routed')
+      expect(text).toContain('Weak signal: escalations are not proof the tier was wrong.')
+      expect(text).toContain('Bars (default): lookup 0.85 · execute 0.6 · decide 0.3 · risk 0.7')
+      expect(text).toContain('Labelled turns: 0')
+      expect(text).toContain('Not enough labelled turns to suggest bars: 0 of 30, 30 more needed.')
+      expect(seen.store.bars).toBeUndefined()
+    })
+
+    test('a tier row counts its corrections and its escalations', async ($, on) => {
+      world($, on, P(0.9, 0.1, 0))
+      await $.prompt.submit({ text: 'look at the auth flow' } as never)
+      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)
+      await $.turn.complete(completion('t1'))
+      await cmd($, 'wrong decide')
+      expect(await cmd($, 'tune')).toContain('lookup: 1 routed · corrected 1 (100%) · escalated to a higher model 1 (100%)')
+    })
+
+    test('with enough labelled turns it suggests bars and changes nothing', async ($, on) => {
+      const seen = world($, on, P(1, 0, 0), { store: seeded() })
+      const text = await cmd($, 'tune')
+      expect(text).toContain('Labelled turns: 50 (corrections 50, labels joined to a replay 0).')
+      expect(text).toContain('Suggested bars: lookup 0.75 · execute 0.6 · decide 0.3 · risk 0.7')
+      expect(text).toContain('under-routing:')
+      expect(seen.store.bars).toBeUndefined()
+      expect(await statsOf($)).toContain('Classifier bars: default')
+    })
+
+    test('--labels joined with --replay supplies the labels, and one flag alone is refused', async ($, on) => {
+      const seen = world($, on, P(1, 0, 0))
+      const rows = Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, variant: 'current', ok: true, p: i < 20 ? { lookup: 0.75, execute: 0.25, decide: 0 } : { lookup: 0.7, execute: 0.3, decide: 0 }, risk: 0 }))
+      const labels = Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, right: i < 20 ? 'lookup' : 'execute' }))
+      for (const [name, data] of [['labels', labels], ['replay', rows]] as const) {
+        seen.files[`/work/${name}.json`] = JSON.stringify(data)
+        seen.files[`C:\\work\\${name}.json`] = JSON.stringify(data)
+      }
+      const text = await cmd($, 'tune --labels /work/labels.json --replay /work/replay.json')
+      expect(text).toContain('Labelled turns: 40 (corrections 0, labels joined to a replay 40).')
+      expect(text).toContain('Suggested bars: lookup 0.75')
+      expect(await cmd($, 'tune --labels /work/labels.json')).toContain('--labels and --replay go together.')
+      expect(await cmd($, 'tune --labels /work/none.json --replay /work/replay.json')).toContain('Cannot read /work/none.json')
+    })
+  })
+
+  describe('apply and reset', () => {
+    test('apply moves each bar by at most 0.05, says what changed, stores it, and the next classification uses it', async ($, on) => {
+      const seen = world($, on, [P(0.78, 0.22, 0), P(0.78, 0.22, 0), P(0.78, 0.22, 0)], { store: seeded() })
+      await $.prompt.submit({ text: 'find files' } as never)
+      // Under the default 0.85 bar the 0.78 lookup is unsure, so the first turn goes to Sonnet.
+      expect(route(seen, 0)).toContain('assigned to sonnet')
+      const first = await cmd($, 'tune apply')
+      expect(first).toContain('lookup 0.85 → 0.8')
+      expect(first).not.toContain('execute 0.6 →')
+      expect(seen.store.bars).toEqual({ lookup: 0.8, execute: 0.6, decide: 0.3 })
+      expect(await statsOf($)).toContain('Classifier bars: tuned (lookup 0.8 · execute 0.6 · decide 0.3 · risk 0.7)')
+      await $.turn.complete(completion('t1'))
+      await $.prompt.submit({ text: 'find more files' } as never)
+      expect(route(seen, 1)).toContain('assigned to sonnet')
+      const second = await cmd($, 'tune apply')
+      expect(second).toContain('lookup 0.8 → 0.75')
+      expect(seen.store.bars).toEqual({ lookup: 0.75, execute: 0.6, decide: 0.3 })
+      await $.turn.complete(completion('t2'))
+      // Now a 0.78 lookup clears the bar: the override is what classification reads.
+      await $.prompt.submit({ text: 'find even more files' } as never)
+      expect(route(seen, 2)).toContain('assigned to haiku')
+      expect(await cmd($, 'tune apply')).toContain('No change')
+    })
+
+    test('apply refuses with too little data and stores nothing', async ($, on) => {
+      const seen = world($, on, P(1, 0, 0))
+      expect(await cmd($, 'tune apply')).toContain('Not enough labelled turns')
+      expect(seen.store.bars).toBeUndefined()
+    })
+
+    test('a stored override is loaded with the prefs, and a bad one is ignored', async ($, on) => {
+      const seen = world($, on, P(0.72, 0.28, 0), { store: { bars: { lookup: 0.7, execute: 0.6, decide: 0.3 } } })
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(route(seen, 0)).toContain('assigned to haiku')
+      expect(await statsOf($)).toContain('Classifier bars: tuned')
+      expect(await cmd($, 'status')).toContain('Classifier bars: tuned (lookup 0.7')
+    })
+
+    test('a stored override out of range is ignored', async ($, on) => {
+      const seen = world($, on, P(0.72, 0.28, 0), { store: { bars: { lookup: 0.1, execute: 0.6, decide: 0.3 } } })
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(route(seen, 0)).toContain('assigned to sonnet')
+      expect(await statsOf($)).toContain('Classifier bars: default')
+    })
+
+    test('reset deletes the override and classification goes back to the defaults', async ($, on) => {
+      const seen = world($, on, [P(0.72, 0.28, 0), P(0.72, 0.28, 0)], { store: { bars: { lookup: 0.7, execute: 0.6, decide: 0.3 } } })
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(route(seen, 0)).toContain('assigned to haiku')
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'tune reset')).toBe('Bars reset to the defaults.')
+      expect(seen.store.bars).toBeUndefined()
+      await $.prompt.submit({ text: 'find more files' } as never)
+      expect(route(seen, 1)).toContain('assigned to sonnet')
+      expect(await statsOf($)).toContain('Classifier bars: default')
+    })
+
+    test('reset says when the stored override could not be deleted, and still resets this session', async ($, on) => {
+      on('store.delete', { key: 'bars' }, async () => ({ deny: 'disk full' }))
+      const seen = world($, on, P(0.72, 0.28, 0), { store: { bars: { lookup: 0.7, execute: 0.6, decide: 0.3 } } })
+      expect(await cmd($, 'tune reset')).toContain('could not be deleted')
+      await $.prompt.submit({ text: 'find files' } as never)
+      expect(route(seen, 0)).toContain('assigned to sonnet')
+    })
+
+    test('an unknown tune argument gets the usage text, and the usage and hint now list tune', async ($, on) => {
+      world($, on, P(1, 0, 0))
+      expect(await cmd($, 'tune nonsense')).toContain('tune [apply|reset]')
+    })
   })
 })

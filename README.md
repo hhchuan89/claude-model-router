@@ -222,8 +222,24 @@ people). The router then decides:
 3. **Otherwise unsure.** The more capable of the two most likely tiers is taken, and the verdict is unsure, so
    "unsure never downgrades" applies (see above), as does the weekly pacing steer for an unsure decide.
 
-These bars are provisional starting values. They are meant to be fitted on your own messages with the replay command
-(see Development).
+These bars are provisional starting values, to be fitted on your own messages (see Tuning).
+
+## Tuning
+
+The router keeps a small record of every classified main turn for 30 days: the probabilities, the risk and the pick, plus
+any correction (`/model-router wrong`) and any escalation to a higher model that followed. No prompt text is in it.
+
+- `/model-router tune` prints a report and changes nothing: per tier the turns routed, the correction rate and the
+  escalation rate (**a weak signal: an escalation is not proof the tier was wrong**), and the current bars and risk bar
+  (default or tuned).
+- With at least 30 labelled turns it also suggests bars: the cheapest bars on a 0.05 grid (cost proxy Haiku 1, Sonnet 3,
+  Opus 6) whose under-routing rate does not exceed the current bars', shown beside the current ones (accuracy,
+  under-routing, over-routing, cost). Labels come from your corrections, or from `--labels <file>` (`[{ "id", "right" }]`)
+  joined by id to a replay results file given as `--replay <file>`. Corrections alone are only the turns that were wrong,
+  so they lean toward under-routing; labelled replays do not. With fewer than 30 the report says how many more it needs.
+- `/model-router tune apply` stores the suggestion as an override, each bar moving at most 0.05 per apply and staying
+  between 0.2 and 0.95, and says what changed. `/model-router tune reset` deletes it. Stats and status show whether the
+  bars are tuned. Nothing is tuned unless you run `apply`.
 
 ## Details and history
 
@@ -349,6 +365,7 @@ This is an estimate; see "Assumptions in the meter" below.
 | `/model-router pin <haiku\|sonnet\|opus> [turns]` / `/model-router unpin` | Hold the main conversation on one model for the next `turns` turns, or until unpinned (see "Pin and corrections") |
 | `/model-router wrong <lookup\|execute\|decide>` | Tell the router the last classified turn should have been that tier |
 | `/model-router corrections` / `/model-router corrections clear` | List the stored corrections, or delete them |
+| `/model-router tune` / `tune apply` / `tune reset` | Report how the classifier's bars are doing and suggest new ones; move the bars at most 0.05 toward the suggestion; remove the override (see Tuning) |
 | `/model-router pacing [off\|warn\|steer\|default]` | Show or override the weekly pacing mode (see "Weekly pacing") |
 
 With no argument, `/model-router` shows stats. Other arguments, including `help`, show the usage line.

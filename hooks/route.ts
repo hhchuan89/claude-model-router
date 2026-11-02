@@ -118,15 +118,15 @@ function normaliseP(raw: unknown): Probs | null {
 
 const riskOf = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) ? unit(x) : 0)
 
-function calibrated(p: Probs, risk: number, reason: string): Decision {
-  return { ...pickTier(p, risk), reason, p, risk }
+function calibrated(p: Probs, risk: number, reason: string, bars: Probs, riskBar: number): Decision {
+  return { ...pickTier(p, risk, bars, riskBar), reason, p, risk }
 }
 
 // Anything unreadable becomes null, and the caller falls back to execute.
 // A reply in the 1.1 format ({"tier","sure","reason"}) still parses: sure defaults to true, so an older reply routes.
 // A reply cut off before its closing brace still carries its tier (or its p) when that came first: it parses as unsure
 // with no reason, so it can never move work to a cheaper model.
-export function parseDecision(text: string): Decision | null {
+export function parseDecision(text: string, bars: Probs = TIER_BARS, riskBar: number = RISK_BAR): Decision | null {
   const start = text.indexOf('{')
   if (start === -1) return null
   const end = text.lastIndexOf('}')
@@ -138,7 +138,7 @@ export function parseDecision(text: string): Decision | null {
         const p = normaliseP(JSON.parse(pm[1]!))
         if (p) {
           const rm = /"risk"\s*:\s*([0-9.]+)\s*[,}]/.exec(tail)
-          const d = calibrated(p, rm ? riskOf(Number(rm[1])) : 0, '')
+          const d = calibrated(p, rm ? riskOf(Number(rm[1])) : 0, '', bars, riskBar)
           return d.guard ? d : { ...d, sure: false }
         }
       } catch { /* Fall through to the tier. */ }
@@ -152,7 +152,7 @@ export function parseDecision(text: string): Decision | null {
     const reason = typeof o.reason === 'string' ? shorten(o.reason, 60) : ''
     if (o.p !== undefined) {
       const p = normaliseP(o.p)
-      return p ? calibrated(p, riskOf(o.risk), reason) : null
+      return p ? calibrated(p, riskOf(o.risk), reason, bars, riskBar) : null
     }
     if (!isTier(o.tier)) return null
     return { tier: o.tier, reason, sure: o.sure !== false }

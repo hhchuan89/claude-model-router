@@ -13,9 +13,11 @@ import type { PaceMode } from './pace'
 import { barChartSvg, cellWidth, chartAlt, hhmm, lastDays, textChart, weekdayOf } from './history'
 import type { DayCost } from './history'
 import { redact } from './redact'
-import type { Decision, Lang } from './route'
-import { exampleBlock, legacyClassifierSystem, parseExamplesFile, parseReplayArgs, parseReplayFile, replayOutPath, replayRow, replaySummary, REPLAY_CONCURRENCY } from './replay'
+import type { Decision, Lang, Probs } from './route'
+import { exampleBlock, legacyClassifierSystem, parseExamplesFile, parseFlags, parseReplayArgs, parseReplayFile, replayOutPath, replayRow, replaySummary, REPLAY_CONCURRENCY } from './replay'
 import type { ExampleEntry, ReplayRow } from './replay'
+import { barsLine, CALIB_KEY, isTuned, labelledSamples, parseLabels, parseReplayResults, planFor, readBars, readCalib, stepBars, tuneReport } from './tune'
+import type { Calib } from './tune'
 import {
   applyEscalation,
   assignmentContext,
@@ -28,8 +30,10 @@ import {
   parseDecision,
   settleTier,
   reviewSystem,
+  RISK_BAR,
   routeFor,
   shorten,
+  TIER_BARS,
   TIER_ROUTE,
   withSuffixOf,
 } from './route'
@@ -128,6 +132,9 @@ let pin: { model: ModelKey; left?: number } | null = null
 // Set from the options at register. Off: nothing is recorded and the classifier prompt is the plain one.
 let learning = true
 let corrections: Correction[] = []
+// The bars /model-router tune apply stored, read with the other prefs; absent means the defaults.
+let tunedBars: Probs | undefined
+const barsNow = (): Probs => tunedBars ?? TIER_BARS
 // The masked snippet of each classified turn's prompt, by turn id, for corrections. Memory only: it never reaches an
 // atom, a log or the UI.
 const snippets = new Map<string, string>()
@@ -250,7 +257,7 @@ const STR = {
     routerOff: '路由已关闭',
     vetoed: '压缩被钩子跳过',
     rejected: '引擎拒绝压缩',
-    usage: '用法：/model-router stats | status | context | checkpoint [备注] | on | off | history | pin <haiku|sonnet|opus> [轮数] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default]',
+    usage: '用法：/model-router stats | status | context | checkpoint [备注] | on | off | history | pin <haiku|sonnet|opus> [轮数] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default] | tune [apply|reset]',
     commandDescription: '模型路由：stats 查看费用，status 查看设置，context 查看上下文，checkpoint [备注] 创建检查点，history 查看详情，pin / unpin 固定模型，wrong 纠正路由，corrections 纠正记录，pacing 每周节奏，on / off 开关',
     pinned: (left?: number) => left === undefined ? '已固定模型' : `已固定模型（剩 ${left} 轮）`,
     pinNeedsRouting: '固定模型需要主会话路由（mainRouting 已关闭）。',
@@ -264,6 +271,15 @@ const STR = {
     wrongFailed: '无法保存纠正。',
     correctionsClearFailed: '已停止使用纠正记录，但无法删除磁盘上的副本，它可能仍然存在。',
     pacingNotSaved: '（无法保存：仅对本会话有效。）',
+    tuneNeedBoth: '--labels 和 --replay 需要一起使用。',
+    tuneUnreadable: (path: string, why: string) => `无法读取 ${path}（${why}）`,
+    tuneRefused: (why: string) => `无法调整：${why}`,
+    tuneNoChange: '阈值无需更改：当前阈值已是这些数据上的最优。',
+    tuneApplied: (changes: string, now: string) => `阈值已调整（每次最多 0.05）：${changes}。现在：${now}。/model-router tune reset 可恢复默认值。`,
+    tuneNotSaved: '（无法保存：仅对本会话有效。）',
+    tuneReset: '阈值已恢复为默认值。',
+    tuneResetFailed: '阈值在本会话已恢复为默认值，但存储的调整无法删除。',
+    barsStatus: (tuned: boolean, line: string) => `分类器阈值：${tuned ? '已调整' : '默认'}（${line}）`,
     wrongSame: (tier: string) => `该轮已被分到 ${tier}，没有记录。`,
     wrongDone: (at: string, routed: string, right: string) => `已记录：${at} 的轮次，分类为 ${routed}，应为 ${right}。`,
     corrections: '路由纠正',
@@ -390,7 +406,7 @@ const STR = {
     routerOff: 'router off',
     vetoed: 'compaction skipped by hook',
     rejected: 'engine refused compaction',
-    usage: 'Usage: /model-router stats | status | context | checkpoint [note] | on | off | history | pin <haiku|sonnet|opus> [turns] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default]',
+    usage: 'Usage: /model-router stats | status | context | checkpoint [note] | on | off | history | pin <haiku|sonnet|opus> [turns] | unpin | wrong <lookup|execute|decide> | corrections [clear] | pacing [off|warn|steer|default] | tune [apply|reset]',
     commandDescription: 'Model router: stats for spend, status for settings, context for context size, checkpoint [note] to compact, history for the details, pin / unpin to hold a model, wrong to correct a route, corrections to list them, pacing for weekly pace, on / off to toggle',
     pinned: (left?: number) => left === undefined ? 'pinned' : `pinned (${left} left)`,
     pinNeedsRouting: 'Pinning needs main routing (mainRouting is off).',
@@ -404,6 +420,15 @@ const STR = {
     wrongFailed: 'Could not save the correction.',
     correctionsClearFailed: 'Corrections are no longer used, but the copy on disk could not be deleted and may remain.',
     pacingNotSaved: '(Could not be saved: this session only.)',
+    tuneNeedBoth: '--labels and --replay go together.',
+    tuneUnreadable: (path: string, why: string) => `Cannot read ${path} (${why})`,
+    tuneRefused: (why: string) => `Cannot tune: ${why}`,
+    tuneNoChange: 'No change: the current bars are already the best on this data.',
+    tuneApplied: (changes: string, now: string) => `Bars tuned (at most 0.05 per apply): ${changes}. Now: ${now}. /model-router tune reset restores the defaults.`,
+    tuneNotSaved: '(Could not be saved: this session only.)',
+    tuneReset: 'Bars reset to the defaults.',
+    tuneResetFailed: 'Bars are back to the defaults for this session, but the stored override could not be deleted.',
+    barsStatus: (tuned: boolean, line: string) => `Classifier bars: ${tuned ? 'tuned' : 'default'} (${line})`,
     wrongSame: (tier: string) => `That turn was already routed ${tier}; nothing recorded.`,
     wrongDone: (at: string, routed: string, right: string) => `Recorded: the ${at} turn was routed ${routed} and should have been ${right}.`,
     corrections: 'Routing corrections',
@@ -598,8 +623,10 @@ async function loadPrefs($: EngineInterface, session: Session) {
   const mode = await $.store.get('pacing')
   const warned = await $.store.get('paceWarned')
   const expanded = await $.store.get('bandExpanded')
+  const bars = await $.store.get('bars')
   if (!here(session)) return
   corrections = readCorrections(stored)
+  tunedBars = readBars(bars)
   pacingOverride = isPaceMode(mode) ? mode : undefined
   paceWarned = typeof warned === 'string' ? warned : undefined
   bandExpanded = expanded === true
@@ -875,7 +902,7 @@ async function prune($: EngineInterface, now: number) {
   if (prunedDay !== day) await bookkeeping($, async () => {
     const oldest = oldestDay(now)
     for (const key of await $.store.keys()) {
-      const day = /^(?:meter|counts):(\d{8}):/.exec(key)?.[1]
+      const day = /^(?:meter|counts|calib):(\d{8}):/.exec(key)?.[1]
       if (day !== undefined && day < oldest) await $.store.delete(key)
     }
     prunedDay = day
@@ -1075,7 +1102,7 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
       if (r.reason === 'api-error') return { ok: false, why: `api-error ${r.status ?? 'none'}` }
       return { ok: false, why: 'empty-reply' }
     }
-    const verdict = parseDecision(r.text)
+    const verdict = parseDecision(r.text, barsNow())
     if (verdict) {
       if (!verdict.guard) return { ok: true, verdict }
       await count($, session, c => ({ ...c, riskGuards: (c.riskGuards ?? 0) + 1 }))
@@ -1149,7 +1176,7 @@ async function runReplay($: EngineInterface, session: Session, lang: Lang, rest:
       if (await stillHere($, session) !== 'same') { cancelled = true; return }
       if (r.usage) for (const k of Object.keys(spent) as (keyof Usage)[]) spent[k] += r.usage[k] ?? 0
       if (!r.ok) { rows[i] = replayRow(item.id, variant, { ok: false, raw: '', why: r.why }); continue }
-      const d = parseDecision(r.raw)
+      const d = parseDecision(r.raw, barsNow())
       rows[i] = d
         ? replayRow(item.id, variant, { ok: true, raw: r.raw, decision: d })
         : replayRow(item.id, variant, { ok: false, raw: r.raw, why: 'unparseable' })
@@ -1200,6 +1227,9 @@ async function classify($: EngineInterface, session: Session, lang: Lang, text: 
     return { ...routeFor('execute', STR[lang].sessionModel(failText(c))), sessionModel: true, how: 'session-model' }
   }
   const s = settleTier(c.verdict, previousTier)
+  // What the classifier said, for /model-router tune: attached to whichever route this turn ends up with.
+  const v = c.verdict
+  const calib = v.p ? { calib: { p: v.p, risk: v.risk ?? 0, tier: v.tier, sure: v.sure, ...(v.guard ? { guard: v.guard } : {}) } } : {}
   // Weekly pacing, steer mode only: while use runs ahead of an even pace, a decide the classifier was unsure of goes to
   // execute. Whatever follows still applies: keepWarm keeps a warm large Opus context where it is, a sure decide stays
   // on Opus, escalate can raise the turn, and #model or a pin never get here.
@@ -1207,9 +1237,84 @@ async function classify($: EngineInterface, session: Session, lang: Lang, text: 
   const pace = paceOf(w, now)
   if (pacingMode() === 'steer' && c.verdict.tier === 'decide' && !c.verdict.sure && pace.state === 'ahead' && w) {
     const reason = `${s.reason} (pacing: weekly ${w.percentUsed}%, ${fmtPace(pace)} pace)`.trim()
-    return { ...how(routeFor('execute', reason), 'classified'), steered: true, steeredFrom: s.tier }
+    return { ...how(routeFor('execute', reason), 'classified'), steered: true, steeredFrom: s.tier, ...calib }
   }
-  return how(routeFor(s.tier, s.reason), 'classified')
+  return { ...how(routeFor(s.tier, s.reason), 'classified'), ...calib }
+}
+
+// What the classifier decided about a classified main turn, one small record per turn in calib:<day>:<session> (no prompt
+// text), pruned with the meter at the usual retention. Outcomes are attached to it later by turn id.
+async function recordCalib($: EngineInterface, session: Session, turnId: string, c: NonNullable<Route['calib']>) {
+  const at = await $.clock.now()
+  await serial($, session, 'calib', async () => {
+    const key = `calib:${dayKey(at)}:${session.id}`
+    const day = readCalib(await $.store.get(key))
+    if (await stillHere($, session) !== 'same') return
+    await $.store.set(key, [...day, { at, turnId, ...c }])
+  })
+}
+
+async function attachCalib($: EngineInterface, session: Session, turnId: string, outcome: Pick<Calib, 'right'> | Pick<Calib, 'escalatedTo'>) {
+  await serial($, session, 'calib', async () => {
+    for (const key of await $.store.keys()) {
+      if (!CALIB_KEY.test(key) || !key.endsWith(`:${session.id}`)) continue
+      const day = readCalib(await $.store.get(key))
+      if (!day.some(r => r.turnId === turnId)) continue
+      if (await stillHere($, session) !== 'same') return
+      await $.store.set(key, day.map(r => (r.turnId === turnId ? { ...r, ...outcome } : r)))
+      return
+    }
+  })
+}
+
+// /model-router tune [apply|reset] [--labels <file> --replay <file>]: statistics over what the classifier decided, and
+// bars suggested from labelled turns. The report changes nothing; only apply and reset do, and nothing runs by itself.
+async function tuneCommand($: EngineInterface, session: Session, lang: Lang, arg: string): Promise<string> {
+  const str = STR[lang]
+  await ensurePrefs($, session)
+  const { head, flags } = parseFlags(arg.slice('tune'.length))
+  if (head !== '' && head !== 'apply' && head !== 'reset') return str.usage
+  if (head === 'reset') {
+    let deleted = false
+    await bookkeeping($, async () => { await $.store.delete('bars'); deleted = true }, undefined, retryFor(session, 'bars write'))
+    if (await stillHere($, session) !== 'same') return str.checkpointCancelled
+    tunedBars = undefined
+    return deleted ? str.tuneReset : str.tuneResetFailed
+  }
+  if ((flags.labels === undefined) !== (flags.replay === undefined)) return str.tuneNeedBoth
+  const files: { labels?: string; replay?: string } = {}
+  for (const name of ['labels', 'replay'] as const) {
+    const path = flags[name]
+    if (path === undefined) continue
+    try {
+      files[name] = (await $.fs.read(path)) as string
+    } catch (err) {
+      return str.tuneUnreadable(path, String(err).slice(0, 120))
+    }
+  }
+  const calib = await bookkeeping($, async () => {
+    const all: Calib[] = []
+    for (const key of await $.store.keys()) if (CALIB_KEY.test(key)) all.push(...readCalib(await $.store.get(key)))
+    return all
+  }, [] as Calib[], retryFor(session, 'tune read'))
+  if (await stillHere($, session) !== 'same') return str.checkpointCancelled
+  const labels = files.labels === undefined ? { ok: true as const, labels: [] } : parseLabels(files.labels)
+  const replay = files.replay === undefined ? { ok: true as const, rows: [] } : parseReplayResults(files.replay)
+  if (!labels.ok) return str.tuneRefused(labels.why)
+  if (!replay.ok) return str.tuneRefused(replay.why)
+  const labelled = labelledSamples(calib, labels.labels, replay.rows)
+  const bars = barsNow()
+  const plan = planFor(labelled, bars)
+  const report = tuneReport(lang, calib, bars, RISK_BAR, labelled, plan)
+  if (head === '' || !plan.enough || !plan.fit) return report
+  const next = stepBars(bars, plan.fit.bars)
+  const changes = (['lookup', 'execute', 'decide'] as const).filter(t => next[t] !== bars[t]).map(t => `${t} ${bars[t]} → ${next[t]}`)
+  if (changes.length === 0) return str.tuneNoChange
+  let saved = false
+  await bookkeeping($, async () => { await $.store.set('bars', next); saved = true }, undefined, retryFor(session, 'bars write'))
+  if (await stillHere($, session) !== 'same') return str.checkpointCancelled
+  tunedBars = next
+  return str.tuneApplied(changes.join(' · '), barsLine(next, RISK_BAR)) + (saved ? '' : ` ${str.tuneNotSaved}`)
 }
 
 // Keeps a classified turn's masked prompt for a later correction, newest SNIPPETS_KEPT only.
@@ -1266,6 +1371,7 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   if (!(await recordCorrection($, session, { at, text, routed: rec.tier, right, source: 'manual' }))) return str.wrongFailed
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
+  await attachCalib($, session, rec.turnId, { right })
   thanks = rec.turnId
   redraw($)
   return str.wrongDone(hhmm(rec.at), rec.tier, right)
@@ -1566,6 +1672,7 @@ function detailLines(t: Tally, lang: Lang, rewrites: number): string {
 }
 
 async function statsText($: EngineInterface, session: Session, lang: Lang, compaction: string): Promise<string> {
+  await ensurePrefs($, session)
   const now = await $.clock.now()
   const { today, all, counts: c } = await bookkeeping($, () => totals($, now), { today: session.today ?? EMPTY, all: EMPTY, counts: NO_COUNTS }, retryFor(session, 'stats totals'))
   const tally = await bookkeeping($, () => sessionTally($, session), EMPTY, retryFor(session, 'stats session'))
@@ -1601,7 +1708,8 @@ async function statsText($: EngineInterface, session: Session, lang: Lang, compa
       `Cache rewrites after the TTL (100k+ tokens): ${c.cacheExpiryRewrites ?? 0}, costing ${fmtUsd(c.cacheExpiryRewriteCost ?? 0)}. ` +
       `Routing corrections recorded: manual ${c.correctionsManual ?? 0} · escalate ${c.correctionsEscalate ?? 0}. ` +
       `Unsure decisions steered to execute by weekly pacing: ${c.pacingSteered ?? 0}. ` +
-      `Risk guard sent to decide: ${c.riskGuards ?? 0}.`,
+      `Risk guard sent to decide: ${c.riskGuards ?? 0}. ` +
+      `${STR[lang].barsStatus(isTuned(barsNow()), barsLine(barsNow(), RISK_BAR))}.`,
     '',
     '_API-equivalent prices; work tokens are priced on Opus with switch writes priced as warm reads. Classification and availability probes add cost only. Another model would not use exactly the same tokens. Session records are retained for 30 days; legacy totals are included unchanged._',
   ].join('\n')
@@ -1643,7 +1751,7 @@ async function statusScreen($: EngineInterface, session: Session, lang: Lang, se
     `${str.pending}: ${pendingText(lang, uiNow) || str.none}${guardPending ? ` (${new Date(guardPending.at).toISOString()})` : ''}`,
     `${str.deadline}: ${lastMain ? new Date(lastMain.at + CACHE_TTL_MS).toISOString() : str.unavailable}`,
     `${str.safeDeadline}: ${lastMain ? new Date(lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS).toISOString() : str.unavailable}`,
-    weeklyText(lang), pacingLine(lang, now), `${str.lastSkip}: ${lastSkipped ?? str.none}`,
+    weeklyText(lang), pacingLine(lang, now), str.barsStatus(isTuned(barsNow()), barsLine(barsNow(), RISK_BAR)), `${str.lastSkip}: ${lastSkipped ?? str.none}`,
   ].filter(Boolean).join('\n')
 }
 
@@ -1946,7 +2054,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'model-router',
       description: str.commandDescription,
-      argumentHint: '[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]',
+      argumentHint: '[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]|tune [apply|reset]]',
       immediate: true,
     })
     await $.tool.register({
@@ -2071,6 +2179,7 @@ export const register: Register = (on, options) => {
       const tier = /^wrong\s+(lookup|execute|decide)$/i.exec(arg)?.[1]?.toLowerCase()
       return { text: tier === undefined ? str.usage : await correctTurn($, session, lang, tier as Tier) }
     }
+    if (arg === 'tune' || arg.startsWith('tune ')) return { text: await tuneCommand($, session, lang, arg) }
     if (/^corrections(?:\s|$)/.test(arg)) return { text: await correctionsCommand($, session, lang, arg) }
     if (/^pacing(?:\s|$)/.test(arg)) return { text: await pacingCommand($, session, lang, arg) }
     if (arg !== 'on' && arg !== 'off') return { text: str.usage }
@@ -2217,6 +2326,7 @@ export const register: Register = (on, options) => {
         redraw($)
       }
       if (r.how === 'classified') rememberSnippet(e.turnId, pendingPrompt)
+      if (r.how === 'classified' && r.calib) await recordCalib($, session, e.turnId, r.calib)
       // Counted when the turn starts (a dropped prompt is not a steer), and only if the steer held: a warm cache that
       // kept the turn on a bigger model was not steered.
       if (r.steered && !r.keptFrom) await count($, session, c => ({ ...c, pacingSteered: (c.pacingSteered ?? 0) + 1 }))
@@ -2463,6 +2573,10 @@ export const register: Register = (on, options) => {
       escalations: c.escalations + 1,
       maxEffort: (c.maxEffort ?? 0) + (out.route.effort === 'max' && r.effort !== 'max' ? 1 : 0),
     }))
+    // The tune record keeps any move above the classified tier's model (a weak signal, never a label).
+    if (r.how === 'classified' && r.calib && r.turnId !== null && MODELS.indexOf(out.route.model) > MODELS.indexOf(TIER_ROUTE[r.tier].model)) {
+      await attachCalib($, session, r.turnId, { escalatedTo: out.route.model })
+    }
     // Moving to a higher MODEL than the classified tier's own means the classifier sorted it too low. An effort-only
     // raise, or a turn the warm cache kept on a bigger model, is not a correction. One entry per turn, counted once;
     // a later, higher raise in the same turn moves it up to the highest model reached.
