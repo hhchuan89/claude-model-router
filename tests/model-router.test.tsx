@@ -7216,12 +7216,18 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         return band
       }
 
+      // Pressed by the label a person reads, so the label-to-tier mapping is what is tested.
+      const pressLabel = async (band: any, label: string) => {
+        const button = await band.find({ type: 'Button', text: label } as never)
+        await band.press({ key: (button as { key: string }).key })
+      }
+
       test('they are labelled by model, hide the one the reply had, and each maps to its tier', async ($, on) => {
         const seen = world($, on, LOOKUP)
         const band = await classifiedLookup($)
         expect(await band.find({ type: 'Text', text: /^Wrong model for the last reply\? Should have been:$/ })).toBeDefined()
         expect((await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)).toEqual(['Hide details', 'Pause router', 'Sonnet', 'Opus'])
-        await band.press({ key: 'wrong-execute' })
+        await pressLabel(band, 'Sonnet')
         expect((seen.store.corrections as Correction[]).at(-1)).toMatchObject({ routed: 'lookup', right: 'execute', source: 'manual' })
         await band.unmount()
       })
@@ -7229,7 +7235,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       test('Opus means decide, and the band thanks the person in place of the buttons', async ($, on) => {
         const seen = world($, on, LOOKUP)
         const band = await classifiedLookup($)
-        await band.press({ key: 'wrong-decide' })
+        await pressLabel(band, 'Opus')
         expect((seen.store.corrections as Correction[]).at(-1)).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
         expect(await band.find({ type: 'Text', text: /^Thanks — the router will use this$/ })).toBeDefined()
         expect(await band.find({ key: 'wrong-decide' })).toBeUndefined()
