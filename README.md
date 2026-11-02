@@ -244,8 +244,9 @@ The classifier is not always right. When it sorted a turn too low, tell it: `/mo
 buttons) records the turn's masked prompt snippet with the tier it should have had; so does the model escalating itself
 to a bigger **model** than the classified tier's (an effort-only raise does not count). Only turns the classifier
 actually sorted can be corrected, not forced, pinned, inherited or failed-classification turns. With `learnFromCorrections`
-on (the default) the newest 8 corrections are added to the classifier's system prompt as examples, for the main
-conversation and for subagents. With no corrections, or with the option off, the prompt is exactly the plain one.
+on (the default) the up to 6 stored corrections most similar to the message (Jaccard similarity of character trigrams,
+bigrams for Chinese; at least 0.12) are added to the classifier's system prompt as examples, for the main conversation
+and for subagents. With no similar correction, or with the option off, the prompt is exactly the plain one.
 `/model-router corrections` lists them, `/model-router corrections clear` deletes them, and stats count them.
 
 ## Weekly pacing
@@ -312,9 +313,9 @@ own effort. `stats` covers routed subagents only.
 - **Nothing else is collected.** No telemetry and no analytics. The router makes no network call of its own: the only
   traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
   the events log are written to local files only.
-- **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store up to 40
-  masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the newest 8 are sent to
-  Haiku as part of every classifier call. Turn `learnFromCorrections` off to stop recording and sending, and run
+- **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store up to 300
+  masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the up to 6 most similar to
+  the message are sent to Haiku as part of a classifier call (none when nothing is similar). Turn `learnFromCorrections` off to stop recording and sending, and run
   `/model-router corrections clear` to delete what is stored. The band and history keep no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
@@ -394,7 +395,7 @@ values, including router on/off, idle minutes, the context cap and `compactMinCo
 | `compactMinContext` | `100000` | Tokens ≥ 0; no configured maximum | Minimum context for idle compaction and checkpoint hints (a small context is cheap to rewrite) |
 | `checkpointHints` | `false` (off) | `true`, `false` | Suggest a task-boundary checkpoint when estimated savings exceed its cost; never compacts automatically |
 | `shrinkToolOutput` | `0` (off) | 0–1,000,000 characters; active at 20,000–1,000,000 | Reduce large Bash/MCP logs and progress output, archive originals and fetch capped slices. Values outside the active range count as off |
-| `learnFromCorrections` | `true` (on) | `true`, `false` | Record corrections and send the newest 8 to the classifier (see "Pin and corrections" and Privacy). Off: none are written or sent |
+| `learnFromCorrections` | `true` (on) | `true`, `false` | Record corrections and send the most similar ones to the classifier (see "Pin and corrections" and Privacy). Off: none are written or sent |
 | `weeklyPacing` | `warn` | `off`, `warn`, `steer` | What the router does when weekly usage runs ahead of an even pace (see "Weekly pacing"); `/model-router pacing` overrides it |
 | `compactAtContext` | `0` (off) | Tokens ≥ 0; active at ≥ 100,000; no configured maximum | Compact between turns when main context reaches this size (e.g. `200000`), so every step does not re-read a huge cache. Below `100000` counts as off |
 

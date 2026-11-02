@@ -6,7 +6,7 @@ import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
 import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
-import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
+import { addCorrection, EXAMPLES_K, fewShot, MAX_CORRECTIONS, MIN_SIMILARITY, readCorrections, similarExamples, similarity, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
@@ -6462,7 +6462,7 @@ describe('weekly pace math (1.1.0)', () => {
 describe('corrections store and few-shot block (1.1.0)', () => {
   const c = (text: string, right: 'lookup' | 'execute' | 'decide' = 'decide', at = 1): Correction => ({ at, text, routed: 'lookup', right, source: 'manual' })
 
-  test('the list keeps the newest 40 and a repeated text replaces its earlier entry', async () => {
+  test('the list keeps the newest 300 and a repeated text replaces its earlier entry', async () => {
     let list: Correction[] = []
     for (let i = 0; i < MAX_CORRECTIONS + 5; i++) list = addCorrection(list, c(`task ${i}`))
     expect(list).toHaveLength(MAX_CORRECTIONS)
@@ -6688,10 +6688,10 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
 
     test('with corrections the block is appended to the system prompt for the main thread and for subagents', async ($, on) => {
       const seen = world($, on, LOOKUP, { store: seeded('rename the helper') })
-      await $.prompt.submit({ text: 'find every TODO' } as never)
+      await $.prompt.submit({ text: 'rename the helper again' } as never)
       expect(seen.systems[0]!.startsWith(classifierSystem('en'))).toBe(true)
       expect(seen.systems[0]).toContain('- "rename the helper" → decide (was routed lookup)')
-      await $.agent.spawn({ prompt: 'search the repo for usages of the helper', description: 'search', subagentType: 'general-purpose', parentModel: 'claude-opus-5-5' } as never)
+      await $.agent.spawn({ prompt: 'rename the helper in the utils file', description: 'search', subagentType: 'general-purpose', parentModel: 'claude-opus-5-5' } as never)
       expect(seen.systems).toHaveLength(2)
       expect(seen.systems[1]).toContain('rename the helper')
     })
@@ -7713,13 +7713,13 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
     test('a failed first read of the stored corrections is retried, not given up on', async ($, on) => {
       let failing = true
       on('store.get', { key: 'corrections' }, async (_$: unknown, e: any, next: any) => failing ? { deny: 'store unavailable' } : next(e))
-      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] } })
-      await $.prompt.submit({ text: 'find files' } as never)
+      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'find more files', routed: 'lookup', right: 'decide', source: 'manual' }] } })
+      await $.prompt.submit({ text: 'find more files' } as never)
       expect(seen.systems[0]).toBe(classifierSystem('en'))
       failing = false
       await new Promise(resolve => (globalThis as any).setTimeout(resolve, 1100))
       await $.prompt.submit({ text: 'find more files' } as never)
-      expect(seen.systems[1]).toContain('rename the helper')
+      expect(seen.systems[1]).toContain('find more files')
     })
 
     test('clear and pacing say when the store write failed', async ($, on) => {
@@ -8050,19 +8050,19 @@ describe('/model-router replay (1.2.0)', () => {
   // WHY: the replay measures the real call, so it must send what classifyTier sends, minus the few-shot block.
   test('each request is the live call minus the few-shot block, even when corrections exist', async ($, on) => {
     const { calls, fn } = classifierBy(bothShapes)
-    const stored = { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] }
+    const stored = { corrections: [{ at: 1, text: 'find every TODO comment', routed: 'lookup', right: 'decide', source: 'manual' }] }
     const seen = world($, on, fn, { store: stored })
     put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: '', previous: null }, { id: 'b', message: 'now the tests', context: '[user] x', previous: 'decide' }]))
     // The live call first, for the parameters to compare with.
     await $.prompt.submit({ text: 'find every TODO' } as never)
-    expect(seen.systems[0]).toContain('rename the helper')
+    expect(seen.systems[0]).toContain('find every TODO comment')
     await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
     await cmd($, `replay ${IN} both`)
     const replayed = calls.requests.slice(1)
     expect(replayed).toHaveLength(4)
     expect(new Set(replayed.map(r => r.prompt))).toEqual(new Set([classifierPrompt(null, '', 'find every TODO'), classifierPrompt('decide', '[user] x', 'now the tests')]))
     expect(replayed.map(r => r.system).sort()).toEqual([classifierSystem('en'), classifierSystem('en'), legacyClassifierSystem('en'), legacyClassifierSystem('en')].sort())
-    expect(replayed.every(r => !r.system.includes('rename the helper'))).toBe(true)
+    expect(replayed.every(r => !r.system.includes('find every TODO comment'))).toBe(true)
     // The same model call as the live one: haiku, the same token limit.
     expect(seen.asked.every(m => m === 'haiku')).toBe(true)
     expect(seen.maxTokens.every(n => n === seen.maxTokens[0])).toBe(true)
@@ -8183,5 +8183,153 @@ describe('/model-router replay (1.2.0)', () => {
     await cmd($, `replay ${IN} current`)
     expect(calls.requests[0]!.prompt).toBe(classifierPrompt(null, '', 'hello'))
     expect(readOut(seen)[0].id).toBe('0')
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 1.2.0 (A): examples chosen by similarity
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('similar examples (1.2.0)', () => {
+  const c = (text: string, at = 1, right: 'lookup' | 'execute' | 'decide' = 'decide'): Correction => ({ at, text, routed: 'lookup', right, source: 'manual' })
+  const RELATED: [string, string][] = [
+    ['rename the helper in utils', 'rename the helper function in the utils file'],
+    ['fix the typo in the readme', 'fix typo in README.md'],
+    ['look at the auth flow', 'look at the login flow'],
+    ['commit the fixes', 'commit the fix'],
+  ]
+  const UNRELATED: [string, string][] = [
+    ['rename the helper in utils', 'deploy the release to production'],
+    ['look at the auth flow', 'write tests for the payment module'],
+    ['find every TODO', 'rename the helper'],
+  ]
+
+  // WHY: the number is a judgement; these pairs fix which side of it realistic wordings fall on, so moving it is a visible decision.
+  test('the minimum sits between related wordings and unrelated work, in English', async () => {
+    expect(MIN_SIMILARITY).toBe(0.12)
+    for (const [a, b] of RELATED) expect(similarity(a, b)).toBeGreaterThan(MIN_SIMILARITY * 2)
+    for (const [a, b] of UNRELATED) expect(similarity(a, b)).toBeLessThan(MIN_SIMILARITY)
+  })
+
+  test('Chinese is compared by character bigrams', async () => {
+    expect(similarity('把这个函数重命名一下', '请把函数重命名')).toBeGreaterThan(MIN_SIMILARITY * 2)
+    expect(similarity('部署到生产环境', '把代码部署到生产环境吧')).toBeGreaterThan(MIN_SIMILARITY * 2)
+    expect(similarity('把这个函数重命名一下', '部署到生产环境')).toBeLessThan(MIN_SIMILARITY)
+    // A single Chinese character is its own gram, so a one-character message is comparable.
+    expect(similarity('改', '改')).toBe(1)
+  })
+
+  test('mixed text compares both parts: the English by trigrams, the Chinese by bigrams', async () => {
+    expect(similarity('run the migration in 生产环境', 'run the migration on production')).toBeGreaterThan(MIN_SIMILARITY * 2)
+    expect(similarity('migrate 生产环境', '部署到生产环境')).toBeGreaterThan(MIN_SIMILARITY)
+    expect(similarity('run the migration in 生产环境', 'rename the helper')).toBeLessThan(MIN_SIMILARITY)
+  })
+
+  test('case, spacing and masked secrets do not matter, and empty text is similar to nothing', async () => {
+    expect(similarity('Rename   THE helper', 'rename the helper')).toBe(1)
+    expect(similarity(`use sk-ant-api03-${'a'.repeat(30)}`, `use sk-ant-api03-${'b'.repeat(30)}`)).toBe(1)
+    expect(similarity('', 'rename the helper')).toBe(0)
+    expect(similarity('', '')).toBe(0)
+  })
+
+  test('the best EXAMPLES_K are taken, oldest first so the block still reads newest last', async () => {
+    const list = Array.from({ length: 10 }, (_, i) => c(`rename the helper in utils ${'x'.repeat(i)}`, i + 1))
+    list.push(c('deploy the release to production', 99))
+    const picked = similarExamples(list, 'rename the helper in utils')
+    expect(EXAMPLES_K).toBe(6)
+    expect(picked).toHaveLength(6)
+    // The least extra text scores highest: entries 1 to 3 differ from the message by 0, 1 and 2 grams; from the fourth on
+    // every entry adds the same three grams (a repeated letter adds none), so those tie and the newest of them win.
+    expect(picked.map(x => x.at)).toEqual([1, 2, 3, 8, 9, 10])
+    expect(picked.every(x => !x.text.includes('deploy'))).toBe(true)
+  })
+
+  test('nothing reaching the minimum means no examples at all', async () => {
+    expect(similarExamples([c('deploy the release to production'), c('部署到生产环境')], 'rename the helper in utils')).toEqual([])
+    expect(similarExamples([], 'rename the helper')).toEqual([])
+    expect(similarExamples([c('rename the helper')], '')).toEqual([])
+  })
+
+  test('an entry exactly at the minimum is kept, one under it is not', async () => {
+    const list = [c('rename the helper')]
+    const score = similarity('rename the helper', 'rename the helper please do')
+    expect(similarExamples(list, 'rename the helper please do', 6, score)).toHaveLength(1)
+    expect(similarExamples(list, 'rename the helper please do', 6, score + 1e-9)).toHaveLength(0)
+  })
+
+  test('a tie goes to the newer entry', async () => {
+    const list = [c('rename the helper in utils', 5), c('rename the helper in utils', 9), c('rename the helper in utils', 2)]
+    expect(similarExamples(list, 'rename the helper in utils', 1).map(x => x.at)).toEqual([9])
+    expect(similarExamples(list, 'rename the helper in utils', 2).map(x => x.at)).toEqual([5, 9])
+  })
+
+  test('the store holds 300; a repeated text replaces its entry, and an entry pushed out can no longer be found', async () => {
+    let list: Correction[] = []
+    for (let i = 0; i < MAX_CORRECTIONS + 10; i++) list = addCorrection(list, c(`unrelated job number ${i} about ${'q'.repeat(i % 7)}`, i))
+    expect(MAX_CORRECTIONS).toBe(300)
+    expect(list).toHaveLength(300)
+    expect(list[0]!.text).toContain('number 10 ')
+    list = addCorrection(list, c('unrelated job number 11 about ', 1000, 'execute'))
+    expect(list).toHaveLength(300)
+    expect(list.filter(x => x.text === 'unrelated job number 11 about ')).toHaveLength(1)
+    expect(list.at(-1)!.right).toBe('execute')
+    expect(readCorrections(Array.from({ length: 305 }, (_, i) => c(`t${i}`, i)))).toHaveLength(300)
+  })
+})
+
+describe('classifier prompt with similar examples (1.2.0)', () => {
+  const stored = (...texts: string[]) => ({ corrections: texts.map((text, i) => ({ at: i + 1, text, routed: 'lookup', right: 'decide', source: 'manual' })) })
+  const LOOKUP_REPLY = P(0.9, 0.1, 0)
+
+  test('a similar correction is added, a dissimilar one is not, and the block keeps its format', async ($, on) => {
+    const seen = world($, on, LOOKUP_REPLY, { store: stored('rename the helper in utils', 'deploy the release to production') })
+    await $.prompt.submit({ text: 'rename the helper function in the utils file' } as never)
+    expect(seen.systems[0]!.startsWith(classifierSystem('en'))).toBe(true)
+    expect(seen.systems[0]).toContain('Corrections this developer made to earlier routing (newest last)')
+    expect(seen.systems[0]).toContain('- "rename the helper in utils" → decide (was routed lookup)')
+    expect(seen.systems[0]).not.toContain('deploy the release')
+  })
+
+  // WHY: with nothing similar the prompt must be exactly the one without corrections, so it caches and behaves as before.
+  test('with nothing similar the prompt is the plain one', async ($, on) => {
+    const seen = world($, on, LOOKUP_REPLY, { store: stored('deploy the release to production', '部署到生产环境') })
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    expect(seen.systems).toEqual([classifierSystem('en')])
+  })
+
+  test('the examples follow the message: each classification chooses its own', async ($, on) => {
+    const seen = world($, on, [LOOKUP_REPLY, LOOKUP_REPLY], { store: stored('rename the helper in utils', 'deploy the release to production') })
+    await $.prompt.submit({ text: 'rename the helper function in the utils file' } as never)
+    await $.prompt.submit({ text: 'deploy the release to production now' } as never)
+    expect(seen.systems[0]).toContain('rename the helper in utils')
+    expect(seen.systems[0]).not.toContain('deploy the release')
+    expect(seen.systems[1]).toContain('deploy the release to production')
+    expect(seen.systems[1]).not.toContain('rename the helper')
+  })
+
+  test('a subagent gets the examples similar to its task', async ($, on) => {
+    const seen = world($, on, LOOKUP_REPLY, { store: stored('rename the helper in utils', 'deploy the release to production') })
+    await spawnAgent($, { prompt: 'rename the helper function in the utils file' })
+    expect(seen.systems).toHaveLength(1)
+    expect(seen.systems[0]).toContain('rename the helper in utils')
+    expect(seen.systems[0]).not.toContain('deploy the release')
+  })
+
+  test('learning off leaves the prompt plain even for a similar message', { options: { learnFromCorrections: false } }, async ($, on) => {
+    const seen = world($, on, LOOKUP_REPLY, { store: stored('rename the helper in utils') })
+    await $.prompt.submit({ text: 'rename the helper function in the utils file' } as never)
+    expect(seen.systems).toEqual([classifierSystem('en')])
+  })
+
+  test('selection reads no store: the corrections are read once, not per classification', async ($, on) => {
+    let reads = 0
+    const seen = world($, on, [LOOKUP_REPLY, LOOKUP_REPLY, LOOKUP_REPLY], { store: stored('rename the helper in utils') })
+    on('store.get', { key: 'corrections' }, async (_$: unknown, e: any, next: any) => {
+      reads++
+      return next(e)
+    })
+    for (let i = 0; i < 3; i++) await $.prompt.submit({ text: `rename the helper in utils ${i}` } as never)
+    expect(seen.systems.every(s => s.includes('rename the helper in utils'))).toBe(true)
+    expect(reads).toBeLessThanOrEqual(1)
   })
 })

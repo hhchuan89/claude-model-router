@@ -5,7 +5,7 @@ import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier, TurnH
 import type { LastRequest, Shape, Usage } from './meter'
 import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, saved, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
-import { addCorrection, fewShot, readCorrections, snippetOf } from './learn'
+import { addCorrection, fewShot, readCorrections, similarExamples, snippetOf } from './learn'
 import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
@@ -1047,10 +1047,10 @@ function failText(c: { why: string; detail?: string }): string {
   return c.detail ? `${c.why}: ${c.detail}` : c.why
 }
 
-// The few-shot block of earlier corrections; nothing at all (the prompt is the plain one) when learning is off or
-// there are none.
-function learnedBlock(lang: Lang): string {
-  const block = learning ? fewShot(corrections, lang) : ''
+// The few-shot block: the stored corrections most like this message (corrections are held in memory, no store read);
+// nothing at all (the prompt is the plain one) when learning is off or none is similar enough.
+function learnedBlock(lang: Lang, message: string): string {
+  const block = learning ? fewShot(similarExamples(corrections, message), lang) : ''
   return block === '' ? '' : `\n\n${block}`
 }
 
@@ -1062,7 +1062,7 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
     if (await stillHere($, session) !== 'same') return { ok: false, why: 'session changed' }
     const r = await $.model.complete({
       model: 'haiku',
-      system: classifierSystem(lang) + learnedBlock(lang),
+      system: classifierSystem(lang) + learnedBlock(lang, text),
       prompt: classifierPrompt(previous, context, redact(text).slice(0, 6000)),
       maxTokens: CLASSIFY_MAX_TOKENS,
       effort: 'low',

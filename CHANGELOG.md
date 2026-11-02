@@ -19,6 +19,11 @@ release.
   decide 0.30). Otherwise the more capable of the top two is taken and the verdict is unsure, which as before never
   moves work to a cheaper model. Subagent classification uses the same rule.
 
+- Corrections: the store holds up to 300 (was 40), and a classification gets the up to 6 corrections most similar to its
+  message instead of the newest 8, chosen by Jaccard similarity of character trigrams (bigrams for Chinese) with no model
+  call and no store read (minimum 0.12; ties go to the newer entry). When none is similar enough the prompt has no
+  corrections block at all.
+
 ### Added
 
 - Risk guard: a risk of 0.7 or more sends the request to decide, whatever its tier probabilities, and the reason ends
