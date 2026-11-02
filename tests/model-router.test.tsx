@@ -10,7 +10,8 @@ import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } f
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
-import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, pickTier, RISK_BAR, routeFor, settleTier, shorten, TIER_BARS, withSuffixOf } from '../hooks/route'
+import { legacyClassifierSystem, parseReplayArgs, replayOutPath } from '../hooks/replay'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
@@ -116,7 +117,7 @@ type Reply = string | null | { fail: 'api-error' | 'empty-reply' }
 function world(
   $: any,
   on: any,
-  classifier: Reply | Reply[],
+  classifier: Reply | Reply[] | ((e: { system?: string; prompt: string }) => Promise<Reply>),
   opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally } = {},
 ): Seen {
   const seen: Seen = { sessionId: 'sess-1', clock: mock.clock(on), systems: [], submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {}, statuses: [], store: { ...opts.store } }
@@ -142,7 +143,7 @@ function world(
     seen.prompts.push(e.prompt)
     const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     if (e.model === 'haiku') {
-      const reply = Array.isArray(classifier) ? (classifier.shift() ?? null) : classifier
+      const reply = typeof classifier === 'function' ? await classifier(e) : Array.isArray(classifier) ? (classifier.shift() ?? null) : classifier
       if (reply !== null && typeof reply === 'object') {
         return reply.fail === 'api-error'
           ? { value: { isAnswered: false as const, reason: 'api-error' as const, status: 529, error: 'overloaded', usage } }
@@ -7644,5 +7645,439 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(await band.findAll({ type: 'Text', text: /kept on/ })).toHaveLength(0)
       await band.unmount()
     })
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 1.2.0: calibrated tier probabilities, per-tier bars, the risk guard and the replay command
+// ---------------------------------------------------------------------------------------------------------------------
+
+const P = (lookup: number, execute: number, decide: number, risk = 0, reason = 'r') => JSON.stringify({ p: { lookup, execute, decide }, risk, reason })
+
+describe('pickTier (1.2.0)', () => {
+  const none = { lookup: 0, execute: 0, decide: 0 }
+
+  test('the defaults are the provisional bars', async () => {
+    expect(TIER_BARS).toEqual({ lookup: 0.85, execute: 0.6, decide: 0.3 })
+    expect(RISK_BAR).toBe(0.7)
+  })
+
+  // WHY: lookup is the dearest tier to get wrong, so it must clear the highest bar; a miss moves work up, never down.
+  test('lookup is taken at its bar exactly, and one hair below it goes to the more capable of the top two, unsure', async () => {
+    expect(pickTier({ ...none, lookup: 0.85, execute: 0.15 }, 0)).toEqual({ tier: 'lookup', sure: true })
+    expect(pickTier({ ...none, lookup: 0.84, execute: 0.16 }, 0)).toEqual({ tier: 'execute', sure: false })
+    expect(pickTier({ ...none, lookup: 0.5, execute: 0.1, decide: 0.4 }, 0)).toEqual({ tier: 'decide', sure: false })
+  })
+
+  test('execute is taken at its bar exactly, and below it the pick is unsure', async () => {
+    expect(pickTier({ lookup: 0.2, execute: 0.6, decide: 0.2 }, 0)).toEqual({ tier: 'execute', sure: true })
+    expect(pickTier({ lookup: 0.3, execute: 0.5, decide: 0.2 }, 0)).toEqual({ tier: 'execute', sure: false })
+    expect(pickTier({ lookup: 0.1, execute: 0.5, decide: 0.4 }, 0)).toEqual({ tier: 'decide', sure: false })
+  })
+
+  test('decide is taken at its bar exactly (a custom bar, since three probabilities leave the top one above 0.3)', async () => {
+    const bars = { lookup: 0.85, execute: 0.6, decide: 0.5 }
+    expect(pickTier({ lookup: 0.3, execute: 0.2, decide: 0.5 }, 0, bars)).toEqual({ tier: 'decide', sure: true })
+    expect(pickTier({ lookup: 0.34, execute: 0.25, decide: 0.41 }, 0, bars)).toEqual({ tier: 'decide', sure: false })
+    expect(pickTier({ lookup: 0.1, execute: 0.1, decide: 0.8 }, 0)).toEqual({ tier: 'decide', sure: true })
+  })
+
+  test('a tie goes to the more capable tier', async () => {
+    expect(pickTier({ lookup: 0.45, execute: 0.1, decide: 0.45 }, 0)).toEqual({ tier: 'decide', sure: true })
+    expect(pickTier({ lookup: 0.5, execute: 0.5, decide: 0 }, 0)).toEqual({ tier: 'execute', sure: false })
+    expect(pickTier({ lookup: 0, execute: 0.5, decide: 0.5 }, 0).tier).toBe('decide')
+  })
+
+  // WHY: an irreversible or outward-facing request is worth the top model however sure the tier looks.
+  test('risk at the bar exactly sends the work to decide, sure, with the guard named; just below it does not', async () => {
+    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, RISK_BAR)).toEqual({ tier: 'decide', sure: true, guard: 'risk' })
+    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, 0.69)).toEqual({ tier: 'lookup', sure: true })
+    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, 0.9, TIER_BARS, 0.9).guard).toBe('risk')
+    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, 0.8, TIER_BARS, 0.9)).toEqual({ tier: 'lookup', sure: true })
+  })
+
+  test('the guard only raises: a verdict already at decide stays decide', async () => {
+    expect(pickTier({ lookup: 0, execute: 0, decide: 1 }, 0.9).tier).toBe('decide')
+  })
+})
+
+describe('parseDecision, calibrated reply (1.2.0)', () => {
+  test('reads p, risk and reason and returns the pick with them', async () => {
+    expect(parseDecision(P(0.9, 0.1, 0, 0.2, 'find files'))).toEqual({ tier: 'lookup', sure: true, reason: 'find files', p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0.2 })
+    expect(parseDecision(P(0.5, 0.1, 0.4, 0, 'maybe'))).toMatchObject({ tier: 'decide', sure: false })
+    expect(parseDecision(P(0.1, 0.1, 0.1, 0.9))).toMatchObject({ tier: 'decide', sure: true, guard: 'risk' })
+  })
+
+  test('a reply fenced in prose still parses', async () => {
+    expect(parseDecision(`Here you go:\n\`\`\`json\n${P(0, 0.9, 0.1)}\n\`\`\``)?.tier).toBe('execute')
+  })
+
+  test('p is clamped to [0,1] and scaled to add up to 1; a sum already 1 is not nudged', async () => {
+    // 1.5 clamps to 1 and -3 to 0, which leaves 1 and 0.5 to scale: two thirds and one third.
+    const d = parseDecision(P(1.5, 0.5, -3))
+    expect(Math.abs((d?.p?.lookup ?? 0) - 2 / 3) < 1e-12 && Math.abs((d?.p?.execute ?? 0) - 1 / 3) < 1e-12 && d?.p?.decide === 0).toBe(true)
+    expect(d).toMatchObject({ tier: 'execute', sure: false })
+    const half = parseDecision(P(0.2, 0.2, 0.4))
+    expect(Math.abs((half?.p?.execute ?? 0) - 0.25) < 1e-12).toBe(true)
+    // 0.85 + 0.1 + 0.05 is 1 within rounding, so the lookup probability stays exactly at its bar.
+    expect(parseDecision(P(0.85, 0.1, 0.05))?.p?.lookup).toBe(0.85)
+    expect(parseDecision(P(0.85, 0.1, 0.05))).toMatchObject({ tier: 'lookup', sure: true })
+    // A tier left out counts as 0.
+    expect(parseDecision('{"p":{"execute":1},"reason":"x"}')?.p).toEqual({ lookup: 0, execute: 1, decide: 0 })
+  })
+
+  test('a missing risk is 0, an out-of-range one is clamped, a non-number one is 0', async () => {
+    expect(parseDecision('{"p":{"lookup":1,"execute":0,"decide":0},"reason":"x"}')).toMatchObject({ risk: 0, tier: 'lookup', sure: true })
+    expect(parseDecision(P(1, 0, 0, 7))).toMatchObject({ risk: 1, guard: 'risk' })
+    expect(parseDecision('{"p":{"lookup":1,"execute":0,"decide":0},"risk":"high"}')?.risk).toBe(0)
+  })
+
+  test('an all-zero, non-object or non-numeric p is unparseable', async () => {
+    expect(parseDecision(P(0, 0, 0))).toBe(null)
+    expect(parseDecision('{"p":"lookup","reason":"x"}')).toBe(null)
+    expect(parseDecision('{"p":[1,0,0],"reason":"x"}')).toBe(null)
+    expect(parseDecision('{"p":{"lookup":"high","execute":0,"decide":0}}')).toBe(null)
+    expect(parseDecision('{"p":null,"tier":"lookup"}')).toBe(null)
+  })
+
+  test('a calibrated reply cut off after p still routes, unsure, with no reason', async () => {
+    expect(parseDecision('{"p":{"lookup":0.9,"execute":0.1,"decide":0},"risk":0.1,"rea')).toMatchObject({ tier: 'lookup', sure: false, reason: '', p: { lookup: 0.9, execute: 0.1, decide: 0 } })
+    // A cut reply never moves work down, and the guard still applies to what was read.
+    expect(parseDecision('{"p":{"lookup":0.9,"execute":0.1,"decide":0},"risk":0.9,"rea')).toMatchObject({ tier: 'decide', sure: true, guard: 'risk' })
+    expect(parseDecision('{"p":{"lookup":0.9,"exec')).toBe(null)
+  })
+
+  test('the 1.1 reply shape still parses and carries no p or risk', async () => {
+    expect(parseDecision('{"tier":"lookup","sure":false,"reason":"maybe"}')).toEqual({ tier: 'lookup', reason: 'maybe', sure: false })
+    expect(parseDecision('{"tier":"decide","reason":"x"}')).toEqual({ tier: 'decide', reason: 'x', sure: true })
+    expect(parseDecision('{"tier":"execute","sure":false')).toEqual({ tier: 'execute', reason: '', sure: false })
+    expect(parseDecision('{"tier":"huge"}')).toBe(null)
+  })
+
+  test('the prompt asks for probabilities and a risk and drops the two rules the bars replace', async () => {
+    for (const lang of ['en', 'zh'] as const) {
+      const text = classifierSystem(lang)
+      expect(text).toContain('{"p":{"lookup":<0-1>,"execute":<0-1>,"decide":<0-1>},"risk":<0-1>,"reason":string}')
+      expect(text).toContain('Be calibrated: 0.9 means you expect to be wrong about one time in ten.')
+      expect(text).not.toContain('When unsure between two tiers')
+      expect(text).not.toContain('sure:')
+      expect(text).toContain('- If a message mixes tiers, use the highest one it contains.')
+    }
+    expect(classifierSystem('zh')).toContain('Simplified Chinese, at most 15 字')
+    expect(legacyClassifierSystem('en')).toContain('When unsure between two tiers, pick the higher one.')
+    expect(legacyClassifierSystem('en')).toContain('{"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}')
+  })
+})
+
+describe('classification with probabilities (1.2.0)', () => {
+  const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
+  const route = (seen: Seen, i = 0) => seen.submits[i]!.context?.[0] ?? ''
+
+  function ui($: any, on: any) {
+    on('ui.toast', async () => ({ value: undefined }))
+    on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+    on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
+    on('tool.register', async () => ({ value: { tool: 'mcp__model-router__escalate' } }))
+    on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+    on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
+  }
+
+  test('a probability over its bar routes as sure; the prompt that was sent is the calibrated one', async ($, on) => {
+    const seen = world($, on, P(0.9, 0.1, 0, 0, 'find files'))
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    expect(route(seen)).toContain('assigned to haiku')
+    expect(route(seen)).toContain('find files')
+    expect(seen.systems).toEqual([classifierSystem('en')])
+    expect(seen.systems[0]).toContain('"p":{"lookup"')
+  })
+
+  test('a probability under its bar is unsure: on a first turn it goes to the more capable of the top two', async ($, on) => {
+    const seen = world($, on, P(0.7, 0.3, 0, 0, 'maybe a lookup'))
+    await $.prompt.submit({ text: 'look at the config' } as never)
+    expect(route(seen)).toContain('assigned to sonnet')
+  })
+
+  // WHY: settleTier is unchanged: an unsure pick must never drop a turn below the tier before it.
+  test('an unsure pick after a decide keeps the decide, a sure lower pick does not', async ($, on) => {
+    const seen = world($, on, [P(0, 0.1, 0.9, 0, 'design'), P(0.7, 0.3, 0, 0, 'maybe lookup'), P(0.95, 0.05, 0, 0, 'find')])
+    await $.prompt.submit({ text: 'design the queue' } as never)
+    expect(route(seen, 0)).toContain('assigned to opus')
+    await $.prompt.submit({ text: 'and the config?' } as never)
+    expect(route(seen, 1)).toContain('assigned to opus')
+    expect(route(seen, 1)).toContain('(unsure: not downgrading)')
+    await $.prompt.submit({ text: 'grep for TODO' } as never)
+    expect(route(seen, 2)).toContain('assigned to haiku')
+  })
+
+  test('the risk guard sends a lookup-looking request to Opus, says so, and is counted; one hair under the bar is not', async ($, on) => {
+    const seen = world($, on, [P(0.95, 0.05, 0, 0.7, 'run the deploy'), P(0.95, 0.05, 0, 0.69, 'run the check')])
+    await $.prompt.submit({ text: 'run the deploy script' } as never)
+    expect(route(seen, 0)).toContain('assigned to opus')
+    expect(route(seen, 0)).toContain('run the deploy (irreversible or outward-facing)')
+    expect(await statsOf($)).toContain('Risk guard sent to decide: 1.')
+    await $.prompt.submit({ text: 'run the check script' } as never)
+    expect(route(seen, 1)).not.toContain('(irreversible or outward-facing)')
+    expect(await statsOf($)).toContain('Risk guard sent to decide: 1.')
+  })
+
+  test('the guard note is in Chinese for a Chinese session', { options: { language: 'zh' } }, async ($, on) => {
+    const seen = world($, on, P(0.95, 0.05, 0, 0.9, '推送'))
+    await $.prompt.submit({ text: '推送到主分支' } as never)
+    expect(route(seen)).toContain('推送（不可逆或对外操作）')
+  })
+
+  test('the pacing steer still acts only on an unsure decide: the guard and a sure decide are left alone', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
+    const seen = world($, on, [P(0.5, 0.1, 0.4, 0, 'maybe design'), P(0.1, 0.2, 0.7, 0, 'design'), P(0.95, 0.05, 0, 0.9, 'push it')])
+    ui($, on)
+    const resetsAt = new Date((seen.clock as any).now() + 3.5 * 24 * 3600 * 1000).toISOString()
+    await $.session.measure({ context: { window: 1e6 }, rateLimits: [{ kind: 'seven_day', percentUsed: 82, resetsAt }], changed: ['rateLimits'] } as never)
+    await $.prompt.submit({ text: 'think about it' } as never)
+    expect(route(seen, 0)).toContain('assigned to sonnet')
+    expect(route(seen, 0)).toContain('(pacing: weekly 82%')
+    await $.prompt.submit({ text: 'a sure decision' } as never)
+    expect(route(seen, 1)).toContain('assigned to opus')
+    await $.prompt.submit({ text: 'push it' } as never)
+    expect(route(seen, 2)).toContain('assigned to opus')
+    expect(route(seen, 2)).not.toContain('pacing')
+    expect(await statsOf($)).toContain('weekly pacing: 1')
+  })
+
+  test('the 1.1 reply shape still routes end to end', async ($, on) => {
+    const seen = world($, on, ['{"tier":"decide","sure":false,"reason":"old shape"}', '{"tier":"lookup","reason":"old shape"}'])
+    await $.prompt.submit({ text: 'think' } as never)
+    expect(route(seen, 0)).toContain('assigned to opus')
+    await $.turn.complete(completion('t1'))
+    await $.prompt.submit({ text: 'find' } as never)
+    expect(route(seen, 1)).toContain('assigned to haiku')
+    expect(await statsOf($)).toContain('Risk guard sent to decide: 0.')
+  })
+
+  test('a subagent uses the same pick: sure lookup to Haiku, under the bar to Sonnet, a decision inherits, the guard inherits and counts', async ($, on) => {
+    const seen = world($, on, [P(0.9, 0.1, 0), P(0.7, 0.3, 0), P(0.1, 0.1, 0.8), P(0.95, 0.05, 0, 0.9)])
+    await spawnAgent($, { prompt: 'grep for TODO' })
+    await spawnAgent($, { prompt: 'look around the config' })
+    await spawnAgent($, { prompt: 'audit the save system' })
+    await spawnAgent($, { prompt: 'delete the old bucket' })
+    expect(seen.agents).toEqual(['haiku', 'sonnet', undefined, undefined])
+    expect(await statsOf($)).toContain('Risk guard sent to decide: 1.')
+  })
+})
+
+describe('/model-router replay (1.2.0)', () => {
+  const IN = '/work/labelled.json'
+  const OUT = '/work/labelled.replay.json'
+  const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
+  const items = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `m${i}`, message: `message ${i}`, context: i % 2 ? '[user] earlier' : '', previous: i % 3 === 0 ? 'execute' : null }))
+
+  // The world's classifier for these tests: answers every haiku call (live or replayed) by what was asked, and records
+  // the requests and how many ran at once. null is a timeout.
+  function classifierBy(answer: (system: string, prompt: string, n: number) => string | null) {
+    const calls = { n: 0, inFlight: 0, max: 0, requests: [] as { system: string; prompt: string }[] }
+    const fn = async (e: { system?: string; prompt: string }): Promise<string | null> => {
+      const n = calls.n++
+      calls.requests.push({ system: e.system ?? '', prompt: e.prompt })
+      calls.inFlight++
+      calls.max = Math.max(calls.max, calls.inFlight)
+      for (let i = 0; i < 50; i++) await Promise.resolve()
+      calls.inFlight--
+      return answer(e.system ?? '', e.prompt, n)
+    }
+    return { calls, fn }
+  }
+  const bothShapes = (system: string) => (system === classifierSystem('en') ? P(0.9, 0.1, 0, 0.1, 'new') : '{"tier":"execute","sure":false,"reason":"old"}')
+  // The engine turns a path such as /work/x.json into an absolute one on Windows, so the input is stored under both
+  // spellings and the output is found by its name.
+  const put = (seen: Seen, text: string) => {
+    seen.files[IN] = text
+    seen.files['C:\\work\\labelled.json'] = text
+  }
+  const outFile = (seen: Seen) => Object.keys(seen.files).find(k => /labelled\.replay\.json$/.test(k))
+  const readOut = (seen: Seen) => JSON.parse(seen.files[outFile(seen)!]!) as any[]
+
+  test('argument parsing: a path with spaces, an optional variant, the output beside the input', async () => {
+    expect(parseReplayArgs(' /a b/c.json ')).toEqual({ path: '/a b/c.json', variants: ['current', 'legacy'] })
+    expect(parseReplayArgs('/a.json legacy')).toEqual({ path: '/a.json', variants: ['legacy'] })
+    expect(parseReplayArgs('/a.json current')?.variants).toEqual(['current'])
+    expect(parseReplayArgs('/a.json both')?.variants).toEqual(['current', 'legacy'])
+    expect(parseReplayArgs('   ')).toBe(null)
+    expect(replayOutPath('/work/labelled.json')).toBe(OUT)
+    expect(replayOutPath('/work/labelled')).toBe(OUT)
+  })
+
+  test('it is not advertised: the usage text does not mention it, and a bare replay gets its own usage', async ($, on) => {
+    world($, on, P(1, 0, 0))
+    expect(await cmd($, 'nonsense')).not.toContain('replay')
+    expect(await cmd($, 'replay')).toContain('Usage: /model-router replay <path>')
+  })
+
+  test('both variants run over every item, the results file has one row per item and variant, and a summary comes back', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(3)))
+    const text = await cmd($, `replay ${IN}`)
+    expect(calls.n).toBe(6)
+    const rows = readOut(seen)
+    expect(rows).toHaveLength(6)
+    const current = rows.filter(r => r.variant === 'current')
+    const legacy = rows.filter(r => r.variant === 'legacy')
+    expect(current.map(r => r.id).sort()).toEqual(['m0', 'm1', 'm2'])
+    expect(current[0]).toMatchObject({ ok: true, tier: 'lookup', sure: true, risk: 0.1, p: { lookup: 0.9, execute: 0.1, decide: 0 } })
+    expect(current[0].raw).toContain('"risk"')
+    expect(legacy[0]).toMatchObject({ ok: true, legacyTier: 'execute', legacySure: false })
+    expect(legacy[0].tier).toBeUndefined()
+    expect(text).toContain('results in /work/labelled.replay.json')
+    expect(text).toContain('current: 3/3 answered · lookup 3 · execute 0 · decide 0 · unsure 0')
+    expect(text).toContain('legacy: 3/3 answered · lookup 0 · execute 3 · decide 0 · unsure 3')
+  })
+
+  test('a single variant runs only that one', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    await cmd($, `replay ${IN} legacy`)
+    expect(calls.n).toBe(2)
+    expect(calls.requests.every(r => r.system === legacyClassifierSystem('en'))).toBe(true)
+    expect(readOut(seen).every(r => r.variant === 'legacy')).toBe(true)
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(4)
+    expect(readOut(seen).every(r => r.variant === 'current')).toBe(true)
+  })
+
+  // WHY: the replay measures the real call, so it must send what classifyTier sends, minus the few-shot block.
+  test('each request is the live call minus the few-shot block, even when corrections exist', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const stored = { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] }
+    const seen = world($, on, fn, { store: stored })
+    put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: '', previous: null }, { id: 'b', message: 'now the tests', context: '[user] x', previous: 'decide' }]))
+    // The live call first, for the parameters to compare with.
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    expect(seen.systems[0]).toContain('rename the helper')
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    await cmd($, `replay ${IN} both`)
+    const replayed = calls.requests.slice(1)
+    expect(replayed).toHaveLength(4)
+    expect(new Set(replayed.map(r => r.prompt))).toEqual(new Set([classifierPrompt(null, '', 'find every TODO'), classifierPrompt('decide', '[user] x', 'now the tests')]))
+    expect(replayed.map(r => r.system).sort()).toEqual([classifierSystem('en'), classifierSystem('en'), legacyClassifierSystem('en'), legacyClassifierSystem('en')].sort())
+    expect(replayed.every(r => !r.system.includes('rename the helper'))).toBe(true)
+    // The same model call as the live one: haiku, the same token limit.
+    expect(seen.asked.every(m => m === 'haiku')).toBe(true)
+    expect(seen.maxTokens.every(n => n === seen.maxTokens[0])).toBe(true)
+  })
+
+  test('the replay prompt is byte for byte the prompt a live classification sends', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn, { messages: [{ role: 'user', text: 'earlier question' }, { role: 'assistant', text: 'earlier answer' }] })
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    const live = seen.prompts[0]!
+    put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: '[user] earlier question\n\n[assistant] earlier answer', previous: null }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[1]!.prompt).toBe(live)
+  })
+
+  test('the message is masked and cut to 6000 characters like a live one, and a secret in the raw reply is masked', async ($, on) => {
+    const { calls, fn } = classifierBy(() => `{"p":{"lookup":1,"execute":0,"decide":0},"reason":"sk-ant-api03-${'e'.repeat(30)}"}`)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify([{ id: 'k', message: `use sk-ant-api03-${'q'.repeat(30)} ${'x'.repeat(7000)}`, context: `token sk-ant-api03-${'w'.repeat(30)}`, previous: null }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[0]!.prompt).not.toContain('qqqqqqqqqq')
+    expect(calls.requests[0]!.prompt).not.toContain('wwwwwwwwww')
+    expect(calls.requests[0]!.prompt).toContain('[REDACTED')
+    expect(calls.requests[0]!.prompt.length).toBeLessThan(6000 + 400)
+    expect(readOut(seen)[0].raw).not.toContain('eeeeeeeeee')
+  })
+
+  test('at most 4 requests are in flight at once, and all of them run', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(12)))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(12)
+    expect(calls.max).toBe(4)
+    expect(readOut(seen)).toHaveLength(12)
+  })
+
+  test('a timeout and an unreadable reply are rows with a reason, and the summary counts them', async ($, on) => {
+    const { fn } = classifierBy((_s, prompt) => (prompt.includes('message 0') ? null : prompt.includes('message 1') ? 'no json here' : P(0, 1, 0)))
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(3)))
+    const text = await cmd($, `replay ${IN} current`)
+    const rows = readOut(seen)
+    expect(rows.find(r => r.id === 'm0')).toMatchObject({ ok: false, why: 'timeout' })
+    expect(rows.find(r => r.id === 'm1')).toMatchObject({ ok: false, why: 'unparseable', raw: 'no json here' })
+    expect(rows.find(r => r.id === 'm2')).toMatchObject({ ok: true, tier: 'execute' })
+    expect(text).toContain('current: 1/3 answered')
+    expect(text).toContain('failures: timeout ×1 · unparseable ×1')
+  })
+
+  // WHY: a replay is a measuring instrument; if it moved routing it would change the numbers it exists to read.
+  test('it changes no routing state, count, correction or band; only the spend moves', async ($, on) => {
+    // The live turns: a decide first, and after the replay an unsure execute that the remembered decide must hold.
+    const { fn } = classifierBy((system, prompt) => (prompt.includes('design the queue') ? P(0, 0.1, 0.9, 0, 'design') : prompt.includes('and the tests?') ? P(0.7, 0.3, 0) : bothShapes(system)))
+    const seen = world($, on, fn)
+    await $.prompt.submit({ text: 'design the queue' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    put(seen, JSON.stringify(items(4)))
+    const countKeys = () => JSON.stringify(Object.fromEntries(Object.entries(seen.store).filter(([k]) => k.startsWith('counts:'))))
+    const countsBefore = countKeys()
+    const submitsBefore = seen.submits.length
+    const statusesBefore = seen.statuses.length
+    const spentBefore = seen.tally?.byRole?.classifier?.tokens ?? 0
+    expect(countsBefore).not.toBe('{}')
+    await cmd($, `replay ${IN}`)
+    expect(countKeys()).toBe(countsBefore)
+    expect(seen.store.corrections).toBeUndefined()
+    expect(seen.submits).toHaveLength(submitsBefore)
+    expect(seen.statuses).toHaveLength(statusesBefore)
+    expect((seen.tally?.byRole?.classifier?.tokens ?? 0) - spentBefore).toBe(16)
+    await $.prompt.submit({ text: 'and the tests?' } as never)
+    expect(seen.submits.at(-1)!.context?.[0]).toContain('assigned to opus')
+    expect(seen.submits.at(-1)!.context?.[0]).toContain('(unsure: not downgrading)')
+  })
+
+  test('it refuses while a turn is running, and asks the model nothing', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    await $.prompt.submit({ text: 'work' } as never)
+    expect(calls.n).toBe(1)
+    expect(await cmd($, `replay ${IN}`)).toContain('a main turn is running')
+    expect(calls.n).toBe(1)
+    expect(outFile(seen)).toBeUndefined()
+  })
+
+  test('it refuses a file of more than 500 items and accepts exactly 500', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(501)))
+    expect(await cmd($, `replay ${IN}`)).toContain('501 items; at most 500')
+    expect(calls.n).toBe(0)
+    expect(outFile(seen)).toBeUndefined()
+    put(seen, JSON.stringify(items(500)))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(500)
+    expect(readOut(seen)).toHaveLength(500)
+  })
+
+  test('a missing file, bad JSON, a non-array and an item with no message are each refused with a reason', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    expect(await cmd($, 'replay /work/missing.json')).toContain('cannot read /work/missing.json')
+    put(seen, '{nope')
+    expect(await cmd($, `replay ${IN}`)).toContain('not valid JSON')
+    put(seen, '{"a":1}')
+    expect(await cmd($, `replay ${IN}`)).toContain('not a JSON array')
+    put(seen, '[{"id":"x"}]')
+    expect(await cmd($, `replay ${IN}`)).toContain('item 0 has no message')
+    expect(calls.n).toBe(0)
+  })
+
+  test('an unknown previous means none, and a missing id falls back to the position', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify([{ message: 'hello', previous: 'huge' }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[0]!.prompt).toBe(classifierPrompt(null, '', 'hello'))
+    expect(readOut(seen)[0].id).toBe('0')
   })
 })

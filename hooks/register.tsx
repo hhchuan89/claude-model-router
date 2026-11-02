@@ -13,10 +13,13 @@ import type { PaceMode } from './pace'
 import { barChartSvg, cellWidth, chartAlt, hhmm, lastDays, textChart, weekdayOf } from './history'
 import type { DayCost } from './history'
 import { redact } from './redact'
-import type { Lang } from './route'
+import type { Decision, Lang } from './route'
+import { legacyClassifierSystem, parseReplayArgs, parseReplayFile, replayOutPath, replayRow, replaySummary, REPLAY_CONCURRENCY } from './replay'
+import type { ReplayRow } from './replay'
 import {
   applyEscalation,
   assignmentContext,
+  classifierPrompt,
   classifierSystem,
   EFFORTS,
   forcedModel,
@@ -78,6 +81,7 @@ let pendingPrompt = ''
 let runningMain: string | null = null
 let checkpointRunning = false
 let checkpointTimer: Timer | null = null
+let replayRunning = false
 let lastHint: { at: number; context: number } | null = null
 // Fable blocks already counted: a main turn once per turnId, a subagent once per agent. Without this every step of a
 // turn would add one.
@@ -201,6 +205,12 @@ function logIO($: EngineInterface) {
 const STR = {
   zh: {
     keptTier: (why: string) => `分类失败（${why}）：沿用上一档位`,
+    riskGuard: '（不可逆或对外操作）',
+    replayBusy: '无法回放：主会话正在运行。请在轮次之间重试。',
+    replayRunning: '无法回放：另一个回放正在运行。',
+    replayUsage: '用法：/model-router replay <文件路径> [current|legacy|both]',
+    replayCancelled: '回放已取消：会话已变化。',
+    replayRefused: (why: string) => `无法回放：${why}`,
     sessionModel: (why: string) => `分类失败（${why}）：用会话模型`,
     inherited: '沿用上一轮路由',
     forced: '你在消息里指定了模型',
@@ -333,6 +343,12 @@ const STR = {
   },
   en: {
     keptTier: (why: string) => `classifier failed (${why}): kept previous tier`,
+    riskGuard: ' (irreversible or outward-facing)',
+    replayBusy: 'Replay refused: a main turn is running. Try again between turns.',
+    replayRunning: 'Replay refused: another replay is running.',
+    replayUsage: 'Usage: /model-router replay <path> [current|legacy|both]',
+    replayCancelled: 'Replay cancelled: the conversation changed.',
+    replayRefused: (why: string) => `Replay refused: ${why}`,
     sessionModel: (why: string) => `classifier failed (${why}): session model`,
     inherited: 'continues previous route',
     forced: 'model pinned in your message',
@@ -498,6 +514,8 @@ type Counts = {
   correctionsEscalate: number
   // Unsure decide verdicts the weekly pacing steer moved to execute.
   pacingSteered: number
+  // Classifications the risk guard sent to decide (main turns and subagents alike).
+  riskGuards: number
 }
 const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
@@ -519,6 +537,7 @@ const NO_COUNTS: Counts = {
   correctionsManual: 0,
   correctionsEscalate: 0,
   pacingSteered: 0,
+  riskGuards: 0,
 }
 
 // "≈$3.51", and "<$0.01" without a sign in front of it.
@@ -1015,7 +1034,7 @@ async function recentContext($: EngineInterface): Promise<string> {
     .join('\n\n')
 }
 
-type Verdict = { tier: Tier; reason: string; sure: boolean }
+type Verdict = Decision
 // A verdict, or why there is none: 'timeout', 'api-error <status>', 'empty-reply', 'unparseable' or 'exception'.
 // why is the counted reason; detail (the start of an unparseable reply) is only for the person reading the log.
 type Classified = { ok: true; verdict: Verdict } | { ok: false; why: string; detail?: string }
@@ -1040,9 +1059,7 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
     const r = await $.model.complete({
       model: 'haiku',
       system: classifierSystem(lang) + learnedBlock(lang),
-      prompt:
-        `<previous_tier>${previous ?? 'none'}</previous_tier>\n` +
-        `<context>\n${context || '(none)'}\n</context>\n\n<message>\n${redact(text).slice(0, 6000)}\n</message>`,
+      prompt: classifierPrompt(previous, context, redact(text).slice(0, 6000)),
       maxTokens: CLASSIFY_MAX_TOKENS,
       effort: 'low',
       timeoutMs: CLASSIFY_MS,
@@ -1055,12 +1072,80 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
       return { ok: false, why: 'empty-reply' }
     }
     const verdict = parseDecision(r.text)
-    if (verdict) return { ok: true, verdict }
+    if (verdict) {
+      if (!verdict.guard) return { ok: true, verdict }
+      await count($, session, c => ({ ...c, riskGuards: (c.riskGuards ?? 0) + 1 }))
+      return { ok: true, verdict: { ...verdict, reason: `${verdict.reason}${STR[lang].riskGuard}`.trim() } }
+    }
     // Masked whole before cutting, so a secret split by the cut is still caught.
     return { ok: false, why: 'unparseable', detail: redact(r.text).replace(/\s+/g, ' ').trim().slice(0, SNIPPET_CHARS) }
   } catch {
     return { ok: false, why: 'exception' }
   }
+}
+
+// The classifier call as classifyTier makes it: same model, effort, limits, masking and cut. The few-shot block is left
+// out so a replay measures the base prompt. Returns the raw text, or why there was none; never throws.
+async function replayCall($: EngineInterface, system: string, prompt: string): Promise<{ ok: true; raw: string; usage: Usage } | { ok: false; why: string; usage?: Usage }> {
+  try {
+    const r = await $.model.complete({ model: 'haiku', system, prompt, maxTokens: CLASSIFY_MAX_TOKENS, effort: 'low', timeoutMs: CLASSIFY_MS })
+    if (r.isAnswered) return { ok: true, raw: r.text, usage: r.usage }
+    if (r.reason === 'aborted') return { ok: false, why: 'timeout', usage: r.usage }
+    if (r.reason === 'api-error') return { ok: false, why: `api-error ${r.status ?? 'none'}`, usage: r.usage }
+    return { ok: false, why: 'empty-reply', usage: r.usage }
+  } catch {
+    return { ok: false, why: 'exception' }
+  }
+}
+
+// /model-router replay <path> [current|legacy|both]: the maintainer's instrument for fitting the tier bars. It runs the
+// real classifier call over a labelled file and writes what came back. It changes no routing state, count (other than the
+// spend), correction or band; the spend of all its calls is added to the meter once, as classifier cost, at the end.
+async function runReplay($: EngineInterface, session: Session, lang: Lang, rest: string): Promise<string> {
+  const str = STR[lang]
+  const args = parseReplayArgs(rest)
+  if (!args) return str.replayUsage
+  let text: string
+  try {
+    text = (await $.fs.read(args.path)) as string
+  } catch (err) {
+    return str.replayRefused(`cannot read ${args.path} (${String(err).slice(0, 120)})`)
+  }
+  if (await stillHere($, session) !== 'same') return str.replayCancelled
+  const file = parseReplayFile(text)
+  if (!file.ok) return str.replayRefused(file.why)
+  const jobs = file.items.flatMap(item => args.variants.map(variant => ({ item, variant })))
+  const rows: (ReplayRow | undefined)[] = new Array(jobs.length)
+  const spent: Usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  let next = 0
+  let cancelled = false
+  const worker = async () => {
+    while (!cancelled && next < jobs.length) {
+      const i = next++
+      const { item, variant } = jobs[i]!
+      const system = variant === 'legacy' ? legacyClassifierSystem(lang) : classifierSystem(lang)
+      const prompt = classifierPrompt(item.previous, redact(item.context), redact(item.message).slice(0, 6000))
+      const r = await replayCall($, system, prompt)
+      if (await stillHere($, session) !== 'same') { cancelled = true; return }
+      if (r.usage) for (const k of Object.keys(spent) as (keyof Usage)[]) spent[k] += r.usage[k] ?? 0
+      if (!r.ok) { rows[i] = replayRow(item.id, variant, { ok: false, raw: '', why: r.why }); continue }
+      const d = parseDecision(r.raw)
+      rows[i] = d
+        ? replayRow(item.id, variant, { ok: true, raw: r.raw, decision: d })
+        : replayRow(item.id, variant, { ok: false, raw: r.raw, why: 'unparseable' })
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(REPLAY_CONCURRENCY, jobs.length) }, worker))
+  await record($, session, 'claude-haiku-5-5', spent, false, true, 'classifier')
+  if (cancelled || await stillHere($, session) !== 'same') return str.replayCancelled
+  const done = rows.filter((r): r is ReplayRow => r !== undefined)
+  const out = replayOutPath(args.path)
+  try {
+    await $.fs.write(out, JSON.stringify(done, null, 2))
+  } catch (err) {
+    return str.replayRefused(`cannot write ${out} (${String(err).slice(0, 120)})`)
+  }
+  return replaySummary(done, args.variants, out, file.items.length)
 }
 
 function countFailure($: EngineInterface, session: Session, why: string): Promise<void> {
@@ -1495,7 +1580,8 @@ async function statsText($: EngineInterface, session: Session, lang: Lang, compa
       `${STR[lang].reductions(c.outputReductions ?? 0, c.outputCharsRemoved ?? 0)} ` +
       `Cache rewrites after the TTL (100k+ tokens): ${c.cacheExpiryRewrites ?? 0}, costing ${fmtUsd(c.cacheExpiryRewriteCost ?? 0)}. ` +
       `Routing corrections recorded: manual ${c.correctionsManual ?? 0} · escalate ${c.correctionsEscalate ?? 0}. ` +
-      `Unsure decisions steered to execute by weekly pacing: ${c.pacingSteered ?? 0}.`,
+      `Unsure decisions steered to execute by weekly pacing: ${c.pacingSteered ?? 0}. ` +
+      `Risk guard sent to decide: ${c.riskGuards ?? 0}.`,
     '',
     '_API-equivalent prices; work tokens are priced on Opus with switch writes priced as warm reads. Classification and availability probes add cost only. Another model would not use exactly the same tokens. Session records are retained for 30 days; legacy totals are included unchanged._',
   ].join('\n')
@@ -1940,6 +2026,16 @@ export const register: Register = (on, options) => {
         return { text: str.checkpointStarted }
       } finally {
         if (here(session)) checkpointRunning = false
+      }
+    }
+    if (/^replay(?:\s|$)/.test(arg)) {
+      if (runningMain !== null) return { text: str.replayBusy }
+      if (replayRunning) return { text: str.replayRunning }
+      replayRunning = true
+      try {
+        return { text: await runReplay($, session, lang, arg.slice('replay'.length)) }
+      } finally {
+        replayRunning = false
       }
     }
     if (arg === 'stats' || arg === '' || arg === 'status') {

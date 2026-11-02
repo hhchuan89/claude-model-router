@@ -54,8 +54,8 @@ shortcuts.
 | decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs, anything irreversible or outward-facing |
 
 1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
-   A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
-   picks the higher tier. The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
+   A short continuation ("yes", "继续") keeps the previous tier and a mix of tiers takes the highest. See "How the
+   classifier decides" below for how its answer becomes a tier. **An unsure verdict never downgrades**: after a
    higher-tier turn the previous tier stays (shown as "unsure: not downgrading"), a first turn never starts on lookup
    (it runs on Sonnet), and an unsure `general-purpose` subagent lookup runs on Sonnet instead of Haiku. Likely secrets
    are masked before classification. **A failed classification never downgrades**: the turn keeps the previous turn's
@@ -206,6 +206,23 @@ option is enabled. Pass `id` (the tool-use id), optionally `startLine` / `endLin
 (a literal, case-insensitive grep). Returned slices retain the original text and line endings. Each call is capped
 at `shrinkToolOutput` characters, including continuation instructions; use the returned `offset` with the same
 selection to page through long lines without losing characters. Stats count reductions and characters removed.
+
+## How the classifier decides
+
+The classifier does not name a tier. It gives the probability that each tier is the cheapest one that does the work
+well (the three add up to 1), and a separate `risk`: the probability that the message asks for or approves an
+irreversible or outward-facing action (deploy, push, merge, delete, production or shared data, money, a message to
+people). The router then decides:
+
+1. **Risk guard.** A risk of 0.7 or more goes to decide, whatever the tiers say. It can only raise a tier, and
+   `/model-router stats` counts it ("Risk guard sent to decide").
+2. **Per-tier bars.** The most likely tier is taken when its probability reaches its own bar: lookup 0.85, execute 0.60,
+   decide 0.30. Lookup has the highest bar because a wrong lookup is the dearest mistake.
+3. **Otherwise unsure.** The more capable of the two most likely tiers is taken, and the verdict is unsure, so
+   "unsure never downgrades" applies (see above), as does the weekly pacing steer for an unsure decide.
+
+These bars are provisional starting values. They are meant to be fitted on your own messages with the replay command
+(see Development).
 
 ## Details and history
 
@@ -416,6 +433,16 @@ rate, not its write rate, so a round trip no longer shows a saving that was not 
 claude plugin validate .
 claude plugin test .
 ```
+
+**Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both]` (default `both`)
+reads a JSON array of `{ "id", "message", "context", "previous" }` (`previous` is a tier or `null`; at most 500 items),
+sends each message to Haiku exactly as a live classification would (same model, effort, limits, masking and 6,000-character
+cut), and writes `<path without .json>.replay.json` with one row per item and variant: the masked start of the reply, then
+`p`, `risk`, `tier` and `sure` for `current` (the 1.2 prompt), or `legacyTier` and `legacySure` for `legacy` (the 1.1
+prompt, kept in `hooks/replay.ts`), or `why` when there was no usable reply. The corrections block is not used, so the
+base prompt is what is measured. At most 4 requests run at once; it refuses while a turn is running. It changes no
+routing state, count, correction or band: only the Haiku spend is added to the meter. It is not listed in the command's
+usage text.
 
 ## Contributors
 

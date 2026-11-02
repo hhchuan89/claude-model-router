@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-02
+
+1.2.0 changes how the classifier's answer becomes a tier: it now gives a probability for each tier and a separate risk
+score, and the router applies a bar per tier and a guard for irreversible or outward-facing requests. **The bars are
+provisional**: they are starting values, to be refitted from a `/model-router replay` over labelled messages in a later
+release.
+
+### Changed
+
+- The classifier returns `{"p":{"lookup","execute","decide"},"risk","reason"}` instead of one tier and `sure`. The two
+  prompt rules the bars replace ("when unsure, pick the higher tier" and the `sure` rule) are removed; the tier
+  definitions and the other rules are unchanged. A reply in the 1.1 shape still parses.
+- A tier is accepted when it is the most likely one and its probability reaches its own bar (lookup 0.85, execute 0.60,
+  decide 0.30). Otherwise the more capable of the top two is taken and the verdict is unsure, which as before never
+  moves work to a cheaper model. Subagent classification uses the same rule.
+
+### Added
+
+- Risk guard: a risk of 0.7 or more sends the request to decide, whatever its tier probabilities, and the reason ends
+  with "(irreversible or outward-facing)". It can only raise the tier. `/model-router stats` counts how often it fired.
+- `/model-router replay <path> [current|legacy|both]`, a maintainer tool for fitting the bars: it runs the real classifier
+  call over a JSON file of up to 500 messages, with the 1.2 prompt, the 1.1 prompt or both, and writes
+  `<path>.replay.json`. It changes no routing state; only its Haiku spend is added to the meter.
+
 ## [1.1.0] - 2026-11-02
 
 1.1.0 redesigns the band, adds a way to pin a model and teach the classifier from your corrections, weekly usage

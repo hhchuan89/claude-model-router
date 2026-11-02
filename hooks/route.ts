@@ -15,7 +15,13 @@ export type Lang = 'zh' | 'en'
 
 export function classifierSystem(lang: Lang): string {
   return `You route a developer's message to Claude Code (an AI coding agent) to the cheapest model that can do it well.
-Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}
+Return ONLY one JSON object:
+{"p":{"lookup":<0-1>,"execute":<0-1>,"decide":<0-1>},"risk":<0-1>,"reason":string}
+- p: your probability that each tier is the cheapest one that does the work well. The three add up to 1.
+  Be calibrated: 0.9 means you expect to be wrong about one time in ten.
+- risk: your probability that the message asks for, or approves, an irreversible or outward-facing action (deploy,
+  push, merge, delete, production or shared data, money, a message or comment to people).
+- reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.
 
 lookup (fast model): pure retrieval or mechanical work with nothing to judge — find/grep/list files, read and report a value
   or status, run a command the user named and report the output, rename, fix a typo, format, translate a short text,
@@ -36,11 +42,16 @@ Rules:
   except: approving a plan that was just made ("照这个做", "开始吧") is execute, because the plan settles what to do.
 - "Implement it", "add it to the PR", "commit the fixes" or "cherry-pick it" is execute when the context shows what to
   change (an approved plan, a spec, an exact instruction). When what to change still has to be worked out, it is decide.
-- If a message mixes tiers, use the highest one it contains.
-- When unsure between two tiers, pick the higher one.
-- sure: set false when the message is ambiguous, could reasonably be read at two tiers, or depends on context you cannot
-  see; otherwise true. An unsure verdict is never used to move work to a cheaper model.
-- reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.`
+- If a message mixes tiers, use the highest one it contains.`
+}
+
+// The user prompt of one classification: the same text the router and the replay command both send.
+export function classifierPrompt(previous: Tier | null, context: string, message: string): string {
+  return [
+    `<previous_tier>${previous ?? 'none'}</previous_tier>`,
+    `<context>\n${context || '(none)'}\n</context>`,
+    `\n<message>\n${message}\n</message>`,
+  ].join('\n')
 }
 
 // A reason longer than max is cut at a word boundary and marked with an ellipsis, so the band never shows a word
@@ -54,33 +65,102 @@ export function shorten(text: string, max: number): string {
   return `${cut.replace(/[\s,;:.\-—]+$/, '')}…`
 }
 
+const TIERS: Tier[] = ['lookup', 'execute', 'decide']
+const TIER_RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }
+
 function isTier(x: unknown): x is Tier {
   return x === 'lookup' || x === 'execute' || x === 'decide'
 }
 
+export type Probs = Record<Tier, number>
+// What one classifier reply says, plus the pick made from it. p and risk are absent for a reply in the 1.1 format
+// ({"tier","sure","reason"}), which already is a pick. guard says why the risk guard decided.
+export type Decision = { tier: Tier; reason: string; sure: boolean; p?: Probs; risk?: number; guard?: 'risk' }
+
+// Provisional: refit from a replay over labelled messages (/model-router replay). A tier is accepted outright when it is
+// the most likely one and its probability reaches its own bar; lookup is the dearest mistake to make, so its bar is highest.
+export const TIER_BARS: Probs = { lookup: 0.85, execute: 0.6, decide: 0.3 }
+// An irreversible or outward-facing request goes to decide when the classifier's risk reaches this.
+export const RISK_BAR = 0.7
+
+// The tier a calibrated reply asks for. The risk guard can only raise the tier. Otherwise the most likely tier (a tie goes
+// to the more capable one) is taken when it clears its bar; if not, the more capable of the top two is taken and the
+// pick is unsure, which settleTier never lets move work to a cheaper model.
+export function pickTier(p: Probs, risk: number, bars: Probs = TIER_BARS, riskBar: number = RISK_BAR): { tier: Tier; sure: boolean; guard?: 'risk' } {
+  if (risk >= riskBar) return { tier: 'decide', sure: true, guard: 'risk' }
+  const ranked = TIERS.slice().sort((a, b) => p[b] - p[a] || TIER_RANK[b] - TIER_RANK[a])
+  const top = ranked[0]!
+  if (p[top] >= bars[top]) return { tier: top, sure: true }
+  const second = ranked[1]!
+  return { tier: TIER_RANK[top] > TIER_RANK[second] ? top : second, sure: false }
+}
+
+const unit = (x: number) => Math.min(1, Math.max(0, x))
+
+// The reply's p, clamped to [0,1] and scaled to add up to 1. An absent tier counts as 0; a present one that is not a
+// number, or all zeros, makes the whole reply unreadable. A sum already 1 (within rounding) is left exactly as given,
+// so a boundary value such as 0.85 is not nudged by the division.
+function normaliseP(raw: unknown): Probs | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const o = raw as Record<string, unknown>
+  const p = { lookup: 0, execute: 0, decide: 0 }
+  for (const t of TIERS) {
+    const v = o[t]
+    if (v === undefined) continue
+    if (typeof v !== 'number' || !Number.isFinite(v)) return null
+    p[t] = unit(v)
+  }
+  const sum = p.lookup + p.execute + p.decide
+  if (!(sum > 0)) return null
+  if (Math.abs(sum - 1) < 1e-9) return p
+  return { lookup: p.lookup / sum, execute: p.execute / sum, decide: p.decide / sum }
+}
+
+const riskOf = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) ? unit(x) : 0)
+
+function calibrated(p: Probs, risk: number, reason: string): Decision {
+  return { ...pickTier(p, risk), reason, p, risk }
+}
+
 // Anything unreadable becomes null, and the caller falls back to execute.
-// sure defaults to true, so a reply in the old format (no "sure") still parses.
-// A reply cut off before its closing brace still carries the tier when that came first: it parses as unsure with
-// no reason, so it can never move work to a cheaper model.
-export function parseDecision(text: string): { tier: Tier; reason: string; sure: boolean } | null {
+// A reply in the 1.1 format ({"tier","sure","reason"}) still parses: sure defaults to true, so an older reply routes.
+// A reply cut off before its closing brace still carries its tier (or its p) when that came first: it parses as unsure
+// with no reason, so it can never move work to a cheaper model.
+export function parseDecision(text: string): Decision | null {
   const start = text.indexOf('{')
   if (start === -1) return null
   const end = text.lastIndexOf('}')
-  const truncated = (): { tier: Tier; reason: string; sure: boolean } | null => {
-    const m = /"tier"\s*:\s*"(lookup|execute|decide)"/.exec(text.slice(start))
+  const truncated = (): Decision | null => {
+    const tail = text.slice(start)
+    const pm = /"p"\s*:\s*(\{[^{}]*\})/.exec(tail)
+    if (pm) {
+      try {
+        const p = normaliseP(JSON.parse(pm[1]!))
+        if (p) {
+          const rm = /"risk"\s*:\s*([0-9.]+)\s*[,}]/.exec(tail)
+          const d = calibrated(p, rm ? riskOf(Number(rm[1])) : 0, '')
+          return d.guard ? d : { ...d, sure: false }
+        }
+      } catch { /* Fall through to the tier. */ }
+    }
+    const m = /"tier"\s*:\s*"(lookup|execute|decide)"/.exec(tail)
     return m ? { tier: m[1] as Tier, reason: '', sure: false } : null
   }
   if (end <= start) return truncated()
   try {
     const o = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
+    const reason = typeof o.reason === 'string' ? shorten(o.reason, 60) : ''
+    if (o.p !== undefined) {
+      const p = normaliseP(o.p)
+      return p ? calibrated(p, riskOf(o.risk), reason) : null
+    }
     if (!isTier(o.tier)) return null
-    return { tier: o.tier, reason: typeof o.reason === 'string' ? shorten(o.reason, 60) : '', sure: o.sure !== false }
+    return { tier: o.tier, reason, sure: o.sure !== false }
   } catch {
     return truncated()
   }
 }
 
-const TIER_RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }
 
 // Low confidence never downgrades: after a higher-tier turn the previous tier stays, and a first turn
 // never starts on lookup. A wrong guess upward costs cents; a wrong guess downward costs a failed turn.
