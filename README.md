@@ -17,15 +17,29 @@ This is an independent project and is not affiliated with TypeSafe AI or Jev.
 
 ![The router's band above the Claude Code prompt](docs/band.png)
 
-The screenshot is from an earlier version. The current band leads with the main context's estimated cost:
+The screenshot is from an earlier version. The band is two plain rows, and every word is meant to be understood without this README:
 
-`Opus · ctx 221.0k · ≈$0.044/step │ cold resume ≈$1.77 · cache warm ~38m`
+```
+⚙ Opus · medium — design work                                   [Details] [Pause router]
+  This reply $0.74 · Today $28.00, $8.94 less than all-Opus · Week 20% used
+```
 
-After the cache deadline it says what the next prompt would rewrite. Narrow terminals keep context and cold cost,
-dropping routing detail first. The route and same-token Opus comparison follow when there is room. These are
-API-equivalent estimates at the rates in `hooks/meter.ts`, not subscription charges. A resumed session without a
-request timestamp shows an unknown cache deadline. Weekly subscription usage and its reset time (local time) come
-directly from the engine's rate-limit windows; API-key sessions without a weekly window show none.
+Row 1 is what the router chose and why: `📌 Sonnet · medium — pinned, 2 more turns`, `📌 Haiku · medium — you chose it (#haiku)`,
+or `⚙ Opus · medium — kept on Opus: switching would re-read the whole conversation`. Row 2 is what it costs: this reply,
+today against the same work on Opus (API-equivalent estimates at the rates in `hooks/meter.ts`, not subscription
+charges), and the week's usage from the engine's rate-limit window (`, ahead of pace` is added only when you are ahead
+and pacing is not off). Only when it matters a third line appears above them: with a conversation of 100k tokens or more
+(`compactMinContext`), `⏳ Reply within 12 min to keep the conversation cached — after that the next reply costs ≈$2.38 more`
+in the last 15 minutes of the cache, and `⏳ The cache expired — your next reply re-reads 298k tokens (≈$2.38)` after it.
+Nothing is shown when the cache's age is unknown (after a reload).
+
+**Details** opens, in the same band, the last 5 replies (time, model and effort coloured by model, cost, a short reason and
+markers such as `(pinned)`, `(you chose)`, `(raised to Opus)`, `(cache expired)`, `(corrected)`), a small 7-day spend chart
+(bars with the dollar amount above each and a thin marker for the same work on Opus; a sparkline on the terminal) with
+`Last 7 days $763.57 · all-Opus would be $908.78`, and, with learning on, `Wrong model for the last reply? Should have been:
+[Haiku] [Sonnet] [Opus]`. Your choice (open or closed) is remembered. **Pause router** (or `/model-router off`) leaves
+every request on your own model; the band then says so and offers **Resume router**. No flow needs a command: they are
+shortcuts.
 
 ## How a turn is routed
 
@@ -189,16 +203,12 @@ option is enabled. Pass `id` (the tool-use id), optionally `startLine` / `endLin
 at `shrinkToolOutput` characters, including continuation instructions; use the returned `offset` with the same
 selection to page through long lines without losing characters. Stats count reductions and characters removed.
 
-## History
+## Details and history
 
-The band above the prompt stays the glance view: route, this turn and today against all-Opus, and nothing else.
-Details are on demand: `/model-router history` prints, in the transcript, the last 10 main turns of this session (time,
-model and effort coloured by model, cost, tokens, and markers for a cold cache, a warm cache that was kept, a pin or
-`#model`, a correction and the escalation trail, then the reason); a small 7-day spend chart (bars with the dollar amount
-above each, a thin marker for the same work at Opus prices; a text sparkline on the terminal) with a one-line total; and,
-with learning on, `Should have been: [lookup] [execute] [decide]` buttons for the last classified turn. The command's text
-(about 11 plain lines) is what the model reads; a surface that cannot draw the tree shows that text. Nothing is
-computed for it until you run the command, apart from a small per-turn record the router keeps for the last 50 main turns.
+The band's **Details** button (see above) is the place to look at recent replies, the week's spend and to tell the router
+it chose the wrong model. `/model-router history` prints the same replies and the week's total as about 11 lines of plain
+text in the transcript, for people who prefer a command. The router keeps a small record of the last 50 main turns of the
+session for both; nothing else is computed until you open Details or run the command.
 
 ## Pin and corrections
 
@@ -280,10 +290,10 @@ own effort. `stats` covers routed subagents only.
 - **Nothing else is collected.** No telemetry and no analytics. The router makes no network call of its own: the only
   traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
   the events log are written to local files only.
-- **Corrections (on by default).** `/model-router wrong`, the history buttons and a model-raising escalation store up to 40
+- **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store up to 40
   masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the newest 8 are sent to
   Haiku as part of every classifier call. Turn `learnFromCorrections` off to stop recording and sending, and run
-  `/model-router corrections clear` to delete what is stored. The history keeps no prompt text.
+  `/model-router corrections clear` to delete what is stored. The band and history keep no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
   also sends a one-word probe to check the model exists. With `reviewModel` empty, none of this happens.
@@ -291,11 +301,11 @@ own effort. `stats` covers routed subagents only.
 ## Cost comparison and commands
 
 Every model request (the router's own Haiku calls included) is priced at Anthropic API rates and added to the turn,
-the day and the retained totals. The baseline prices the same tokens on Opus 5.5. The band shows this turn and today;
+the day and the retained totals. The baseline prices the same tokens on Opus 5.5. The band shows this reply and today;
 `/model-router stats` first names whether the router is on and the compaction settings loaded by the plugin: idle
 minutes, context cap and `compactMinContext`. It then shows this session and today across sessions by main /
 subagents / classifier / reviewer / compaction and by cache reads / cache writes / uncached input / output.
-It also shows recorded compaction sizes, cold rewrites and peak main context. The band and stats label the comparison
+It also shows recorded compaction sizes, cache rewrites and peak main context. The band and stats label the comparison
 as a **difference**: another model would not necessarily use the same tokens. Older records without these categories
 are labelled as unattributed spend. The retained total covers 30 days plus legacy totals. Stats also show turns per
 tier, escalations, warm-cache keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus,
@@ -312,7 +322,7 @@ This is an estimate; see "Assumptions in the meter" below.
 | `/model-router checkpoint [note]` | Compact between tasks, preserving the information needed to continue |
 | `/model-router context` | Main context size and local category estimates, or an explicit unavailable message; makes no token-count requests |
 | `/model-router on` / `/model-router off` | Enable or disable routing and guards |
-| `/model-router history` | The last 10 turns of this session, a small 7-day spend chart and, with learning on, correction buttons, drawn in the transcript (see "History") |
+| `/model-router history` | The last 10 replies of this session and the 7-day total, as plain text (the band's Details button shows the same, with a chart and correction buttons) |
 | `/model-router pin <haiku\|sonnet\|opus> [turns]` / `/model-router unpin` | Hold the main conversation on one model for the next `turns` turns, or until unpinned (see "Pin and corrections") |
 | `/model-router wrong <lookup\|execute\|decide>` | Tell the router the last classified turn should have been that tier |
 | `/model-router corrections` / `/model-router corrections clear` | List the stored corrections, or delete them |
@@ -341,7 +351,7 @@ Requires Claude Code with function-hook plugins (early access; tested on 2.1.295
 ```
 
 Answer `y` to add the marketplace and pick a scope. Installed at user scope it also loads in Claude Code Desktop.
-**Disable router** in the band, or `/model-router off`, leaves every request on the session's model. To keep subagent routing
+**Pause router** in the band, or `/model-router off`, leaves every request on the session's model. To keep subagent routing
 but leave your own conversation alone, turn `mainRouting` off instead (see Options).
 
 ## Options

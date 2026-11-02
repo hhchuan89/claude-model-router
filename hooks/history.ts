@@ -60,8 +60,3 @@ export function barChartSvg(days: readonly DayCost[], width = 320, height = 66):
   })
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">${parts.join('')}</svg>`
 }
-
-// "opus · high (why)" as the trail stores it becomes "opus/high".
-export function trailStep(step: string): string {
-  return step.replace(/\s*\(.*\)$/, '').replace(/\s·\s/, '/')
-}

@@ -9,7 +9,7 @@ import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMP
 import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
-import { barChartSvg, chartAlt, hhmm, sparkline, trailStep } from '../hooks/history'
+import { barChartSvg, chartAlt, hhmm, sparkline } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
@@ -288,7 +288,7 @@ test('the running model escalates itself, and the next step follows; downgrades 
   expect(down.result).toContain('Not changed')
 
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /Haiku · medium → opus · medium \(要做设计决策\)/ })).toBeDefined()
+  expect(await ui.find({ text: /^⚙ Opus · medium — 找文件 \(raised from Haiku\)$/ })).toBeDefined()
 })
 
 test('Fable 5.1 never runs, not even in a subagent; other subagent models are left alone', async ($, on) => {
@@ -471,8 +471,7 @@ test('each step goes on the meter, shown in the band and in /model-router stats'
   seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /本轮 21\.2k tok · / })).toBeDefined()
-  expect(await ui.find({ text: /≈\$[\d.]+ \(\d+%\) 低于全 Opus/ })).toBeDefined()
+  expect(await ui.find({ text: /^本次回复 不足 \$0\.01 · 今天 不足 \$0\.01，比全程 Opus 少 \$0\.01$/ })).toBeDefined()
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('haiku')
   expect(r.text).toContain('same work tokens at Opus prices')
@@ -862,7 +861,7 @@ test('parallel subagent steps all land on the meter, and the turn includes the c
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('| sonnet | 5.0k |')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /本轮 5\.0k tok/ })).toBeDefined()
+  expect(await ui.find({ text: /^本次回复 \$0\.01 · / })).toBeDefined()
 })
 
 test('the band speaks English by default', async ($, on) => {
@@ -872,9 +871,7 @@ test('the band speaks English by default', async ($, on) => {
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /Haiku · medium — find files/ })).toBeDefined()
-  expect(await ui.find({ text: /turn 21\.2k tok · / })).toBeDefined()
-  expect(await ui.find({ text: /today 21\.2k tok · / })).toBeDefined()
-  expect(await ui.find({ text: /· ≈\$[\d.]+ \(\d+%\) below all-Opus$/ })).toBeDefined()
+  expect(await ui.find({ text: /^This reply under \$0\.01 · Today under \$0\.01, \$0\.01 less than all-Opus$/ })).toBeDefined()
   // The precise wording lives in /model-router stats, not in the band.
   expect(await ui.find({ text: /work tokens at Opus prices/ })).toBeUndefined()
 })
@@ -1070,7 +1067,7 @@ describe('classifier failures', () => {
     const seen = world($, on, [null, execute])
     await $.prompt.submit({ text: 'do the thing' } as never)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /classifier failed \(timeout\): session model/ })).toBeDefined()
+    expect(await ui.find({ text: /^⚙ your model — the router did not choose this turn \(timeout\)$/ })).toBeDefined()
     expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'session model' })
     // An unrouted turn gives the escalate tool nothing to change.
     const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)) as { result: string }
@@ -1204,8 +1201,7 @@ describe('mainRouting off (subagent-only mode)', () => {
     await step($, 't1')
     await $.prompt.submit({ text: 'second' } as never)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /turn 0 tok/ })).toBeDefined()
-    expect(await ui.find({ text: /today 21\.2k tok/ })).toBeDefined()
+    expect(await ui.find({ text: /^This reply \$0\.00 · Today \$0\.01/ })).toBeDefined()
   })
 
   test('on by default', async ($, on) => {
@@ -1228,7 +1224,8 @@ describe('the band without a route', () => {
     const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
     expect(texts.filter(t => t.trim() === '')).toEqual([])
     expect(texts.some(t => t.includes('⚙'))).toBe(true)
-    expect(await ui.find({ text: /today 21\.2k tok/ })).toBeDefined()
+    expect(await ui.find({ text: /^⚙ Router on for subagents only — your own model answers your messages$/ })).toBeDefined()
+    expect(await ui.find({ text: /^This reply \$0\.01 · Today \$0\.01/ })).toBeDefined()
     expect(await ui.find({ key: 'router-disable' })).toBeDefined()
   })
 
@@ -1547,8 +1544,9 @@ describe('phase 1 routing and meter fixes', () => {
       expect(seen.steps.at(-1)!.model).toContain(model)
       expect(seen.asked).toEqual(['haiku'])
       expect(seen.submits.at(-1)!.context?.[0]).toContain(`warm Opus cache abandoned, estimated round-trip rewrite ${cost}`)
+      // The band says the person chose the model; what that gives up is in the assignment above.
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: `warm Opus cache abandoned, estimated round-trip rewrite ${cost}` })).toBeDefined()
+      expect(await ui.find({ text: new RegExp(`^📌 ${model === 'haiku' ? 'Haiku' : 'Sonnet'} · medium — you chose it \\(#${model}\\)$`) })).toBeDefined()
       expect(await statsOf($)).toContain('Kept on a warm cache: 0')
     })
   }
@@ -1809,7 +1807,10 @@ describe('classifier skipped on a warm large Opus context (v0.8.2)', () => {
 })
 
 describe('cost exposure and session commands (1.0)', () => {
-  test('the band leads with main context, read cost, cold write cost and the send-time deadline', async ($, on) => {
+  // The one cache line the band shows: only for a big conversation, within 15 minutes of the cache expiring or after.
+  const cacheLine = async (ui: any) => ((await ui.find({ type: 'Text', text: /⏳/ })) as { text: string } | undefined)?.text
+
+  test('the band warns with the cost to re-read when the cache is about to expire, and again once it has', async ($, on) => {
     const seen = world($, on, decide)
     await $.prompt.submit({ text: 'choose #opus' } as never)
     seen.stepMs = 6 * 60_000
@@ -1817,11 +1818,13 @@ describe('cost exposure and session commands (1.0)', () => {
     await step($, 't1')
     await seen.clock.advance(16 * 60_000)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-    expect(texts[0]).toBe('Opus · ctx 221.0k · ≈$0.044/step │ cold resume ≈$1.77 · cache warm ~38m')
+    // The request went out at minute 0: 38 minutes of cache are left at minute 22.
+    expect(await cacheLine(ui)).toBeUndefined()
     expect(await ui.find({ text: /Opus · medium/ })).toBeDefined()
-    await seen.clock.advance(38 * 60_000)
-    expect(await ui.find({ text: /cache expired: next prompt rewrites ≈221.0k \(≈\$1.77\)/ })).toBeDefined()
+    await seen.clock.advance(28 * 60_000)
+    expect(await cacheLine(ui)).toBe('⏳ Reply within 10 min to keep the conversation cached — after that the next reply costs ≈$1.77 more')
+    await seen.clock.advance(10 * 60_000)
+    expect(await cacheLine(ui)).toBe('⏳ The cache expired — your next reply re-reads 221.0k tokens (≈$1.77)')
   })
 
   for (const model of ['haiku', 'sonnet', 'opus', 'fable'] as const) {
@@ -1830,12 +1833,13 @@ describe('cost exposure and session commands (1.0)', () => {
       await $.prompt.submit({ text: 'work' } as never)
       seen.usage.push(U(1000, 500, 220_000, 0, `claude-${model}-5-5`))
       await step($, 't1', `claude-${model}-5-5`)
-      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
       // 221k tokens at the official per-million rates (Haiku is over 100k, so its long-prompt write $1 and read $0.05).
       const expected: Record<string, [string, string]> = { haiku: ['$0.22', '0.011'], sonnet: ['$0.88', '0.022'], opus: ['$1.77', '0.044'], fable: ['$4.42', '0.055'] }
-      const [cold, read] = expected[model]!
-      expect(await ui.find({ text: `cold resume ≈${cold}` })).toBeDefined()
-      expect(await ui.find({ text: `≈$${read}/step` })).toBeDefined()
+      const [cold] = expected[model]!
+      // The cache of a conversation this size is gone an hour later; the notice prices the re-read at the model's rate.
+      await seen.clock.advance(61 * 60_000)
+      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await cacheLine(ui)).toBe(`⏳ The cache expired — your next reply re-reads 221.0k tokens (≈${cold})`)
     })
   }
 
@@ -1846,11 +1850,13 @@ describe('cost exposure and session commands (1.0)', () => {
     await step($, 't1')
     seen.usage.push(U(1000, 500, 9000, 0, 'claude-haiku-5-5'))
     await step($, 'a1', 'claude-haiku-5-5', 'agent-1')
+    await seen.clock.advance(61 * 60_000)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /Opus · ctx 221.0k/ })).toBeDefined()
+    // The Haiku subagent's small context does not replace the main conversation's 221k at Opus prices.
+    expect(await cacheLine(ui)).toBe('⏳ The cache expired — your next reply re-reads 221.0k tokens (≈$1.77)')
   })
 
-  test('a newer context measurement replaces request exposure without moving the cache deadline', async ($, on) => {
+  test('a newer context measurement replaces request exposure without moving the cache deadline', { options: { compactMinContext: 1 } }, async ($, on) => {
     const seen = world($, on, decide)
     on('session.model', async () => ({ value: 'claude-opus-5-5' }))
     await $.prompt.submit({ text: 'choose #opus' } as never)
@@ -1859,17 +1865,18 @@ describe('cost exposure and session commands (1.0)', () => {
     await seen.clock.advance(16 * 60_000)
     await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: 'Opus · ctx 60.0k · ≈$0.012/step │ cold resume ≈$0.48 · cache warm ~44m' })).toBeDefined()
+    expect(await cacheLine(ui)).toBeUndefined()
+    // The deadline is the request's, not the measurement's: it expires at minute 60 with the new, smaller size.
     await seen.clock.advance(44 * 60_000)
-    expect(await ui.find({ text: /cache expired: next prompt rewrites ≈60.0k \(≈\$0.48\)/ })).toBeDefined()
-    // The next request is newer than the rewind measurement, even though its cache deadline is separate.
+    expect(await cacheLine(ui)).toBe('⏳ The cache expired — your next reply re-reads 60.0k tokens (≈$0.48)')
+    // The next request is newer than the rewind measurement and its cache is warm again.
     seen.usage.push(U(1000, 500, 300_000))
     await step($, 't1')
-    expect(await ui.find({ text: /Opus · ctx 301.0k.*cold resume ≈\$2.41.*cache warm ~60m/ })).toBeDefined()
+    expect(await cacheLine(ui)).toBeUndefined()
   })
 
   for (const model of ['haiku', 'sonnet', 'opus', 'fable'] as const) {
-    test(`a measurement keeps the observed ${model} request prices in a different session model`, async ($, on) => {
+    test(`a measurement keeps the observed ${model} request prices in a different session model`, { options: { compactMinContext: 1 } }, async ($, on) => {
       const seen = world($, on, null)
       on('session.model', async () => ({ value: model === 'opus' ? 'sonnet' : 'opus' }))
       await $.prompt.submit({ text: 'find #haiku' } as never)
@@ -1880,22 +1887,22 @@ describe('cost exposure and session commands (1.0)', () => {
       await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
       const cost = fmtUsd(60_000 * PRICES[model].write / 1e6)
-      expect(await ui.find({ text: `cold resume ≈${cost} · cache warm ~44m` })).toBeDefined()
-      expect(await ui.find({ text: `≈$${(60_000 * PRICES[model].read / 1e6).toFixed(3)}/step` })).toBeDefined()
+      expect(await cacheLine(ui)).toBeUndefined()
       await seen.clock.advance(44 * 60_000)
-      expect(await ui.find({ text: `cache expired: next prompt rewrites ≈60.0k (≈${cost})` })).toBeDefined()
+      expect(await cacheLine(ui)).toBe(`⏳ The cache expired — your next reply re-reads 60.0k tokens (≈${cost})`)
     })
   }
 
-  test('a measurement uses the sent model when usage omits its model id', async ($, on) => {
+  test('a measurement uses the sent model when usage omits its model id', { options: { compactMinContext: 1 } }, async ($, on) => {
     const seen = world($, on, null)
     on('session.model', async () => ({ value: 'opus' }))
     await $.prompt.submit({ text: 'find #haiku' } as never)
     seen.usage.push({ ...U(1000, 500, 220_000), model: undefined })
     await step($, 't1')
     await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
+    await seen.clock.advance(61 * 60_000)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /Haiku · ctx 60.0k.*cold resume ≈\$0.01/ })).toBeDefined()
+    expect(await cacheLine(ui)).toBe('⏳ The cache expired — your next reply re-reads 60.0k tokens (≈$0.01)')
   })
 
   for (const fallback of ['unavailable', 'no tokens']) {
@@ -1909,16 +1916,17 @@ describe('cost exposure and session commands (1.0)', () => {
         seen.usage.push(U(1000, 500, 220_000))
         await step($, 't1')
         await $.session.measure({ context: { window: 1e6, tokens }, rateLimits: [], changed: ['context'] } as never)
-        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain(`ctx: ${tokens ? '60.0k' : '0'}`)
+        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain(`Conversation size: ${tokens ? '60.0k' : '0'}`)
         // A rate-limit-only update has no newer size to replace this reading with.
         await $.session.measure({ context: { window: 1e6 }, rateLimits: [], changed: ['rateLimits'] } as never)
-        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain(`ctx: ${tokens ? '60.0k' : '0'}`)
+        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain(`Conversation size: ${tokens ? '60.0k' : '0'}`)
         // A later request replaces the measurement, including its model for pricing.
         seen.usage.push(U(1000, 500, 300_000, 0, 'sonnet'))
         await step($, 't1')
-        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('ctx: 301.0k')
+        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 301.0k')
+        await seen.clock.advance(61 * 60_000)
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /Sonnet · ctx 301.0k.*cold resume ≈\$1.20/ })).toBeDefined()
+        expect(await cacheLine(ui)).toBe('⏳ The cache expired — your next reply re-reads 301.0k tokens (≈$1.20)')
       })
     }
   }
@@ -1931,8 +1939,10 @@ describe('cost exposure and session commands (1.0)', () => {
     await step($, 't1')
     await $.session.measure({ context: { window: 1e6, tokens: 100_000 }, rateLimits: [], changed: ['context'] } as never)
     await $.prompt.submit({ text: 'find #haiku' } as never)
+    // The person chose Haiku: what that gives up is in the assignment, and the band says they chose it.
+    expect(seen.submits.at(-1)!.context?.[0]).toMatch(/round.trip.*\$0.82/)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /round.trip.*\$0.82/ })).toBeDefined()
+    expect(await ui.find({ text: /^📌 Haiku · medium — you chose it \(#haiku\)$/ })).toBeDefined()
   })
 
   for (const tokens of [0, 100_000]) {
@@ -1950,35 +1960,20 @@ describe('cost exposure and session commands (1.0)', () => {
     })
   }
 
-  test('a narrow band keeps context and cold cost and drops routing detail first', async ($, on) => {
-    const seen = world($, on, decide)
-    await $.prompt.submit({ text: 'choose #opus' } as never)
-    seen.usage.push(U(1000, 500, 220_000))
-    await step($, 't1')
-    for (const bodyColumns of [95, 75, 40]) {
-      const ui = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: { ...(BAND_PROPS as {}), bodyColumns } as never })
-      const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-      expect(texts[0]).toContain('ctx 221.0k')
-      expect(texts[0]).toContain('cold resume ≈$1.77')
-      expect(texts.some(t => t.includes('medium'))).toBe(false)
-      expect(texts.some(t => t.includes('/step'))).toBe(bodyColumns >= 90)
-      expect(await ui.find({ key: 'router-disable' })).toBeDefined()
-    }
-  })
-
   test('a survey keeps the other band unchanged', async ($, on) => {
     world($, on, null)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: { ...(BAND_PROPS as {}), hasSurvey: true } as never })
     expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['other mods'])
   })
 
-  test('Chinese exposure and help use the language table', { options: { language: 'zh' } }, async ($, on) => {
+  test('the Chinese notice and help use the language table', { options: { language: 'zh' } }, async ($, on) => {
     const seen = world($, on, decide)
     await $.prompt.submit({ text: 'choose #opus' } as never)
     seen.usage.push(U(1000, 500, 220_000))
     await step($, 't1')
+    await seen.clock.advance(61 * 60_000)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /上下文 221.0k.*冷恢复 ≈\$1.77.*缓存仍热/ })).toBeDefined()
+    expect(await cacheLine(ui)).toBe('⏳ 缓存已过期——下一条回复将重新读取 221.0k 个 token（约 $1.77）')
     const help = await $.command.run({ command: 'model-router', args: 'help' } as never)
     expect(help.text).toContain('用法：/model-router stats | status | context | checkpoint [备注] | on | off')
     expect(await ui.find({ key: 'router-disable' })).toBeDefined()
@@ -2056,7 +2051,7 @@ describe('cost exposure and session commands (1.0)', () => {
       const r = await $.command.run({ command: 'model-router', args: 'context' } as never)
       expect(requests).toHaveLength(1)
       expect(requests[0]).toMatchObject({ breakdown: 'summary' })
-      expect(r.text).toContain('ctx: 221.0k')
+      expect(r.text).toContain('Conversation size: 221.0k')
       expect(r.text).toContain(breakdown ? 'Messages: ≈200.0k' : 'No local breakdown available.')
       expect(seen.asked).toEqual([])
     })
@@ -2066,7 +2061,7 @@ describe('cost exposure and session commands (1.0)', () => {
     const seen = world($, on, null)
     on('session.usage', async () => ({ deny: 'unavailable' }))
     const r = await $.command.run({ command: 'model-router', args: 'context' } as never)
-    expect(r.text).toContain('上下文尚无读数')
+    expect(r.text).toContain('对话大小尚无读数')
     expect(r.text).toContain('无本地分类数据。')
     expect(seen.asked).toEqual([])
   })
@@ -2095,15 +2090,17 @@ describe('cost exposure and session commands (1.0)', () => {
     expect(text).toContain('**Today**: 6.5k tokens')
   })
 
-  test('a resumed context without a request timestamp has prices but no invented cache deadline', async ($, on) => {
+  test('a resumed context without a request timestamp has no invented cache deadline', async ($, on) => {
     world($, on, null)
     on('session.model', async () => ({ value: 'claude-sonnet-5-5' }))
     await $.session.measure({ context: { window: 1e6, tokens: 221_000 }, rateLimits: [], changed: ['context'] } as never)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /Sonnet · ctx 221.0k.*cold resume ≈\$0.88.*cache deadline unknown/ })).toBeDefined()
+    // A resumed conversation has a size but no send time: the band guesses nothing.
+    expect(await cacheLine(ui)).toBeUndefined()
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text).join(' ')).not.toMatch(/unknown/)
   })
 
-  test('new measurements while off replace stale exposure without inventing a send time', async ($, on) => {
+  test('new measurements while paused replace the stale size without inventing a send time', async ($, on) => {
     const seen = world($, on, decide)
     on('session.model', async () => ({ value: 'claude-sonnet-5-5' }))
     await $.prompt.submit({ text: 'choose #opus' } as never)
@@ -2112,8 +2109,11 @@ describe('cost exposure and session commands (1.0)', () => {
     await $.command.run({ command: 'model-router', args: 'off' } as never)
     await $.session.measure({ context: { window: 1e6, tokens: 300_000 }, rateLimits: [], changed: ['context'] } as never)
     const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await ui.find({ text: /Sonnet · ctx 300.0k.*cold resume ≈\$1.20.*cache deadline unknown/ })).toBeDefined()
+    expect(await cacheLine(ui)).toBeUndefined()
+    expect(await ui.find({ text: /^⚙ Router paused — your own model answers every turn$/ })).toBeDefined()
     expect(await ui.find({ key: 'router-enable' })).toBeDefined()
+    // The new reading is the conversation's size for the next notice and for the context command.
+    expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 300.0k')
   })
 
   test('phase 1 rewrite counters remain visible in session and daily breakdowns', async ($, on) => {
@@ -2123,8 +2123,8 @@ describe('cost exposure and session commands (1.0)', () => {
       [`counts:${day}:sess-2`]: { cacheExpiryRewrites: 3 },
     } })
     const text = await statsOf($)
-    expect(text.split('**Today**')[0]).toContain('Cold rewrites counted: 2')
-    expect(text.split('**Today**')[1]).toContain('Cold rewrites counted: 5')
+    expect(text.split('**Today**')[0]).toContain('Cache rewrites counted: 2')
+    expect(text.split('**Today**')[1]).toContain('Cache rewrites counted: 5')
   })
 
   test('role and token-kind costs sum to spend; merge retains peaks and sizes', async () => {
@@ -2259,7 +2259,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(lists).toBe(1)
         expect(totals).toBe(failed === 'totals' ? 2 : 1)
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /today 1.0M tok/ })).toBeDefined()
+        // The loaded day (a million Haiku tokens, long-prompt rates) is what Today shows.
+        expect(await ui.find({ text: / Today \$0\.50/ })).toBeDefined()
         await measure()
         expect(scans).toBe(failed === 'history' ? 2 : 1)
         expect(totals).toBe(failed === 'totals' ? 2 : 1)
@@ -2400,7 +2401,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
         failing = false
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /ctx 100/ })).toBeDefined()
+        expect(await ui.find({ text: /^This reply / })).toBeDefined()
       })
 
       test(`turn.complete returns normally when shape store.${operation} throws`, { options: { checkpointHints: true } }, async ($, on) => {
@@ -2501,7 +2502,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(result).toMatchObject({ changed })
       expect(failures).toBe(1)
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: /ctx 60.0k/ })).toBeDefined()
+      expect(await ui.find({ text: /^This reply / })).toBeDefined()
       expect(await ui.find({ text: /other mods/ })).toBeDefined()
     })
 
@@ -2518,7 +2519,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         failing = true
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
         expect(failures).toBe(1)
-        expect(await ui.find({ text: /turn 0 tok/ })).toBeDefined()
+        expect(await ui.find({ text: /^This reply \$0\.00 · / })).toBeDefined()
         expect(await ui.find({ text: /other mods/ })).toBeDefined()
       })
     }
@@ -2846,7 +2847,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await step($, 't2')
       expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: /turn 150 tok/ })).toBeDefined()
+      expect(await ui.find({ text: /^This reply under \$0\.01 · / })).toBeDefined()
       await seen.clock.advance(20 * MIN)
       expect(c.instructions).toHaveLength(0)
     })
@@ -2912,7 +2913,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         retainState(on)
         const seen = world($, on, null, { store })
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /turn 0 tok.*today 450 tok/ })).toBeDefined()
+        expect(await ui.find({ text: /^This reply \$0\.00 · Today / })).toBeDefined()
         await $.prompt.submit({ text: 'work after reload' } as never)
         expect(seen.prompts[0]).toContain('<previous_tier>none</previous_tier>')
         await step($, 't3')
@@ -2980,7 +2981,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         await old
         expect(seen.statuses.at(-1)).toBe('idle compact in 20m')
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /ctx 190.0k/ })).toBeDefined()
+        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 190.0k')
         expect(await ui.find({ text: /Sonnet · medium/ })).toBeDefined()
         const raised = await $.tool.call({ tool: 'mcp__model-router__escalate', agent: replacementAgent, model: 'sonnet', reason: 'more work' } as never)
         expect(raised.result).toContain('now runs sonnet')
@@ -3079,7 +3080,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
             expect(day).toContain(`same work tokens at Opus prices (switch-adjusted): ${fmtUsd(today.baseline)}`)
           }
           const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-          expect(await ui.find({ text: new RegExp(`turn 0 tok.*today .*${fmtUsd(today.cost).replace('$', '\\$')}`) })).toBeDefined()
+          expect(await ui.find({ text: new RegExp(`^This reply \\$0\\.00 · Today ${fmtUsd(today.cost).replace('$', '\\$')}`) })).toBeDefined()
         })
       }
     }
@@ -3142,10 +3143,10 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
           expect(c.instructions).toHaveLength(0)
           expect(seen.statuses.at(-1)).toBeUndefined()
           const status = await $.command.run({ command: 'model-router', args: 'status' } as never)
-          expect(status.text).toContain('Cache deadline: unavailable')
+          expect(status.text).toContain('Cache expires: unavailable')
           expect(status.text).toContain('Pending: none')
           const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-          expect(await ui.find({ text: /ctx 250.0k/ })).toBeUndefined()
+          expect(await ui.find({ text: /⏳/ })).toBeUndefined()
           // A warm Opus context from the old conversation must not skip this classifier.
           const classified = seen.asked.length
           await $.prompt.submit({ text: 'find a file' } as never)
@@ -3196,7 +3197,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
           expect(JSON.stringify(seen.store)).toBe(before)
           expect(Object.keys(seen.store).some(key => key.endsWith(':sess-2'))).toBe(false)
           const status = await $.command.run({ command: 'model-router', args: 'status' } as never)
-          expect(status.text).toContain('Cache deadline: unavailable')
+          expect(status.text).toContain('Cache expires: unavailable')
           expect(await statsOf($)).toContain('**This session**: 0 tokens')
           expect(c.toasts.filter(text => text.includes('compacted'))).toEqual([])
         })
@@ -3276,7 +3277,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(replace).toBe(false)
         expect(seen.statuses.at(-1)).toBe('idle compact in 20m')
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /Opus · ctx 180.0k/ })).toBeDefined()
+        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 180.0k')
         const tally = seen.store[`meter:${storeDay(0)}:sess-2`] as Tally
         expect(tally.byRole?.compaction).toBeUndefined()
         expect(tally.compactions ?? []).toEqual([])
@@ -3860,7 +3861,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(slow).toBe(true)
         expect(armed).toBe(0)
         expect(c.instructions).toHaveLength(path === 'cap retry' ? 1 : 0)
-        expect(c.toasts.at(-1)).toBe('Compaction skipped: cache deadline passed')
+        expect(c.toasts.at(-1)).toBe('Compaction skipped: the cache has expired')
       })
     }
   })
@@ -4773,7 +4774,9 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       model = 'haiku'
       await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: /Haiku · ctx 60.0k.*cold resume ≈\$0.01.*cache deadline unknown/ })).toBeDefined()
+      // The installed summary has no send time: the band says nothing about the cache rather than guess.
+      expect(await ui.find({ text: /⏳|unknown/ })).toBeUndefined()
+      expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 60.0k')
     })
 
     for (const kind of ['idle', 'cap']) {
@@ -4815,7 +4818,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         // Installing a summary forgets the timestamp, but keeps the request's price family.
         await $.session.measure({ context: { window: 1e6, tokens: 40_000 }, rateLimits: [], changed: ['context'] } as never)
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /Haiku · ctx 40.0k.*cold resume ≈<\$0.01.*cache deadline unknown/ })).toBeDefined()
+        expect(await ui.find({ text: /⏳|unknown/ })).toBeUndefined()
+        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 40.0k')
       })
     }
 
@@ -4848,12 +4852,13 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await seen.clock.advance(MIN)
       expect(seen.statuses.at(-1)).toBe('idle compact in 35m')
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: /cache warm ~40m/ })).toBeDefined()
+      // 40 minutes of cache are left: too early to warn.
+      expect(await ui.find({ text: /⏳/ })).toBeUndefined()
       expect(c.instructions).toEqual([])
       wallTime = 61 * MIN
       await seen.clock.advance(MIN)
       expect(seen.statuses.at(-1)).toBe('idle compact in 0m')
-      expect(await ui.find({ text: /cache expired: next prompt rewrites/ })).toBeDefined()
+      expect(await ui.find({ text: /^⏳ The cache expired/ })).toBeDefined()
     })
 
     test('the idle countdown advances, lists its deadlines and clears on a held prompt', { options: { idleCompactMinutes: 20 } }, async ($, on) => {
@@ -4865,8 +4870,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(seen.statuses.at(-1)).toBe('idle compact in 8m')
       const r = await $.command.run({ command: 'model-router', args: 'status' } as never)
       expect(r.text).toContain('Pending: idle compact in 8m')
-      expect(r.text).toContain('Cache deadline: 1970-01-01T01:00:00.000Z')
-      expect(r.text).toContain('Compaction safe deadline: 1970-01-01T00:57:00.000Z')
+      expect(r.text).toContain('Cache expires: 1970-01-01T01:00:00.000Z')
+      expect(r.text).toContain('Compact before: 1970-01-01T00:57:00.000Z')
       await $.prompt.submit({ text: 'back' } as never)
       expect(seen.statuses.at(-1)).toBeUndefined()
     })
@@ -4941,14 +4946,14 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       const messages = [{ role: 'user', text: 'summary', toolUses: [] }]
       await $.session.compact({ trigger: 'precompute', messages } as never)
       await $.session.compact({ agentId: 'agent-1', messages } as never)
-      expect(await ui.find({ text: /Opus · ctx 221.0k/ })).toBeDefined()
+      expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 221.0k')
       await $.session.compact({ messages } as never)
       const text = await statsOf($)
       expect(text.split('221.0k → 31.0k')).toHaveLength(3)
       expect(text.split('| Compaction | 4.5k |')).toHaveLength(3)
-      expect(await ui.find({ text: /Opus · ctx 31.0k.*cold resume ≈\$0.25.*cache deadline unknown/ })).toBeDefined()
+      expect(await ui.find({ text: /⏳|unknown/ })).toBeUndefined()
       const context = await $.command.run({ command: 'model-router', args: 'context' } as never)
-      expect(context.text).toContain('ctx: 31.0k')
+      expect(context.text).toContain('Conversation size: 31.0k')
       expect(context.text).toContain('No local breakdown available.')
     })
 
@@ -4979,7 +4984,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         }
         expect(after.compactions ?? []).toEqual([])
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-        expect(await ui.find({ text: /Opus · ctx 221.0k/ })).toBeDefined()
+        expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 221.0k')
       })
     }
 
@@ -5012,7 +5017,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
           }
           expect(after.compactions ?? []).toEqual([])
           const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-          expect(await ui.find({ text: /Opus · ctx 221.0k/ })).toBeDefined()
+          expect((await $.command.run({ command: 'model-router', args: 'context' } as never)).text).toContain('Conversation size: 221.0k')
         })
       }
     }
@@ -5029,7 +5034,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await seen.clock.advance(0)
       expect(c.instructions).toEqual([])
       expect(seen.statuses.at(-1)).toBeUndefined()
-      expect(c.toasts).toEqual(['Compaction skipped: cache deadline passed'])
+      expect(c.toasts).toEqual(['Compaction skipped: the cache has expired'])
       await seen.clock.advance(60 * MIN)
       expect(c.toasts).toHaveLength(1)
     })
@@ -5067,7 +5072,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       }
       expect(seen.statuses.at(-1)).toBeUndefined()
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: /Opus · ctx 31.0k.*cold resume ≈\$0.25.*cache deadline unknown/ })).toBeDefined()
+      expect(await ui.find({ text: /⏳|unknown/ })).toBeUndefined()
     })
 
     test('cold rewrite counts appear in this session and today without changing the same-token comparison', async ($, on) => {
@@ -5076,7 +5081,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       seen.usage.push(U(1000, 500, 0, 221_000))
       await step($, 't1')
       const text = await statsOf($)
-      expect(text.split('Cold rewrites counted: 1')).toHaveLength(3)
+      expect(text.split('Cache rewrites counted: 1')).toHaveLength(3)
       expect(text).toContain('same work tokens at Opus prices')
     })
 
@@ -6514,10 +6519,6 @@ describe('history helpers (1.1.0)', () => {
     expect(narrow.match(/<rect x="[^"]*" y="[^"]*" width="[^"]*" height="[^"]*" rx="2"/g)).toHaveLength(2)
     expect(chartAlt(days)).toBe('Spend over the last 2 days: $3.00, against $12 for the same work tokens at Opus prices.')
   })
-
-  test('a trail step is shortened to model/effort', async () => {
-    expect(trailStep('opus · high (the design turned out to need a call)')).toBe('opus/high')
-  })
 })
 
 describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
@@ -6865,11 +6866,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
     })
   })
 
-  describe('history', () => {
-    // A history row is drawn from the snapshot its command took, found by the text the command printed.
-    const mountHistory = async ($: any, surface: 'terminal' | 'desktop', args = 'history') =>
-      $.ui.mount({ plugin: 'model-router', surface, component: 'CommandOutput', props: { command: 'model-router', args, text: args === 'history' ? await cmd($, 'history') : 'x', isErrored: false } } as never)
-    // The turn a classified lookup ran as: one cold Haiku request.
+  describe('history command (text only)', () => {
     async function lookupTurn($: any, seen: Seen, text: string, turnId: string) {
       await $.prompt.submit({ text } as never)
       seen.usage.push(U(1000, 500, 0, 150_000, 'claude-haiku-5-5'))
@@ -6877,19 +6874,19 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.turn.complete(completion(turnId))
     }
 
-    test('the command text is short plain lines: the last turns, then the week total', async ($, on) => {
+    test('plain rows: time, model and effort, cost, what happened, then the week total', async ($, on) => {
       const seen = world($, on, LOOKUP)
       await lookupTurn($, seen, 'find every TODO in the repo', 't1')
-      const text = await cmd($, 'history')
-      const lines = text.split('\n')
+      const lines = (await cmd($, 'history')).split('\n')
       expect(lines).toHaveLength(2)
-      expect(lines[0]).toMatch(/^\d\d:\d\d Haiku·medium \$\d+\.\d\d · 151\.5k · cold — find/)
-      expect(lines[1]).toMatch(/^7 days \$\d+\.\d\d · all-Opus \$\d+\.\d\d$/)
+      expect(lines[0]).toMatch(/^\d\d:\d\d {2}Haiku · medium {2}\$\d+\.\d\d \(cache expired\) — find/)
+      expect(lines[1]).toMatch(/^Last 7 days \$\d+\.\d\d · all-Opus would be \$\d+\.\d\d$/)
+      expect(lines.join('\n')).not.toMatch(/ctx|cold|deadline|switch-adjusted|work tokens/)
     })
 
-    test('an empty session says so, and the text never has more than 10 turn rows plus the total', async ($, on) => {
+    test('an empty session says so, and the text is never longer than 10 turns plus the total', async ($, on) => {
       world($, on, LOOKUP)
-      expect((await cmd($, 'history')).split('\n')[0]).toBe('No routed turns in this session yet.')
+      expect((await cmd($, 'history')).split('\n')[0]).toBe('No replies routed in this session yet.')
       for (let i = 1; i <= 12; i++) {
         await $.prompt.submit({ text: `job ${i} #haiku` } as never)
         await $.turn.complete(completion(`t${i}`))
@@ -6897,192 +6894,369 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect((await cmd($, 'history')).split('\n')).toHaveLength(11)
     })
 
-    test('the 7-day total in the text is the sum of the retained days', async ($, on) => {
+    test('the week total is the retained days summed', async ($, on) => {
       const seen = world($, on, LOOKUP)
       await lookupTurn($, seen, 'find files', 't1')
-      const total = (await cmd($, 'history')).split('\n').at(-1)!
-      expect(total).toContain(`7 days ${fmtUsd(seen.tally!.cost)}`)
+      expect((await cmd($, 'history')).split('\n').at(-1)).toContain(`Last 7 days ${fmtUsd(seen.tally!.cost)}`)
     })
+  })
 
-    for (const surface of ['terminal', 'desktop'] as const) {
-      test(`the tree lists the turn and the week with a one-line total (${surface})`, async ($, on) => {
-        const seen = world($, on, LOOKUP)
-        await lookupTurn($, seen, 'find every TODO in the repo', 't1')
-        const ui = await mountHistory($, surface)
-        expect(await ui.find({ type: 'Text', text: /^Haiku·medium$/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /\$\d+\.\d\d · 151\.5k · cold — find/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /^7 days \$\d+\.\d\d · all-Opus \$\d+\.\d\d$/ })).toBeDefined()
-        if (surface === 'desktop') {
-          const svg = await ui.find({ type: 'Svg' } as never)
-          expect(svg).toBeDefined()
-        } else {
-          expect(await ui.find({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]{7}$/ })).toBeDefined()
-        }
-        await ui.unmount()
-      })
+  describe('band (1.1.0)', () => {
+    const mountBand = ($: any, surface: 'terminal' | 'desktop' = 'desktop') =>
+      $.ui.mount({ plugin: 'model-router', surface, component: 'AbovePrompt', props: BAND_PROPS })
+    const SONNET_TURN = U(100_000, 10_000, 0, 0, 'claude-sonnet-5-5')
+    const texts = async (band: any) => (await band.findAll({ type: 'Text' })).map((x: any) => x.text as string)
+    // A big Opus conversation last used at minute 0 of the mock clock (its cache runs 60 minutes from there).
+    async function bigConversation($: any, seen: Seen, context = 298_000, text = 'work #opus') {
+      await $.prompt.submit({ text } as never)
+      seen.usage.push(U(1000, 500, context - 1000))
+      await step($, 't1')
     }
 
-    test('any other model-router command keeps the engine row', async ($, on) => {
-      world($, on, LOOKUP)
-      on('ui.render', { component: 'CommandOutput' }, async ($$: any, e: any) => {
-        const { Text } = $$.ui.resolve(e)
-        return <Text>engine row</Text>
+    describe('collapsed', () => {
+      test('two plain rows: what the router chose, and what it costs; only Details and Pause router', async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
+        seen.usage.push(SONNET_TURN)
+        await step($, 't1')
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^⚙ Haiku · medium — find$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^This reply \$0\.30 · Today \$0\.30, \$0\.30 less than all-Opus$/ })).toBeDefined()
+        const buttons = (await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)
+        expect(buttons).toEqual(['Details', 'Pause router'])
+        expect((await texts(band)).join(' ')).not.toMatch(/ctx|cold resume|deadline|unknown|\bstep\b|switch-adjusted|work tokens/)
+        // Nothing of the details is there.
+        expect(await band.find({ type: 'Text', text: /Last 7 days/ })).toBeUndefined()
+        await band.unmount()
       })
-      for (const args of ['stats', '', 'status', 'pacing']) {
-        const ui = await mountHistory($, 'terminal', args)
-        expect(await ui.find({ type: 'Text', text: /engine row/ })).toBeDefined()
-        expect(await ui.find({ type: 'Text', text: /all-Opus/ })).toBeUndefined()
-        await ui.unmount()
-      }
-    })
 
-    test('the row marks a forced turn, a pin and the turn\'s own escalation', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      await $.prompt.submit({ text: 'quick #haiku' } as never)
-      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'needs code' } as never)
-      await $.turn.complete(completion('t1'))
-      await cmd($, 'pin opus 1')
-      await $.prompt.submit({ text: 'pinned' } as never)
-      await $.turn.complete(completion('t2'))
-      const ui = await mountHistory($, 'terminal')
-      expect(await ui.find({ type: 'Text', text: /→ sonnet\/medium · forced/ })).toBeDefined()
-      expect(await ui.find({ type: 'Text', text: /📌 pinned — pinned \(1 left\)/ })).toBeDefined()
-      expect(seen.store.corrections).toBeUndefined()
-      await ui.unmount()
-    })
+      test('a cost under a cent and a comparison against all-Opus that goes the other way say so in words', async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        // Only the classifier ran: it costs something and has no Opus baseline.
+        await $.prompt.submit({ text: 'find files' } as never)
+        void seen
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^This reply under \$0\.01 · Today under \$0\.01, under \$0\.01 more than all-Opus$/ })).toBeDefined()
+        await band.unmount()
+      })
 
-    for (const surface of ['terminal', 'desktop'] as const) {
-      test(`correction buttons hide the tier the turn had, and pressing one records it (${surface})`, async ($, on) => {
+      test('the week shows only when the engine reports one, and "ahead of pace" only when pacing says so and is not off', async ($, on) => {
         const seen = world($, on, LOOKUP)
         ui($, on)
-        await $.prompt.submit({ text: 'rename the helper' } as never)
+        await $.prompt.submit({ text: 'find files' } as never)
+        let band = await mountBand($)
+        expect((await texts(band)).join(' ')).not.toContain('Week')
+        await band.unmount()
+        await weekly($, seen, 20, 0.5)
+        band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /· Week 20% used$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /ahead of pace/ })).toBeUndefined()
+        await band.unmount()
+        await weekly($, seen, 80, 0.5)
+        band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /· Week 80% used$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^, ahead of pace$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('pacing off never shows "ahead of pace"', { options: { weeklyPacing: 'off' } }, async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        ui($, on)
+        await weekly($, seen, 80, 0.5)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /Week 80% used/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /ahead of pace/ })).toBeUndefined()
+        await band.unmount()
+      })
+
+      test('a fresh session, before any message, says what the router will do', async ($, on) => {
+        world($, on, LOOKUP)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^⚙ The router picks a model for each message you send$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('the Chinese band uses plain Chinese words too', { options: { language: 'zh' } }, async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        await $.prompt.submit({ text: 'find files' } as never)
+        seen.usage.push(SONNET_TURN)
+        await step($, 't1')
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^本次回复 \$0\.30 · 今天 \$0\.30，比全程 Opus 少 \$0\.30$/ })).toBeDefined()
+        expect((await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)).toEqual(['详情', '暂停路由器'])
+        await band.unmount()
+      })
+    })
+
+    describe('route row', () => {
+      test('a pin: the model, then how long it lasts', async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        await cmd($, 'pin sonnet 2')
+        await $.prompt.submit({ text: 'do the thing' } as never)
+        seen.usage.push(U(1000, 500, 20_000, 0, 'claude-sonnet-5-5'))
+        await step($, 't1')
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^📌 Sonnet · medium — pinned, 1 more turn$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      // WHY: a pin set after a classified route must not make that route look pinned.
+      test('a pin set while the last route is not pinned says what the next reply will use', async ($, on) => {
+        world($, on, LOOKUP)
+        await $.prompt.submit({ text: 'find files' } as never)
+        await cmd($, 'pin opus 3')
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^📌 Opus · medium — pinned for the next 3 replies$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /Haiku/ })).toBeUndefined()
+        await band.unmount()
+      })
+
+      test('a #model in the message says you chose it', async ($, on) => {
+        world($, on, LOOKUP)
+        await $.prompt.submit({ text: 'quick look #haiku' } as never)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^📌 Haiku · medium — you chose it \(#haiku\)$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('a turn kept on the bigger model says why in words', async ($, on) => {
+        const seen = world($, on, '{"tier":"execute","reason":"implement"}')
+        await $.prompt.submit({ text: 'seed #opus' } as never)
+        seen.usage.push(U(1000, 500, 20_000))
+        await step($, 't1')
+        await $.prompt.submit({ text: 'implement the change' } as never)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^⚙ Opus · medium — kept on Opus: switching would re-read the whole conversation$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('an unrouted turn says the router did not choose it, and why in a word', async ($, on) => {
+        world($, on, null)
+        await $.prompt.submit({ text: 'do the thing' } as never)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^⚙ your model — the router did not choose this turn \(timeout\)$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('a turn raised by the model names where it started', async ($, on) => {
+        world($, on, LOOKUP)
+        await $.prompt.submit({ text: 'look at the auth flow' } as never)
+        await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^⚙ Opus · medium — find \(raised from Haiku\)$/ })).toBeDefined()
+        await band.unmount()
+      })
+    })
+
+    describe('paused', () => {
+      test('one row and a Resume router button; pressing it brings the band back', async ($, on) => {
+        world($, on, LOOKUP)
+        await cmd($, 'off')
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^⚙ Router paused — your own model answers every turn$/ })).toBeDefined()
+        expect((await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)).toEqual(['Resume router'])
+        expect(await band.find({ type: 'Text', text: /This reply/ })).toBeUndefined()
+        await band.press({ key: 'router-enable' })
+        expect(await band.find({ type: 'Text', text: /^⚙ The router picks a model/ })).toBeDefined()
+        await band.unmount()
+      })
+    })
+
+    describe('cache notice', () => {
+      // 15 minutes or less of warm cache on a conversation of 298k tokens (≈$2.38 to re-read) is worth a warning.
+      for (const [elapsed, shown, text] of [
+        [44, false, ''], [44.5, false, ''], [45, true, /^⏳ Reply within 15 min to keep the conversation cached — after that the next reply costs ≈\$2\.38 more$/],
+        [59, true, /^⏳ Reply within 1 min to keep the conversation cached/], [59.5, true, /^⏳ Reply within 1 min/],
+      ] as [number, boolean, RegExp | ''][]) {
+        test(`warm with ${60 - elapsed} minutes left ${shown ? 'warns' : 'says nothing'}`, async ($, on) => {
+          const seen = world($, on, decide)
+          await bigConversation($, seen)
+          await seen.clock.advance(elapsed * 60_000)
+          const band = await mountBand($)
+          if (shown) expect(await band.find({ type: 'Text', text: text as RegExp })).toBeDefined()
+          else expect(await band.find({ type: 'Text', text: /⏳/ })).toBeUndefined()
+          await band.unmount()
+        })
+      }
+
+      test('an expired cache says the next reply re-reads the conversation', async ($, on) => {
+        const seen = world($, on, decide)
+        await bigConversation($, seen)
+        await seen.clock.advance(61 * 60_000)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /^⏳ The cache expired — your next reply re-reads 298\.0k tokens \(≈\$2\.38\)$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('a small conversation is not worth a warning, warm or expired', async ($, on) => {
+        const seen = world($, on, decide)
+        await bigConversation($, seen, 50_000)
+        for (const minutes of [50, 70]) {
+          await seen.clock.advance((minutes - (minutes === 50 ? 0 : 50)) * 60_000)
+          const band = await mountBand($)
+          expect(await band.find({ type: 'Text', text: /⏳/ })).toBeUndefined()
+          await band.unmount()
+        }
+      })
+
+      test('the minimum context option sets what counts as big', { options: { compactMinContext: 400_000 } }, async ($, on) => {
+        const seen = world($, on, decide)
+        await bigConversation($, seen)
+        await seen.clock.advance(50 * 60_000)
+        const band = await mountBand($)
+        expect(await band.find({ type: 'Text', text: /⏳/ })).toBeUndefined()
+        await band.unmount()
+      })
+
+      // WHY: after a reload nothing says how old the cache is; guessing would be worse than silence.
+      test('an unknown cache age never shows a warning or the word unknown', async ($, on) => {
+        world($, on, decide)
+        await $.session.measure({ context: { window: 1e6, tokens: 300_000 }, rateLimits: [], changed: ['context'] } as never)
+        const band = await mountBand($)
+        expect((await texts(band)).join(' ')).not.toMatch(/⏳|unknown|expired/)
+        await band.unmount()
+      })
+    })
+
+    describe('details', () => {
+      async function opened($: any, surface: 'terminal' | 'desktop' = 'terminal') {
+        const band = await mountBand($, surface)
+        await band.press({ key: 'band-details' })
+        return band
+      }
+      async function lookupTurn($: any, seen: Seen, text: string, turnId: string) {
+        await $.prompt.submit({ text } as never)
+        seen.usage.push(U(1000, 500, 0, 150_000, 'claude-haiku-5-5'))
+        await step($, turnId)
+        await $.turn.complete(completion(turnId))
+      }
+
+      test('Details opens the last replies, the week and a footer; Hide details closes them again', async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        await lookupTurn($, seen, 'find every TODO in the repo', 't1')
+        const band = await opened($)
+        expect(await band.find({ type: 'Text', text: /^Haiku · medium$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^\$\d+\.\d\d \(cache expired\) — find$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^Last 7 days \$\d+\.\d\d · all-Opus would be \$\d+\.\d\d$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^\/model-router for stats, settings and commands$/ })).toBeDefined()
+        expect(await band.find({ type: 'Button', text: 'Hide details' } as never)).toBeDefined()
+        await band.press({ key: 'band-details' })
+        expect(await band.find({ type: 'Text', text: /Last 7 days/ })).toBeUndefined()
+        await band.unmount()
+      })
+
+      test('without replies it says so, and shows at most the last 5', async ($, on) => {
+        world($, on, LOOKUP)
+        let band = await opened($)
+        expect(await band.find({ type: 'Text', text: /^No replies routed in this session yet\.$/ })).toBeDefined()
+        await band.unmount()
+        for (let i = 1; i <= 7; i++) {
+          await $.prompt.submit({ text: `job ${i} #haiku` } as never)
+          await $.turn.complete(completion(`t${i}`))
+        }
+        band = await mountBand($)
+        expect(await band.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(5)
+        await band.unmount()
+      })
+
+      for (const [surface, drawn] of [['desktop', 'svg'], ['terminal', 'sparkline']] as const) {
+        test(`the week is a ${drawn} (${surface})`, async ($, on) => {
+          const seen = world($, on, LOOKUP)
+          await lookupTurn($, seen, 'find files', 't1')
+          const band = await opened($, surface)
+          if (drawn === 'svg') expect(await band.find({ type: 'Svg' } as never)).toBeDefined()
+          else expect(await band.find({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]{7}$/ })).toBeDefined()
+          await band.unmount()
+        })
+      }
+
+      test('markers are spelled out: you chose, pinned, raised, and the reason is dropped where the marker says it', async ($, on) => {
+        world($, on, LOOKUP)
+        await $.prompt.submit({ text: 'quick #haiku' } as never)
+        await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'needs code' } as never)
         await $.turn.complete(completion('t1'))
-        const hist = await mountHistory($, surface)
-        expect(await hist.find({ key: 'wrong-decide' })).toBeDefined()
-        expect(await hist.find({ key: 'wrong-execute' })).toBeDefined()
-        expect(await hist.find({ key: 'wrong-lookup' })).toBeUndefined()
-        await hist.press({ key: 'wrong-decide' })
-        expect((seen.store.corrections as Correction[])[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
-        await hist.unmount()
+        await cmd($, 'pin opus 1')
+        await $.prompt.submit({ text: 'pinned' } as never)
+        await $.turn.complete(completion('t2'))
+        const band = await opened($)
+        expect(await band.find({ type: 'Text', text: /^<?(under )?\$[\d.]+ \(you chose\) \(raised to Sonnet\)$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /\(pinned\)$/ })).toBeDefined()
+        await band.unmount()
       })
-    }
 
-    test('with learning off there are no correction buttons', { options: { learnFromCorrections: false } }, async ($, on) => {
-      world($, on, LOOKUP)
-      await $.prompt.submit({ text: 'rename the helper' } as never)
-      await $.turn.complete(completion('t1'))
-      const hist = await mountHistory($, 'desktop')
-      expect(await hist.find({ key: 'wrong-decide' })).toBeUndefined()
-      expect(await hist.find({ type: 'Text', text: /^Haiku·medium$/ })).toBeDefined()
-      await hist.unmount()
-    })
-
-    // WHY: a row in the transcript is what the model read; later turns and redraws must not change it.
-    test('a history row stays a snapshot: more turns and a redraw change neither its rows nor its button target', async ($, on) => {
-      const seen = world($, on, [LOOKUP, LOOKUP, LOOKUP])
-      ui($, on)
-      await $.prompt.submit({ text: 'rename the helper' } as never)
-      await $.turn.complete(completion('t1'))
-      const old = await mountHistory($, 'terminal')
-      expect(await old.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(1)
-      await seen.clock.advance(5 * 60_000)
-      await $.prompt.submit({ text: 'list the files' } as never)
-      await $.turn.complete(completion('t2'))
-      await seen.clock.advance(5 * 60_000)
-      await $.prompt.submit({ text: 'show the config' } as never)
-      await $.turn.complete(completion('t3'))
-      // A redraw (the pin command asks for one) re-runs the hook for the old row.
-      await cmd($, 'pin opus 1')
-      expect(await old.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(1)
-      expect(await old.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(0)}\\)`) })).toBeDefined()
-      await old.press({ key: 'wrong-decide' })
-      expect((seen.store.corrections as Correction[]).map(c => c.text)).toEqual(['rename the helper'])
-      await old.unmount()
-    })
-
-    test('a row whose text no history printed keeps the engine row, and an old lifetime\'s rows too', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      on('ui.render', { component: 'CommandOutput' }, async ($$: any, e: any) => {
-        const { Text } = $$.ui.resolve(e)
-        return <Text>engine row</Text>
+      test('the choice is remembered: stored once, read once, and used by the next session', async ($, on) => {
+        let reads = 0
+        on('store.get', { key: 'bandExpanded' }, async (_$: unknown, e: any, next: any) => {
+          reads++
+          return next(e)
+        })
+        const seen = world($, on, LOOKUP)
+        const band = await mountBand($, 'terminal')
+        await band.press({ key: 'band-details' })
+        expect(seen.store.bandExpanded).toBe(true)
+        for (let i = 0; i < 5; i++) await cmd($, 'pin opus 1')
+        expect(reads).toBe(1)
+        await band.unmount()
       })
-      await $.prompt.submit({ text: 'find files' } as never)
-      await $.turn.complete(completion('t1'))
-      const text = await cmd($, 'history')
-      // A new session forgets what the old rows were drawn from.
-      seen.sessionId = 'sess-2'
-      await $.prompt.submit({ text: 'in the new session' } as never)
-      const hist = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'CommandOutput', props: { command: 'model-router', args: 'history', text, isErrored: false } } as never)
-      expect(await hist.find({ type: 'Text', text: /engine row/ })).toBeDefined()
-      await hist.unmount()
+
+      test('a stored choice opens the band without a click', async ($, on) => {
+        world($, on, LOOKUP, { store: { bandExpanded: true } })
+        const band = await mountBand($, 'terminal')
+        expect(await band.find({ type: 'Text', text: /^\/model-router for stats/ })).toBeDefined()
+        await band.unmount()
+      })
     })
 
-    test('the buttons target a turn among the rows shown, and none when no shown turn is correctable', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      ui($, on)
-      await $.prompt.submit({ text: 'rename the helper' } as never)
-      await $.turn.complete(completion('t1'))
-      // Ten forced turns push the one classified turn out of the ten shown.
-      for (let i = 2; i <= 11; i++) {
-        await $.prompt.submit({ text: `job ${i} #haiku` } as never)
-        await $.turn.complete(completion(`t${i}`))
+    describe('wrong model buttons', () => {
+      async function classifiedLookup($: any, text = 'rename the helper') {
+        await $.prompt.submit({ text } as never)
+        await $.turn.complete(completion('t1'))
+        const band = await mountBand($, 'terminal')
+        await band.press({ key: 'band-details' })
+        return band
       }
-      const hist = await mountHistory($, 'terminal')
-      expect(await hist.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(10)
-      expect(await hist.find({ key: 'wrong-decide' })).toBeUndefined()
-      expect(seen.store.corrections).toBeUndefined()
-      await hist.unmount()
-    })
 
-    test('the tree lists the last 10 turns of the 50 kept', async ($, on) => {
-      world($, on, LOOKUP)
-      for (let i = 1; i <= 52; i++) {
-        await $.prompt.submit({ text: `job ${i} #haiku` } as never)
-        await $.turn.complete(completion(`t${i}`))
-      }
-      const hist = await mountHistory($, 'terminal')
-      expect(await hist.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(10)
-      await hist.unmount()
+      test('they are labelled by model, hide the one the reply had, and each maps to its tier', async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        const band = await classifiedLookup($)
+        expect(await band.find({ type: 'Text', text: /^Wrong model for the last reply\? Should have been:$/ })).toBeDefined()
+        expect((await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)).toEqual(['Hide details', 'Pause router', 'Sonnet', 'Opus'])
+        await band.press({ key: 'wrong-execute' })
+        expect((seen.store.corrections as Correction[]).at(-1)).toMatchObject({ routed: 'lookup', right: 'execute', source: 'manual' })
+        await band.unmount()
+      })
+
+      test('Opus means decide, and the band thanks the person in place of the buttons', async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        const band = await classifiedLookup($)
+        await band.press({ key: 'wrong-decide' })
+        expect((seen.store.corrections as Correction[]).at(-1)).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
+        expect(await band.find({ type: 'Text', text: /^Thanks — the router will use this$/ })).toBeDefined()
+        expect(await band.find({ key: 'wrong-decide' })).toBeUndefined()
+        expect(await band.find({ type: 'Text', text: /Wrong model/ })).toBeUndefined()
+        await band.unmount()
+      })
+
+      test('with learning off there is no question', { options: { learnFromCorrections: false } }, async ($, on) => {
+        world($, on, LOOKUP)
+        const band = await classifiedLookup($)
+        expect(await band.find({ type: 'Text', text: /Wrong model/ })).toBeUndefined()
+        expect(await band.find({ key: 'wrong-decide' })).toBeUndefined()
+        await band.unmount()
+      })
+
+      test('a forced turn has nothing to correct', async ($, on) => {
+        world($, on, LOOKUP)
+        await $.prompt.submit({ text: 'quick #haiku' } as never)
+        await $.turn.complete(completion('t1'))
+        const band = await mountBand($, 'terminal')
+        await band.press({ key: 'band-details' })
+        expect(await band.find({ type: 'Text', text: /Wrong model/ })).toBeUndefined()
+        await band.unmount()
+      })
     })
   })
 
-  describe('band wording (1.1.0)', () => {
-    // WHY: the band is the glance view: a pin shows as a marker before the model, and nothing else is added to its rows.
-    // WHY: a pin set after a classified route must not look like that route was pinned.
-    test('a pin set while the route is not pinned shows in front of it, as the narrow layout does', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      await $.prompt.submit({ text: 'find files' } as never)
-      seen.usage.push(U(1000, 500, 20_000, 0, 'claude-haiku-5-5'))
-      await step($, 't1')
-      await cmd($, 'pin opus 3')
-      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await band.find({ text: /^📌 Opus \(3\) │ Haiku · medium — find$/ })).toBeDefined()
-      expect(await band.find({ text: /^📌 Haiku/ })).toBeUndefined()
-    })
-
-    test('a saving under a cent reads <$0.01, not ≈<$0.01', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      await $.prompt.submit({ text: 'do the thing #sonnet' } as never)
-      seen.usage.push(U(1000, 500, 20_000, 0, 'claude-sonnet-5-5'))
-      await step($, 't1')
-      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await band.find({ text: /· <\$0\.01 \(\d+%\) below all-Opus$/ })).toBeDefined()
-      expect(await band.find({ text: /≈</ })).toBeUndefined()
-    })
-
-    test('an active pin puts a marker before the model, and the meter says it in plain words', async ($, on) => {
-      const seen = world($, on, LOOKUP)
-      await cmd($, 'pin sonnet 2')
-      await $.prompt.submit({ text: 'do the thing' } as never)
-      seen.usage.push(U(1000, 500, 20_000, 0, 'claude-sonnet-5-5'))
-      await step($, 't1')
-      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await band.find({ text: /^📌 Sonnet · medium — pinned \(2 left\)$/ })).toBeDefined()
-      expect(await band.find({ text: /^turn 21\.5k tok · <\$0\.01 {3}today 21\.5k tok · <\$0\.01 · <\$0\.01 \(50%\) below all-Opus$/ })).toBeDefined()
-      // Only the enable/disable button.
-      expect((await band.findAll({ type: 'Button' } as never))).toHaveLength(1)
-    })
-  })
 
   describe('steered turns (1.1.0 review)', () => {
     // WHY: a steered turn's tier is pacing's choice; a correction would teach Haiku "routed execute" for a decide verdict.
@@ -7100,37 +7274,36 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
   })
 
   describe('review fixes (1.1.0)', () => {
-    const mountHist = async ($: any) =>
-      $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'CommandOutput', props: { command: 'model-router', args: 'history', text: await cmd($, 'history'), isErrored: false } } as never)
+    const openBand = async ($: any) => {
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+      if (!(await band.find({ key: 'band-details' }))) throw new Error('no Details button')
+      if ((await band.find({ text: /^Hide details$/ })) === undefined && (await band.find({ type: 'Button', text: 'Details' } as never)) !== undefined) await band.press({ key: 'band-details' })
+      return band
+    }
     const STEER = { options: { weeklyPacing: 'steer' } }
 
     // WHY: the buttons must correct the turn whose time they show, not whichever turn is latest when pressed.
-    test('history targets the latest correctable turn, skips a newer steered one, and a press hits exactly that turn', STEER, async ($, on) => {
+    test('the band targets the latest correctable turn, skips a newer steered one, and a press hits exactly that turn', STEER, async ($, on) => {
       const seen = world($, on, [LOOKUP, '{"tier":"decide","sure":false,"reason":"maybe"}', LOOKUP])
       ui($, on)
       await $.prompt.submit({ text: 'rename the helper' } as never)
       await $.turn.complete(completion('t1'))
-      await seen.clock.advance(5 * 60_000)
       await weekly($, seen, 82, 0.5)
       await $.prompt.submit({ text: 'think about the design' } as never)
       expect(route(seen, 1)).toContain('assigned to sonnet')
       await $.turn.complete(completion('t2'))
-      let hist = await mountHist($)
-      // The first turn ran at minute 0 and the steered one at minute 5: the label is the first turn's time.
-      expect(await hist.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(0)}\\)`) })).toBeDefined()
-      expect(await hist.find({ key: 'wrong-decide' })).toBeDefined()
-      await hist.unmount()
-      // A newer correctable turn completes; the next history shows it, and a press corrects exactly that turn.
-      await seen.clock.advance(5 * 60_000)
+      let band = await openBand($)
+      // The newest turn is steered, so the buttons are for the first one.
+      expect(await band.find({ key: 'wrong-decide' })).toBeDefined()
+      await band.unmount()
       await $.prompt.submit({ text: 'list the files' } as never)
       await $.turn.complete(completion('t3'))
-      hist = await mountHist($)
-      expect(await hist.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(10 * 60_000)}\\)`) })).toBeDefined()
-      await hist.press({ key: 'wrong-decide' })
+      band = await openBand($)
+      await band.press({ key: 'wrong-decide' })
       const stored = seen.store.corrections as Correction[]
       expect(stored).toHaveLength(1)
       expect(stored[0]!.text).toBe('list the files')
-      await hist.unmount()
+      await band.unmount()
     })
 
     test('a steer does not leak into later routing: an unsure execute after it is held at decide as without a steer', STEER, async ($, on) => {
@@ -7203,12 +7376,11 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       // A turn with no person prompt continues the route within the cache window.
       await $.turn.start({ text: 'task notification', turnId: 't2' } as never)
       await $.turn.complete(completion('t2'))
-      const hist = await mountHist($)
-      const rows = (await hist.findAll({ type: 'Text', text: /^<?\$\d/ })).map((x: any) => x.text)
-      expect(rows).toHaveLength(2)
-      expect(rows[0]).toContain('→ sonnet/medium')
-      expect(rows[1]).not.toContain('→ sonnet')
-      await hist.unmount()
+      const band = await openBand($)
+      // Only the first turn was raised; the inherited one carries no earlier escalation or cache keep.
+      expect(await band.findAll({ type: 'Text', text: /raised to Sonnet/ })).toHaveLength(1)
+      expect(await band.findAll({ type: 'Text', text: /kept on/ })).toHaveLength(0)
+      await band.unmount()
     })
   })
 })

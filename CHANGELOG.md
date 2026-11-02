@@ -5,21 +5,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [1.1.0] - 2026-11-02
 
-1.1.0 adds `/model-router history`, a way to pin a model and teach the classifier from your corrections, weekly usage
-pacing, and a corrected price table. The band above the prompt stays three rows; details are on demand. Pin and
+1.1.0 redesigns the band, adds a way to pin a model and teach the classifier from your corrections, weekly usage
+pacing, and a corrected price table. The band above the prompt is two plain rows; details open with a click. Pin and
 corrections can be switched off or left idle (`learnFromCorrections`, `weeklyPacing`), and with both off the router
 routes and prompts exactly as 1.0.1 does.
 
 ### Added
 
-- `/model-router history`: the last 10 main turns of the session (time, model and effort coloured by model, cost,
-  tokens, cold-cache, kept-cache, pin or forced, correction and escalation markers, reason), a small 7-day spend chart
-  (SVG with the dollar amount above each bar and an Opus-priced marker; a sparkline on the terminal) with a one-line
-  total, and, with learning on, correction buttons. It draws inline in the transcript; its text is about 11 plain lines.
+- A plainer band. Two rows (what the router chose and why, and `This reply $0.74 · Today $28.00, $8.94 less than all-Opus ·
+  Week 20% used`), a **Details** button that opens the last 5 replies, a small 7-day chart with its total, and `Wrong model for
+  the last reply? Should have been: [Haiku] [Sonnet] [Opus]` buttons (with learning on), and **Pause router** / **Resume
+  router**. The choice to show details is remembered. A third line appears only when it matters: `⏳ Reply within 12 min to
+  keep the conversation cached …` in the last 15 minutes of a large conversation's cache, or `⏳ The cache expired …` after
+  it; an unknown cache age says nothing. No flow needs a command.
+- `/model-router history`: the same replies and the week's total as about 11 lines of plain text.
 - `/model-router pin <haiku|sonnet|opus> [turns]` and `/model-router unpin`: hold the main conversation on a model like a
   `#model` in every message, counted down when the turn starts (`pinned (n left)` counts the turn being started). The band
   shows `📌` before the model.
-- Learning from corrections: `/model-router wrong <tier>`, the history buttons, or the model escalating itself above the
+- Learning from corrections: `/model-router wrong <tier>`, the band's buttons, or the model escalating itself above the
   classified tier's model store the masked prompt snippet (up to 40, 200 characters each); the newest 8 are added to the
   classifier prompt for the main thread and subagents. `/model-router corrections [clear]` lists or deletes them; stats
   count them. Option `learnFromCorrections` (on by default); see Privacy.
@@ -31,8 +34,8 @@ routes and prompts exactly as 1.0.1 does.
 
 ### Changed
 
-- The band's meter row says it in plain words: `turn 1.9M tok · $0.74   today 12.2M tok · $10.94 · ≈$3.51 (24%) below all-Opus`.
-  The exact wording (work tokens at Opus prices, switch-adjusted) stays in `/model-router stats`.
+- The band no longer shows the context size, cold-resume cost, step cost or cache deadline; those words are also gone from
+  `/model-router context` and `status` (now "Conversation size", "Cache expires", "Compact before").
 - The command hint and usage line list the new subcommands (the old ones come first, unchanged).
 
 ### Fixed

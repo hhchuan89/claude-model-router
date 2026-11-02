@@ -10,7 +10,7 @@ import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
 import type { PaceMode } from './pace'
-import { barChartSvg, chartAlt, hhmm, lastDays, sparkline, trailStep } from './history'
+import { barChartSvg, chartAlt, hhmm, lastDays, sparkline } from './history'
 import type { DayCost } from './history'
 import { redact } from './redact'
 import type { Lang } from './route'
@@ -57,8 +57,10 @@ const PROBE_EVERY_MS = 24 * 3600 * 1000
 // The verdict is a JSON object with a tier, a confidence and a reason; 120 tokens cut it off mid-reply.
 const CLASSIFY_MAX_TOKENS = 300
 const SNIPPET_CHARS = 120
-// The turns /model-router history lists.
+// The turns /model-router history lists (text only).
 const HISTORY_ROWS = 10
+// The turns the expanded band lists.
+const BAND_ROWS = 5
 const MAX_TURNS = 50
 const PACE_DAYS = 7
 
@@ -137,11 +139,12 @@ let turnCold = false
 let turnBase = { tokens: 0, cost: 0 }
 // An inherited turn's route already carries earlier escalations: its own start at this many trail steps.
 let turnTrailBase = 0
-// What each /model-router history row was drawn from, by the exact text it printed: a row in the transcript stays what
-// the model read, however many turns come after it. Newest HISTORY_KEPT only.
-type HistorySnapshot = { shown: TurnRecord[]; series: DayCost[]; target?: TurnRecord }
-const histories = new Map<string, HistorySnapshot>()
-const HISTORY_KEPT = 20
+// The seven days behind the expanded band, cached by day and latest turn: no store scan per redraw.
+let weekCache: { day: string; key: string; series: DayCost[] } | undefined
+// Whether the band shows its details; a per-person choice, kept in the store (read with the other preferences).
+let bandExpanded = false
+// The turn a correction was just recorded for: the band thanks the person in place of the buttons.
+let thanks: string | undefined
 // A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
 const REWRITE_MIN_TOKENS = 100_000
 // A cache read below this on a request with no earlier one in this process means the cache was cold.
@@ -201,11 +204,7 @@ const STR = {
     forced: '你在消息里指定了模型',
     abandoned: (cost: string) => `放弃 Opus 热缓存，预计往返重写 ${cost}`,
     warmSkip: '大上下文缓存仍热：跳过分类',
-    off: 'Model router 已关闭',
     review: '决策审查',
-    kept: '保缓存',
-    turn: '本轮',
-    today: '今日',
     idleCompacted: (size: string) => `空闲压缩：已压缩 ${size} 上下文（缓存仍热）`,
     capCompacted: (size: string) => `上下文达到上限：已压缩 ${size}`,
     checkpointCompacted: (size: string) => `任务检查点：已压缩 ${size}`,
@@ -227,19 +226,13 @@ const STR = {
     fetchMore: (offset: number) => `\n[输出已截断；使用相同范围和 offset ${offset} 继续获取。]`,
     weekly: '每周',
     resets: '重置',
-    ctx: '上下文',
-    step: '步',
-    cold: '冷恢复',
-    warm: (n: number) => `缓存仍热 ~${n}分钟`,
-    expired: (size: string,
-    cost: string) => `缓存已过期：下次提示重写 ≈${size}（≈${cost}）`,
-    unknownContext: '上下文尚无读数',
-    unknownCache: '缓存期限未知',
+    ctx: '对话大小',
+    unknownContext: '对话大小尚无读数',
     idleIn: (n: number) => `空闲压缩将在 ${n} 分钟后执行`,
     capIn: '上下文上限压缩待执行',
     waiting: (n: number) => n < 0 ? '空闲压缩等待：无法确认代理状态' : `空闲压缩等待 ${n} 个代理`,
     skipped: (why: string) => `已跳过压缩：${why}`,
-    deadlinePassed: '缓存安全期限已过',
+    deadlinePassed: '缓存已过期',
     agentsBusy: '代理仍忙碌',
     agentUnavailable: '无法确认代理状态',
     routerOff: '路由已关闭',
@@ -274,27 +267,49 @@ const STR = {
     pacingNoWindow: '没有每周用量窗口',
     paceAhead: (x: string) => ` · 节奏 ${x} 超前`,
     paceToast: (used: string, x: string, steer: boolean) => `每周用量 ${used}%，节奏 ${x}，超过均匀消耗。${steer ? '未确定的决策将改用 Sonnet。' : ''}`,
-    histNone: '本会话还没有路由记录。',
-    histTotal: (cost: string, base: string) => `7 天 ${cost} · 全 Opus ${base}`,
-    below: '低于全 Opus',
-    above: '高于全 Opus',
-    shouldBe: '应为：',
-    tagCold: '冷',
-    tagKept: '保缓存',
-    tagPinned: '固定',
-    tagForced: '指定',
-    tagCorrected: '纠正',
-    sessionRow: '会话模型',
+    histNone: '本会话还没有路由过的回复。',
+    paused: '路由器已暂停——每一轮都由你自己的模型回答',
+    details: '详情',
+    hideDetails: '收起详情',
+    bandIdle: '路由器会为你发送的每条消息选择模型',
+    bandSubagents: '路由器只负责子代理——你的消息由你自己的模型回答',
+    pinnedMore: (left?: number) => left === undefined ? '已固定，直到你取消' : left === 0 ? '已固定' : `已固定，还有 ${left} 轮`,
+    pinWaiting: (left?: number) => left === undefined ? '已固定，直到你取消' : `已固定，接下来 ${left} 条回复使用`,
+    youChose: (m: string) => `你指定了它（#${m}）`,
+    keptOn: (m: string) => `保持 ${m}：切换会重新读取整个对话`,
+    raisedFrom: (m: string) => `由 ${m} 升级`,
+    unrouted: (why: string) => `路由器没有为这一轮选择模型${why ? `（${why}）` : ''}`,
+    thisReply: '本次回复',
+    todayWord: '今天',
+    week: (pct: string) => `本周已用 ${pct}%`,
+    aheadOfPace: '，进度偏快',
+    lessThan: (usd: string) => `比全程 Opus 少 ${usd}`,
+    moreThan: (usd: string) => `比全程 Opus 多 ${usd}`,
+    underCent: '不足 $0.01',
+    comma: '，',
+    cacheSoon: (min: number, extra: string) => `⏳ 请在 ${min} 分钟内回复以保持对话缓存——之后下一条回复将多花约 ${extra}`,
+    cacheGone: (size: string, cost: string) => `⏳ 缓存已过期——下一条回复将重新读取 ${size} 个 token（约 ${cost}）`,
+    wrongAsk: '上一条回复的模型不对？应该是：',
+    thanks: '谢谢——路由器会参考这一条',
+    footer: '/model-router 查看统计、设置和命令',
+    raisedTo: (m: string) => `（升级到 ${m}）`,
+    histTotal: (cost: string, base: string) => `近 7 天 ${cost} · 全程 Opus 则为 ${base}`,
+    tagCold: '（缓存已过期）',
+    tagKept: (m: string) => `（保持 ${m}）`,
+    tagPinned: '（已固定）',
+    tagForced: '（你指定）',
+    tagCorrected: '（已纠正）',
+    sessionRow: '你的模型',
     enabled: '启用',
     disabled: '关闭',
-    enable: '启用路由',
-    disable: '关闭路由',
+    enable: '恢复路由器',
+    disable: '暂停路由器',
     session: '本会话',
     settings: '当前设置',
     pending: '待执行',
     none: '无',
-    deadline: '缓存期限',
-    safeDeadline: '压缩安全期限',
+    deadline: '缓存到期时间',
+    safeDeadline: '最晚压缩时间',
     lastSkip: '上次跳过',
     unavailable: '无读数',
     categories: '本地估算分类（≈token）',
@@ -303,7 +318,7 @@ const STR = {
     usages: { read: '缓存读取', write: '缓存写入', input: '未缓存输入', output: '输出' },
     spendHeader: '| 类别 | token | 估算费用 |',
     peak: '主上下文峰值',
-    rewrites: '冷重写次数',
+    rewrites: '已记录的缓存重写次数',
     compactions: '压缩前 → 后',
     unknownSize: '未知',
     unattributed: '旧记录未分类费用',
@@ -315,11 +330,7 @@ const STR = {
     forced: 'model pinned in your message',
     abandoned: (cost: string) => `warm Opus cache abandoned, estimated round-trip rewrite ${cost}`,
     warmSkip: 'warm large context: classifier skipped',
-    off: 'Model router is off',
     review: 'Decision review',
-    kept: 'cache kept',
-    turn: 'turn',
-    today: 'today',
     idleCompacted: (size: string) => `Idle compact: compacted ${size} of context while the cache was warm`,
     capCompacted: (size: string) => `Context cap reached: compacted ${size}`,
     checkpointCompacted: (size: string) => `Checkpoint: compacted ${size}`,
@@ -341,19 +352,13 @@ const STR = {
     fetchMore: (offset: number) => `\n[Output capped; fetch the same selection with offset ${offset} to continue.]`,
     weekly: 'Weekly',
     resets: 'resets',
-    ctx: 'ctx',
-    step: 'step',
-    cold: 'cold resume',
-    warm: (n: number) => `cache warm ~${n}m`,
-    expired: (size: string,
-    cost: string) => `cache expired: next prompt rewrites ≈${size} (≈${cost})`,
-    unknownContext: 'Context not measured yet',
-    unknownCache: 'cache deadline unknown',
+    ctx: 'Conversation size',
+    unknownContext: 'Conversation size not measured yet',
     idleIn: (n: number) => `idle compact in ${n}m`,
     capIn: 'context cap compact pending',
     waiting: (n: number) => n < 0 ? 'idle compact waiting: agent status unavailable' : `idle compact waiting for ${n} agent${n === 1 ? '' : 's'}`,
     skipped: (why: string) => `Compaction skipped: ${why}`,
-    deadlinePassed: 'cache deadline passed',
+    deadlinePassed: 'the cache has expired',
     agentsBusy: 'agents still busy',
     agentUnavailable: 'agent status unavailable',
     routerOff: 'router off',
@@ -388,27 +393,49 @@ const STR = {
     pacingNoWindow: 'no weekly usage window',
     paceAhead: (x: string) => ` · pace ${x} ahead`,
     paceToast: (used: string, x: string, steer: boolean) => `Weekly usage ${used}% is using the week ${x} faster than an even pace.${steer ? ' Unsure decisions now route to Sonnet.' : ''}`,
-    histNone: 'No routed turns in this session yet.',
-    histTotal: (cost: string, base: string) => `7 days ${cost} · all-Opus ${base}`,
-    below: 'below all-Opus',
-    above: 'above all-Opus',
-    shouldBe: 'Should have been:',
-    tagCold: 'cold',
-    tagKept: 'kept',
-    tagPinned: 'pinned',
-    tagForced: 'forced',
-    tagCorrected: 'corrected',
-    sessionRow: 'session model',
+    histNone: 'No replies routed in this session yet.',
+    paused: 'Router paused — your own model answers every turn',
+    details: 'Details',
+    hideDetails: 'Hide details',
+    bandIdle: 'The router picks a model for each message you send',
+    bandSubagents: 'Router on for subagents only — your own model answers your messages',
+    pinnedMore: (left?: number) => left === undefined ? 'pinned until you unpin' : left === 0 ? 'pinned' : `pinned, ${left} more turn${left === 1 ? '' : 's'}`,
+    pinWaiting: (left?: number) => left === undefined ? 'pinned until you unpin' : `pinned for the next ${left} repl${left === 1 ? 'y' : 'ies'}`,
+    youChose: (m: string) => `you chose it (#${m})`,
+    keptOn: (m: string) => `kept on ${m}: switching would re-read the whole conversation`,
+    raisedFrom: (m: string) => `raised from ${m}`,
+    unrouted: (why: string) => `the router did not choose this turn${why ? ` (${why})` : ''}`,
+    thisReply: 'This reply',
+    todayWord: 'Today',
+    week: (pct: string) => `Week ${pct}% used`,
+    aheadOfPace: ', ahead of pace',
+    lessThan: (usd: string) => `${usd} less than all-Opus`,
+    moreThan: (usd: string) => `${usd} more than all-Opus`,
+    underCent: 'under $0.01',
+    comma: ', ',
+    cacheSoon: (min: number, extra: string) => `⏳ Reply within ${min} min to keep the conversation cached — after that the next reply costs ≈${extra} more`,
+    cacheGone: (size: string, cost: string) => `⏳ The cache expired — your next reply re-reads ${size} tokens (≈${cost})`,
+    wrongAsk: 'Wrong model for the last reply? Should have been:',
+    thanks: 'Thanks — the router will use this',
+    footer: '/model-router for stats, settings and commands',
+    raisedTo: (m: string) => `(raised to ${m})`,
+    histTotal: (cost: string, base: string) => `Last 7 days ${cost} · all-Opus would be ${base}`,
+    tagCold: '(cache expired)',
+    tagKept: (m: string) => `(kept on ${m})`,
+    tagPinned: '(pinned)',
+    tagForced: '(you chose)',
+    tagCorrected: '(corrected)',
+    sessionRow: 'your model',
     enabled: 'enabled',
     disabled: 'disabled',
-    enable: 'Enable',
-    disable: 'Disable router',
+    enable: 'Resume router',
+    disable: 'Pause router',
     session: 'This session',
     settings: 'Current settings',
     pending: 'Pending',
     none: 'none',
-    deadline: 'Cache deadline',
-    safeDeadline: 'Compaction safe deadline',
+    deadline: 'Cache expires',
+    safeDeadline: 'Compact before',
     lastSkip: 'Last skipped action',
     unavailable: 'unavailable',
     categories: 'Local category estimates (≈tokens)',
@@ -417,7 +444,7 @@ const STR = {
     usages: { read: 'Cache reads', write: 'Cache writes', input: 'Uncached input', output: 'Output' },
     spendHeader: '| category | tokens | estimated cost |',
     peak: 'Peak main context',
-    rewrites: 'Cold rewrites counted',
+    rewrites: 'Cache rewrites counted',
     compactions: 'Compactions before → after',
     unknownSize: 'unknown',
     unattributed: 'Unattributed legacy spend',
@@ -533,10 +560,12 @@ async function loadPrefs($: EngineInterface, session: Session) {
   const stored = await $.store.get('corrections')
   const mode = await $.store.get('pacing')
   const warned = await $.store.get('paceWarned')
+  const expanded = await $.store.get('bandExpanded')
   if (!here(session)) return
   corrections = readCorrections(stored)
   pacingOverride = isPaceMode(mode) ? mode : undefined
   paceWarned = typeof warned === 'string' ? warned : undefined
+  bandExpanded = expanded === true
 }
 
 // One toast when weekly use first runs ahead of an even pace in a window, remembered across sessions.
@@ -729,7 +758,8 @@ function resetSession($: EngineInterface, cancel = true) {
   turnCold = false
   turnBase = { tokens: 0, cost: 0 }
   turnTrailBase = 0
-  histories.clear()
+  weekCache = undefined
+  thanks = undefined
   rateLimits = []
   lastSkipped = null
   skippedEpoch = -1
@@ -761,18 +791,17 @@ function warmRequest(): LastRequest | null {
   return lastMain === null || model === 'fable' ? null : { at: lastMain.at, context: tokens ?? 0, model }
 }
 
-function exposureText(lang: Lang, now: number, columns: number): string {
+// The one cache notice the band ever shows, and only when it matters: a conversation big enough to be costly to re-read,
+// whose cache is about to expire (15 minutes or less) or already has. A cache of unknown age (after a reload) says nothing.
+function cacheWarning(lang: Lang, now: number, minContext: number): string {
   const str = STR[lang]
   const { tokens: context, model } = contextReading()
-  if (context === undefined) return str.unknownContext
-  const size = fmtTokens(context)
-  const cold = fmtUsd(context * priceOf(model, context).write / 1e6)
-  const label = model === 'fable' ? 'Fable' : LABEL[model]
-  const prefix = `${columns >= 55 ? `${label} · ` : ''}${str.ctx} ${size}`
-  if (lastMain && now >= lastMain.at + CACHE_TTL_MS) return `${prefix} │ ${str.expired(size, cold)}`
-  const read = columns >= 90 ? ` · ≈$${(context * priceOf(model, context).read / 1e6).toFixed(3)}/${str.step}` : ''
-  const warmth = columns >= 65 ? ` · ${lastMain ? str.warm(Math.max(0, Math.ceil((lastMain.at + CACHE_TTL_MS - now) / 60_000))) : str.unknownCache}` : ''
-  return `${prefix}${read} │ ${str.cold} ≈${cold}${warmth}`
+  if (context === undefined || lastMain === null || context < minContext) return ''
+  const rewrite = fmtUsd(context * priceOf(model, context).write / 1e6)
+  const left = lastMain.at + CACHE_TTL_MS - now
+  if (left <= 0) return str.cacheGone(fmtTokens(context), rewrite)
+  const minutes = Math.ceil(left / 60_000)
+  return minutes <= 15 ? str.cacheSoon(minutes, rewrite) : ''
 }
 
 async function setEnabled($: EngineInterface, session: Session, isOn: boolean) {
@@ -1117,12 +1146,15 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   if (!(await recordCorrection($, session, { at, text, routed: rec.tier, right, source: 'manual' }))) return str.wrongFailed
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
+  thanks = rec.turnId
   redraw($)
   return str.wrongDone(hhmm(rec.at), rec.tier, right)
 }
 
 async function pressWrong($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId: string) {
   const text = await correctTurn($, session, lang, right, turnId)
+  // The band thanks the person itself when it was recorded; only a refusal needs saying.
+  if (thanks === turnId) return
   try {
     $.ui.toast(text)
   } catch {
@@ -1170,21 +1202,29 @@ async function weekSeries($: EngineInterface, session: Session, now: number): Pr
   return days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0 }))
 }
 
-// One turn as a row: the pieces the tree colours and the plain text joins.
+// A dollar amount in plain words: under a cent says so.
+function plainUsd(lang: Lang, n: number): string {
+  return n > 0 && n < 0.01 ? STR[lang].underCent : fmtUsd(n)
+}
+
+// One turn as a row: the pieces the band colours and the plain text joins.
 function turnParts(t: TurnRecord, lang: Lang) {
   const str = STR[lang]
-  const tags = [
+  const markers = [
+    t.how === 'pinned' ? str.tagPinned : t.how === 'forced' ? str.tagForced : '',
+    t.keptFrom && t.model !== 'session' ? str.tagKept(LABEL[t.model]) : '',
+    t.trail.length > 0 && t.model !== 'session' ? str.raisedTo(LABEL[t.model]) : '',
     t.cold ? str.tagCold : '',
-    t.keptFrom ? str.tagKept : '',
-    t.trail.length > 0 ? `→ ${t.trail.map(trailStep).join(' → ')}` : '',
-    t.how === 'pinned' ? `📌 ${str.tagPinned}` : t.how === 'forced' ? str.tagForced : '',
-    t.corrected ? `${str.tagCorrected} → ${t.corrected}` : '',
+    t.corrected ? str.tagCorrected : '',
   ].filter(Boolean)
+  // A pinned or chosen turn's reason only repeats its marker.
+  const why = t.how === 'pinned' || t.how === 'forced' ? '' : t.reason
   return {
     time: hhmm(t.at),
-    label: t.model === 'session' ? str.sessionRow : `${LABEL[t.model]}·${t.effort ?? ''}`.replace(/·$/, ''),
-    detail: `${fmtUsd(t.cost)} · ${fmtTokens(t.tokens)}${tags.length > 0 ? ` · ${tags.join(' · ')}` : ''}`,
-    reason: t.reason,
+    label: t.model === 'session' ? str.sessionRow : `${LABEL[t.model]} · ${t.effort ?? ''}`.replace(/ · $/, ''),
+    cost: plainUsd(lang, t.cost),
+    markers: markers.join(' '),
+    why,
   }
 }
 
@@ -1192,12 +1232,12 @@ function weekTotals(series: readonly DayCost[]): { cost: number; base: number } 
   return { cost: series.reduce((sum, d) => sum + d.cost, 0), base: series.reduce((sum, d) => sum + d.baseline, 0) }
 }
 
-// The command's own text, which the model reads too: the last turns, one short row each, and the week's total.
+// /model-router history: the same plain rows as the expanded band, as text, with the week's total.
 function historyText(lang: Lang, list: readonly TurnRecord[], series: readonly DayCost[]): string {
   const str = STR[lang]
   const rows = list.map(t => {
     const p = turnParts(t, lang)
-    return `${p.time} ${p.label} ${p.detail}${p.reason ? ` — ${shorten(p.reason, 40)}` : ''}`
+    return `${p.time}  ${p.label}  ${p.cost}${p.markers ? ` ${p.markers}` : ''}${p.why ? ` — ${shorten(p.why, 40)}` : ''}`
   })
   const w = weekTotals(series)
   return [...(rows.length > 0 ? rows : [str.histNone]), str.histTotal(fmtUsd(w.cost), fmtUsd(w.base))].join('\n')
@@ -1208,13 +1248,30 @@ async function historyCommand($: EngineInterface, session: Session, lang: Lang):
   const now = await $.clock.now()
   const series = await bookkeeping($, () => weekSeries($, session, now), undefined, retryFor(session, 'history week'))
   if (series === undefined || await stillHere($, session) !== 'same') return STR[lang].sessionChanged
-  const shown = list.slice(-HISTORY_ROWS)
-  const text = historyText(lang, shown, series)
-  // The row the transcript draws for this text comes from here, never from what the session holds by then. The button
-  // target is among the rows shown.
-  histories.set(text, { shown, series, target: [...shown].reverse().find(isCorrectable) })
-  while (histories.size > HISTORY_KEPT) histories.delete(histories.keys().next().value!)
-  return text
+  return historyText(lang, list.slice(-HISTORY_ROWS), series)
+}
+
+// The band's Details button: the choice is remembered across sessions.
+async function toggleDetails($: EngineInterface, session: Session) {
+  bandExpanded = !bandExpanded
+  weekCache = undefined
+  redraw($)
+  await bookkeeping($, () => $.store.set('bandExpanded', bandExpanded), undefined, retryFor(session, 'band write'))
+}
+
+// Row 1 of the band: what the router chose, in words.
+function bandRoute(lang: Lang, r: Route | null, routesMain: boolean): string {
+  const str = STR[lang]
+  const effortOf = (m: ModelKey) => TIER_ROUTE[TIER_OF[m]].effort
+  // A pin set since the last route is what the next reply will use.
+  if (pin && r?.how !== 'pinned') return `📌 ${LABEL[pin.model]} · ${effortOf(pin.model)} — ${str.pinWaiting(pin.left)}`
+  if (!r) return `⚙ ${routesMain ? str.bandIdle : str.bandSubagents}`
+  if (r.sessionModel) return `⚙ ${str.sessionRow} — ${str.unrouted(/\(([^)]*)\)/.exec(r.reason)?.[1] ?? '')}`
+  const label = `${LABEL[r.model]} · ${r.effort}`
+  if (r.how === 'pinned') return `📌 ${label} — ${pin ? str.pinnedMore(pin.left) : str.pinnedMore(0)}`
+  if (r.how === 'forced') return `📌 ${label} — ${str.youChose(r.model)}`
+  if (r.keptFrom) return `⚙ ${label} — ${str.keptOn(LABEL[r.model])}`
+  return `⚙ ${label}${r.reason ? ` — ${r.reason}` : ''}${r.trail.length > 0 ? ` (${str.raisedFrom(LABEL[TIER_ROUTE[r.tier].model])})` : ''}`
 }
 
 async function pinCommand($: EngineInterface, lang: Lang, arg: string, mainRouting: boolean): Promise<string> {
@@ -1414,12 +1471,12 @@ async function contextText($: EngineInterface, session: Session, lang: Lang, col
     if (await stillHere($, session) !== 'same') return str.checkpointCancelled
     const n = contextReading(context.tokens).tokens
     const rows = context.breakdown?.categories
-    return [n === undefined ? str.unknownContext : `${str.ctx}: ${fmtTokens(n)}`,
+    return [n === undefined ? str.unknownContext : `${str.ctx}: ${fmtTokens(n)} tokens`,
       rows?.length ? `${str.categories}:\n${rows.map(r => `${r.name}: ≈${fmtTokens(r.tokens)}`).join('\n')}` : str.noBreakdown,
     ].join('\n\n')
   } catch {
     const n = contextReading().tokens
-    return [n === undefined ? str.unknownContext : `${str.ctx}: ${fmtTokens(n)}`, str.noBreakdown].join('\n\n')
+    return [n === undefined ? str.unknownContext : `${str.ctx}: ${fmtTokens(n)} tokens`, str.noBreakdown].join('\n\n')
   }
 }
 
@@ -2442,71 +2499,26 @@ export const register: Register = (on, options) => {
 
   // /model-router history draws its details inline in the transcript; every other model-router command keeps the
   // engine's own row. A surface that cannot draw the tree shows the command's plain text instead.
-  on('ui.render', { component: 'CommandOutput', props: { command: 'model-router' } }, async ($, e, next) => {
-    // Drawn from the snapshot the command took, matched by the text it printed; none (an older lifetime, or another
-    // command) leaves the engine's own row.
-    const snap = e.props.args.trim() === 'history' && !e.props.isErrored ? histories.get(e.props.text) : undefined
-    if (!snap) return next(e)
-    const session = await useSession($)
-    if (!here(session)) return next(e)
-    const table = $.ui.resolve(e)
-    const { Box, Text, Button } = table
-    // The terminal's table has no Svg (it would draw a fragment: nothing): it gets a text sparkline instead.
-    const Svg = e.surface === 'terminal' ? undefined : (table as unknown as { Svg?: ElementConstructor<SvgProps> }).Svg
-    const w = weekTotals(snap.series)
-    const target = learning ? snap.target : undefined
-    return (
-      <Box flexDirection="column">
-        {snap.shown.length === 0 && <Text dimColor>{str.histNone}</Text>}
-        {snap.shown.map(t => {
-          const p = turnParts(t, lang)
-          return (
-            <Box key={t.turnId} flexDirection="row" gap={1}>
-              <Box flexShrink={0}>
-                <Text dimColor>{p.time}</Text>
-              </Box>
-              <Box flexShrink={0}>
-                <Text color={TURN_COLOR[t.model]}>{p.label}</Text>
-              </Box>
-              <Box flexGrow={1} flexShrink={1} width={0}>
-                <Text dimColor wrap="truncate-end">{`${p.detail}${p.reason ? ` — ${p.reason}` : ''}`}</Text>
-              </Box>
-            </Box>
-          )
-        })}
-        {snap.series.length > 0 && (Svg
-          ? <Svg source={barChartSvg(snap.series)} alt={chartAlt(snap.series)} />
-          : <Text dimColor>{sparkline(snap.series.map(d => d.cost))}</Text>)}
-        <Text dimColor wrap="truncate-end">{str.histTotal(fmtUsd(w.cost), fmtUsd(w.base))}</Text>
-        {target && (
-          <Box flexDirection="row" gap={1} alignItems="center">
-            <Text dimColor>{`${str.shouldBe} (${hhmm(target.at)})`}</Text>
-            {(['lookup', 'execute', 'decide'] as const).filter(t => t !== target.tier).map(t => (
-              <Button key={`wrong-${t}`} label={t} onPress={() => pressWrong($, session, lang, t, target.turnId)} />
-            ))}
-          </Box>
-        )}
-      </Box>
-    )
-  })
-
+  // The band above the prompt: what the router chose and what it costs, in plain words. Details open with a click.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const session = await useSession($)
     if (!here(session)) return next(e)
     const below = await next(e)
     if (await stillHere($, session) !== 'same') return below
     if (e.props.hasSurvey) return below
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const exposure = exposureText(lang, await $.clock.now(), e.props.bodyColumns)
+    await ensurePrefs($, session)
+    const table = $.ui.resolve(e)
+    const { Box, Text, Button } = table
+    const now = await $.clock.now()
     if (await stillHere($, session) !== 'same') return below
-    const narrow = e.props.bodyColumns < 100
 
     if (!(await read($, enabled))) {
       return (
         <Box flexDirection="column">
-          <Text dimColor>{exposure}</Text>
           <Box flexDirection="row" gap={1} alignItems="center">
-            <Text dimColor>⚙ {str.off}</Text>
+            <Box flexGrow={1} flexShrink={1} width={0}>
+              <Text dimColor wrap="truncate-end">⚙ {str.paused}</Text>
+            </Box>
             <Button key="router-enable" label={str.enable} onPress={() => setEnabled($, session, true)} />
           </Box>
           {below}
@@ -2516,65 +2528,87 @@ export const register: Register = (on, options) => {
 
     const r = await bookkeeping($, () => read($, memberOf(route, { requestId: session.stateId })), null)
     const m = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), { turn: EMPTY, today: session.today ?? EMPTY })
-    if (await stillHere($, session) !== 'same') return below
-    const routeBase = !r
-      ? ''
-      : r.sessionModel
-        ? r.reason
-        : `${LABEL[r.keptFrom ?? TIER_ROUTE[r.tier].model]} · ${TIER_ROUTE[r.tier].effort}` +
-          (r.keptFrom ? ` → ${LABEL[r.model]} (${str.kept})` : '') +
-          (r.trail.length > 0 ? ` → ${r.trail.join(' → ')}` : '') +
-          (r.reason ? ` — ${r.reason}` : '')
-    // A pin shows in front of the route, and without one nothing here changes.
-    const pinTag = pin ? `📌 ${LABEL[pin.model]}${pin.left === undefined ? '' : ` (${pin.left})`}` : ''
-    // A pinned turn already says so; a pin set since the last route is shown in front of it, as the narrow layout does.
-    const routeText = r?.how === 'pinned' ? `📌 ${routeBase}` : pinTag === '' ? routeBase : `${pinTag} │ ${routeBase}`
-    const today = session.today ?? m.today
-    const s = saved(today)
-    const meterText =
-      `${str.turn} ${fmtTokens(m.turn.tokens)} tok · ${fmtUsd(m.turn.cost)}   ` +
-      `${str.today} ${fmtTokens(today.tokens)} tok · ${fmtUsd(today.cost)} · ${approxUsd(Math.abs(s.usd))} (${Math.abs(s.pct)}%) ${s.usd >= 0 ? str.below : str.above}`
-
-    // No route, or no room for it: the meter takes the gear's row, so there is no empty route row.
-    if (!r || narrow) {
-      return (
-        <Box flexDirection="column">
-          <Text dimColor>{exposure}</Text>
-          <Box flexDirection="row" gap={1} alignItems="center">
-            <Box flexShrink={0}>
-              <Text dimColor>⚙</Text>
-            </Box>
-            <Box flexGrow={1} flexShrink={1} width={0}>
-              <Text dimColor wrap="truncate-end">
-                {pinTag === '' ? meterText : `${pinTag}  ${meterText}`}
-              </Text>
-            </Box>
-            <Button key="router-disable" label={str.disable} onPress={() => setEnabled($, session, false)} />
-          </Box>
-          {below}
-        </Box>
-      )
+    const expanded = bandExpanded
+    const list = expanded ? await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[]) : []
+    // The week behind the chart is read when the details open, the day turns or a turn was recorded, not per redraw.
+    if (expanded) {
+      const key = list.at(-1)?.turnId ?? ''
+      if (weekCache === undefined || weekCache.day !== dayKey(now) || weekCache.key !== key) {
+        const series = await bookkeeping($, () => weekSeries($, session, now), undefined, retryFor(session, 'band week'))
+        if (series !== undefined) weekCache = { day: dayKey(now), key, series }
+      }
     }
+    if (await stillHere($, session) !== 'same') return below
+
+    const today = session.today ?? m.today
+    const diff = saved(today).usd
+    const w = weeklyLimit()
+    const ahead = w !== undefined && pacingMode() !== 'off' && paceOf(w, now).state === 'ahead'
+    const cost =
+      `${str.thisReply} ${plainUsd(lang, m.turn.cost)} · ${str.todayWord} ${plainUsd(lang, today.cost)}` +
+      (Math.abs(diff) > 0 ? `${str.comma}${(diff >= 0 ? str.lessThan : str.moreThan)(plainUsd(lang, Math.abs(diff)))}` : '') +
+      (w ? ` · ${str.week(String(w.percentUsed))}` : '')
+    const cache = cacheWarning(lang, now, compactMinContext > 0 ? compactMinContext : 100_000)
+
+    // The terminal's table has no Svg (it would draw a fragment: nothing): it gets a text sparkline instead.
+    const Svg = e.surface === 'terminal' ? undefined : (table as unknown as { Svg?: ElementConstructor<SvgProps> }).Svg
+    const shown = list.slice(-BAND_ROWS)
+    const series = weekCache?.series ?? []
+    const total = weekTotals(series)
+    const target = learning ? [...shown].reverse().find(isCorrectable) : undefined
+    const answers: [string, Tier][] = [['Haiku', 'lookup'], ['Sonnet', 'execute'], ['Opus', 'decide']]
 
     return (
       <Box flexDirection="column">
-        <Text dimColor>{exposure}</Text>
+        {cache !== '' && <Text color="warning" wrap="truncate-end">{cache}</Text>}
         <Box flexDirection="row" gap={1} alignItems="center">
-          <Box flexShrink={0}>
-            <Text dimColor>⚙</Text>
-          </Box>
           <Box flexGrow={1} flexShrink={1} width={0}>
-            <Text dimColor wrap="truncate-end">
-              {routeText}
-            </Text>
+            <Text dimColor wrap="truncate-end">{bandRoute(lang, r, mainRouting)}</Text>
           </Box>
+          <Button key="band-details" label={expanded ? str.hideDetails : str.details} onPress={() => toggleDetails($, session)} />
           <Button key="router-disable" label={str.disable} onPress={() => setEnabled($, session, false)} />
         </Box>
-        <Box paddingLeft={2}>
-          <Text dimColor wrap="truncate-end">
-            {meterText}
-          </Text>
+        <Box flexDirection="row" paddingLeft={2}>
+          <Box flexShrink={1}>
+            <Text dimColor wrap="truncate-end">{cost}</Text>
+          </Box>
+          {ahead && <Text color="warning">{str.aheadOfPace}</Text>}
         </Box>
+        {expanded && (
+          <Box flexDirection="column" paddingLeft={2}>
+            {shown.length === 0 && <Text dimColor>{str.histNone}</Text>}
+            {shown.map(t => {
+              const p = turnParts(t, lang)
+              return (
+                <Box key={t.turnId} flexDirection="row" gap={2}>
+                  <Box flexShrink={0}>
+                    <Text dimColor>{p.time}</Text>
+                  </Box>
+                  <Box flexShrink={0}>
+                    <Text color={TURN_COLOR[t.model]}>{p.label}</Text>
+                  </Box>
+                  <Box flexGrow={1} flexShrink={1} width={0}>
+                    <Text dimColor wrap="truncate-end">{`${p.cost}${p.markers ? ` ${p.markers}` : ''}${p.why ? ` — ${p.why}` : ''}`}</Text>
+                  </Box>
+                </Box>
+              )
+            })}
+            {series.length > 0 && (Svg
+              ? <Svg source={barChartSvg(series)} alt={chartAlt(series)} />
+              : <Text dimColor>{sparkline(series.map(d => d.cost))}</Text>)}
+            <Text dimColor wrap="truncate-end">{str.histTotal(fmtUsd(total.cost), fmtUsd(total.base))}</Text>
+            {target && thanks === target.turnId && <Text dimColor>{str.thanks}</Text>}
+            {target && thanks !== target.turnId && (
+              <Box flexDirection="row" gap={1} alignItems="center">
+                <Text dimColor>{str.wrongAsk}</Text>
+                {answers.filter(([, tier]) => tier !== target.tier).map(([name, tier]) => (
+                  <Button key={`wrong-${tier}`} label={name} onPress={() => pressWrong($, session, lang, tier, target.turnId)} />
+                ))}
+              </Box>
+            )}
+            <Text dimColor wrap="truncate-end">{str.footer}</Text>
+          </Box>
+        )}
         {below}
       </Box>
     )
