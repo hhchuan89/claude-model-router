@@ -1,5 +1,7 @@
 import type { Tier } from '../types'
 import { redact } from './redact'
+import { fewShot, similarExamples, snippetOf } from './learn'
+import type { Correction } from './learn'
 import type { Decision, Lang, Probs } from './route'
 
 // Dev-only, for /model-router replay: the 1.1.0 classifier prompt, word for word, so a labelled file can be run through
@@ -38,7 +40,8 @@ export const REPLAY_MAX_ITEMS = 500
 export const REPLAY_CONCURRENCY = 4
 const RAW_CHARS = 400
 
-export type ReplayVariant = 'current' | 'legacy'
+// current+examples: the current prompt with the corrections block chosen from an examples file, leaving the item itself out.
+export type ReplayVariant = 'current' | 'legacy' | 'current+examples'
 export type ReplayItem = { id: string; message: string; context: string; previous: Tier | null }
 export type ReplayRow = {
   id: string
@@ -54,13 +57,53 @@ export type ReplayRow = {
   why?: string
 }
 
-// The arguments after "replay": a path (it may hold spaces) and an optional variant after it.
-export function parseReplayArgs(rest: string): { path: string; variants: ReplayVariant[] } | null {
-  const m = /^(.*?)(?:\s+(current|legacy|both))?$/.exec(rest.trim())
+// "--name value" flags after the leading words; the value runs to the next flag, so a path may hold spaces.
+export function parseFlags(rest: string): { head: string; flags: Record<string, string> } {
+  const at = rest.search(/(?:^|\s)--\w+(?:\s|$)/)
+  if (at === -1) return { head: rest.trim(), flags: {} }
+  const flags: Record<string, string> = {}
+  for (const m of rest.slice(at).matchAll(/--(\w+)\s+(.+?)(?=\s+--\w+(?:\s|$)|$)/g)) flags[m[1]!] = m[2]!.trim()
+  return { head: rest.slice(0, at).trim(), flags }
+}
+
+// The arguments after "replay": a path (it may hold spaces), an optional variant after it, and --examples <file>.
+export function parseReplayArgs(rest: string): { path: string; variants: ReplayVariant[]; examples?: string } | null {
+  const { head, flags } = parseFlags(rest)
+  const m = /^(.*?)(?:\s+(current|legacy|both))?$/.exec(head)
   const path = m?.[1]?.trim() ?? ''
   if (path === '') return null
   const which = m?.[2] ?? 'both'
-  return { path, variants: which === 'both' ? ['current', 'legacy'] : [which as ReplayVariant] }
+  const variants: ReplayVariant[] = which === 'both' ? ['current', 'legacy'] : [which as ReplayVariant]
+  if (flags.examples !== undefined) variants.push('current+examples')
+  return { path, variants, ...(flags.examples !== undefined ? { examples: flags.examples } : {}) }
+}
+
+export type ExampleEntry = Correction & { id: string }
+
+// An examples file: a JSON array of { id, message, right }, treated as stored corrections. The routed tier is not in the
+// file (it only fills the block's "was routed" note): it is a different tier from the right one, as a real correction's is.
+export function parseExamplesFile(text: string): { ok: true; examples: ExampleEntry[] } | { ok: false; why: string } {
+  let data: unknown
+  try { data = JSON.parse(text) } catch { return { ok: false, why: 'examples file is not valid JSON' } }
+  if (!Array.isArray(data)) return { ok: false, why: 'examples file is not a JSON array' }
+  const examples: ExampleEntry[] = []
+  for (const [i, x] of data.entries()) {
+    const o = x as Record<string, unknown> | null
+    const right = o?.right
+    if (typeof o !== 'object' || o === null || typeof o.message !== 'string' || (right !== 'lookup' && right !== 'execute' && right !== 'decide')) {
+      return { ok: false, why: `examples item ${i} needs a message and a right tier` }
+    }
+    const id = typeof o.id === 'string' || typeof o.id === 'number' ? String(o.id) : String(i)
+    examples.push({ id, at: i, text: snippetOf(o.message), routed: right === 'execute' ? 'lookup' : 'execute', right, source: 'manual' })
+  }
+  return { ok: true, examples }
+}
+
+// The block for one item: the examples most like its message, never the entry with its own id (leave-one-out, so the
+// answer is not in the prompt). Empty when none is similar, as in live routing.
+export function exampleBlock(examples: readonly ExampleEntry[], id: string, message: string, lang: Lang): string {
+  const block = fewShot(similarExamples(examples.filter(e => e.id !== id), message), lang)
+  return block === '' ? '' : `\n\n${block}`
 }
 
 // Results go next to the input: labelled.json -> labelled.replay.json.

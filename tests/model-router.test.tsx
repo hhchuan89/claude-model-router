@@ -8184,6 +8184,53 @@ describe('/model-router replay (1.2.0)', () => {
     expect(calls.requests[0]!.prompt).toBe(classifierPrompt(null, '', 'hello'))
     expect(readOut(seen)[0].id).toBe('0')
   })
+
+  test('--examples adds the current+examples variant, and a path with spaces still parses', async () => {
+    expect(parseReplayArgs('/a.json --examples /e.json')).toEqual({ path: '/a.json', variants: ['current', 'legacy', 'current+examples'], examples: '/e.json' })
+    expect(parseReplayArgs('/my files/a.json legacy --examples /my files/e.json')).toEqual({ path: '/my files/a.json', variants: ['legacy', 'current+examples'], examples: '/my files/e.json' })
+    expect(parseReplayArgs('/a.json')).toEqual({ path: '/a.json', variants: ['current', 'legacy'] })
+  })
+
+  // WHY: an example that is the item itself would hand the classifier its own answer and make the measurement look better than it is.
+  test('with --examples each item is classified with similar examples from the file, never with its own entry', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify([
+      { id: 'a', message: 'rename the helper in utils', context: '', previous: null },
+      { id: 'z', message: 'rename the helper in utils', context: '', previous: 'decide' },
+    ]))
+    const examples = JSON.stringify([
+      { id: 'a', message: 'rename the helper in utils', right: 'decide' },
+      { id: 'b', message: 'deploy the release to production', right: 'decide' },
+    ])
+    seen.files['/work/examples.json'] = examples
+    seen.files['C:\\work\\examples.json'] = examples
+    const text = await cmd($, `replay ${IN} current --examples /work/examples.json`)
+    const withExamples = calls.requests.filter(r => r.system.startsWith(classifierSystem('en')) && r.system !== classifierSystem('en'))
+    // Item a: its only similar entry is itself, so it gets no block. Item z gets that entry, and not the unrelated one.
+    const forA = calls.requests.filter(r => r.prompt === classifierPrompt(null, '', 'rename the helper in utils'))
+    expect(forA.map(r => r.system)).toEqual([classifierSystem('en'), classifierSystem('en')])
+    expect(withExamples).toHaveLength(1)
+    expect(withExamples[0]!.prompt).toBe(classifierPrompt('decide', '', 'rename the helper in utils'))
+    expect(withExamples[0]!.system).toContain('Corrections this developer made to earlier routing (newest last)')
+    expect(withExamples[0]!.system).toContain('- "rename the helper in utils" → decide (was routed execute)')
+    expect(withExamples[0]!.system).not.toContain('deploy the release')
+    const rows = readOut(seen)
+    expect(rows.filter(r => r.variant === 'current+examples').map(r => r.id).sort()).toEqual(['a', 'z'])
+    expect(rows.filter(r => r.variant === 'current+examples')[0]).toMatchObject({ ok: true, tier: 'lookup', sure: true })
+    expect(text).toContain('current+examples: 2/2 answered')
+  })
+
+  test('an unreadable or malformed examples file is refused with a reason and asks the model nothing', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    expect(await cmd($, `replay ${IN} --examples /work/none.json`)).toContain('cannot read /work/none.json')
+    seen.files['/work/bad.json'] = '[{"id":"a","message":"x","right":"huge"}]'
+    seen.files['C:\\work\\bad.json'] =seen.files['/work/bad.json']
+    expect(await cmd($, `replay ${IN} --examples /work/bad.json`)).toContain('examples item 0 needs a message and a right tier')
+    expect(calls.n).toBe(0)
+  })
 })
 
 // ---------------------------------------------------------------------------------------------------------------------

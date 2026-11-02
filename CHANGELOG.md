@@ -30,7 +30,8 @@ release.
   with "(irreversible or outward-facing)". It can only raise the tier. `/model-router stats` counts how often it fired.
 - `/model-router replay <path> [current|legacy|both]`, a maintainer tool for fitting the bars: it runs the real classifier
   call over a JSON file of up to 500 messages, with the 1.2 prompt, the 1.1 prompt or both, and writes
-  `<path>.replay.json`. It changes no routing state; only its Haiku spend is added to the meter.
+  `<path>.replay.json`. It changes no routing state; only its Haiku spend is added to the meter. `--examples <file>` adds
+  a `current+examples` variant that uses the file's `{ id, message, right }` entries as corrections, leave-one-out.
 
 ## [1.1.0] - 2026-11-02
 

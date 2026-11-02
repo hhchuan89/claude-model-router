@@ -436,14 +436,16 @@ claude plugin validate .
 claude plugin test .
 ```
 
-**Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both]` (default `both`)
+**Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both] [--examples <file>]` (default `both`)
 reads a JSON array of `{ "id", "message", "context", "previous" }` (`previous` is a tier or `null`; at most 500 items),
 sends each message to Haiku exactly as a live classification would (same model, effort, limits, masking and 6,000-character
 cut), and writes `<path without .json>.replay.json` with one row per item and variant: the masked start of the reply, then
 `p`, `risk`, `tier` and `sure` for `current` (the 1.2 prompt), or `legacyTier` and `legacySure` for `legacy` (the 1.1
 prompt, kept in `hooks/replay.ts`), or `why` when there was no usable reply. The corrections block is not used, so the
 base prompt is what is measured. At most 4 requests run at once; it refuses while a turn is running. It changes no
-routing state, count, correction or band: only the Haiku spend is added to the meter. It is not listed in the command's
+routing state, count, correction or band: only the Haiku spend is added to the meter. `--examples <file>` (a JSON array of `{ "id", "message", "right" }`, used like stored corrections) adds a third variant,
+`current+examples`: each item is classified with the corrections block chosen by similarity from that file, leaving out the
+entry with the item's own id (leave-one-out), to measure what the examples are worth. It is not listed in the command's
 usage text.
 
 ## Contributors

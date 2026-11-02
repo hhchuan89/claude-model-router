@@ -14,8 +14,8 @@ import { barChartSvg, cellWidth, chartAlt, hhmm, lastDays, textChart, weekdayOf 
 import type { DayCost } from './history'
 import { redact } from './redact'
 import type { Decision, Lang } from './route'
-import { legacyClassifierSystem, parseReplayArgs, parseReplayFile, replayOutPath, replayRow, replaySummary, REPLAY_CONCURRENCY } from './replay'
-import type { ReplayRow } from './replay'
+import { exampleBlock, legacyClassifierSystem, parseExamplesFile, parseReplayArgs, parseReplayFile, replayOutPath, replayRow, replaySummary, REPLAY_CONCURRENCY } from './replay'
+import type { ExampleEntry, ReplayRow } from './replay'
 import {
   applyEscalation,
   assignmentContext,
@@ -208,7 +208,7 @@ const STR = {
     riskGuard: '（不可逆或对外操作）',
     replayBusy: '无法回放：主会话正在运行。请在轮次之间重试。',
     replayRunning: '无法回放：另一个回放正在运行。',
-    replayUsage: '用法：/model-router replay <文件路径> [current|legacy|both]',
+    replayUsage: '用法：/model-router replay <文件路径> [current|legacy|both] [--examples <文件>]',
     replayCancelled: '回放已取消：会话已变化。',
     replayRefused: (why: string) => `无法回放：${why}`,
     sessionModel: (why: string) => `分类失败（${why}）：用会话模型`,
@@ -348,7 +348,7 @@ const STR = {
     riskGuard: ' (irreversible or outward-facing)',
     replayBusy: 'Replay refused: a main turn is running. Try again between turns.',
     replayRunning: 'Replay refused: another replay is running.',
-    replayUsage: 'Usage: /model-router replay <path> [current|legacy|both]',
+    replayUsage: 'Usage: /model-router replay <path> [current|legacy|both] [--examples <file>]',
     replayCancelled: 'Replay cancelled: the conversation changed.',
     replayRefused: (why: string) => `Replay refused: ${why}`,
     sessionModel: (why: string) => `classifier failed (${why}): session model`,
@@ -1118,6 +1118,20 @@ async function runReplay($: EngineInterface, session: Session, lang: Lang, rest:
   if (await stillHere($, session) !== 'same') return str.replayCancelled
   const file = parseReplayFile(text)
   if (!file.ok) return str.replayRefused(file.why)
+  // --examples: a file of { id, message, right } used like stored corrections, for the current+examples variant.
+  let examples: ExampleEntry[] = []
+  if (args.examples !== undefined) {
+    let exampleText: string
+    try {
+      exampleText = (await $.fs.read(args.examples)) as string
+    } catch (err) {
+      return str.replayRefused(`cannot read ${args.examples} (${String(err).slice(0, 120)})`)
+    }
+    if (await stillHere($, session) !== 'same') return str.replayCancelled
+    const parsed = parseExamplesFile(exampleText)
+    if (!parsed.ok) return str.replayRefused(parsed.why)
+    examples = parsed.examples
+  }
   const jobs = file.items.flatMap(item => args.variants.map(variant => ({ item, variant })))
   const rows: (ReplayRow | undefined)[] = new Array(jobs.length)
   const spent: Usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
@@ -1127,7 +1141,9 @@ async function runReplay($: EngineInterface, session: Session, lang: Lang, rest:
     while (!cancelled && next < jobs.length) {
       const i = next++
       const { item, variant } = jobs[i]!
-      const system = variant === 'legacy' ? legacyClassifierSystem(lang) : classifierSystem(lang)
+      const system = variant === 'legacy' ? legacyClassifierSystem(lang)
+        : variant === 'current+examples' ? classifierSystem(lang) + exampleBlock(examples, item.id, item.message, lang)
+        : classifierSystem(lang)
       const prompt = classifierPrompt(item.previous, redact(item.context), redact(item.message).slice(0, 6000))
       const r = await replayCall($, system, prompt)
       if (await stillHere($, session) !== 'same') { cancelled = true; return }
