@@ -6,14 +6,13 @@ import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
 import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
-import { addCorrection, EXAMPLES_K, fewShot, MAX_CORRECTIONS, MIN_SIMILARITY, readCorrections, similarExamples, similarity, snippetOf } from '../hooks/learn'
+import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
-import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, pickTier, RISK_BAR, routeFor, settleTier, shorten, TIER_BARS, withSuffixOf } from '../hooks/route'
-import { legacyClassifierSystem, parseReplayArgs, replayOutPath } from '../hooks/replay'
-import { BAR_MAX, BAR_MIN, COST, evaluate, fitBars, labelledSamples, parseLabels, planFor, readBars, readCalib, STEP_MAX, stepBars, tuneReport } from '../hooks/tune'
-import type { Sample } from '../hooks/tune'
+import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS } from '../hooks/replay'
+import { isRisky, riskFloor } from '../hooks/risk'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
@@ -2029,7 +2028,7 @@ describe('cost exposure and session commands (1.0)', () => {
     on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [{ kind: 'seven_day', percentUsed: 76 }] } }))
     on('session.model', async () => ({ value: 'opus' }))
     await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
-    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]|tune [apply|reset]]')
+    expect(command.argumentHint).toBe('[stats|status|context|checkpoint [note]|on|off|history|pin <model> [turns]|unpin|wrong <tier>|corrections [clear]|pacing [mode]]')
     expect(command.immediate).toBe(true)
     expect(command.description).toContain('status')
     expect(command.description).toContain('context')
@@ -5392,9 +5391,10 @@ describe('execute needs a settled plan; opus delegates settled work (v0.10.0)', 
   // "cherry-pick it") while what to change still had to be worked out.
   test('the classifier calls work execute only when what to change is visible', async () => {
     const text = classifierSystem('en')
-    expect(text).toContain('already settled in the message or the context you can see')
-    expect(text).toContain('is execute when the context shows what to\n  change (an approved plan')
-    expect(text).toContain('When what to change still has to be worked out, it is decide.')
+    // 1.2.0: the round 2 definitions say this in their own words (the separate "implement it" rule is gone).
+    expect(text).toContain('already settled in the message or the visible context, by a plan, a spec or an exact instruction')
+    expect(text).toContain('judgement is needed before acting')
+    expect(text).toContain('an ambiguous request that needs interpreting')
     // An approved plan stays execute: the new rule must not contradict the old one.
     expect(text).toContain('is execute, because the plan settles what to do')
     expect(text).toContain('porting a change to a branch whose version of the code differs')
@@ -6464,7 +6464,7 @@ describe('weekly pace math (1.1.0)', () => {
 describe('corrections store and few-shot block (1.1.0)', () => {
   const c = (text: string, right: 'lookup' | 'execute' | 'decide' = 'decide', at = 1): Correction => ({ at, text, routed: 'lookup', right, source: 'manual' })
 
-  test('the list keeps the newest 300 and a repeated text replaces its earlier entry', async () => {
+  test('the list keeps the newest 40 and a repeated text replaces its earlier entry', async () => {
     let list: Correction[] = []
     for (let i = 0; i < MAX_CORRECTIONS + 5; i++) list = addCorrection(list, c(`task ${i}`))
     expect(list).toHaveLength(MAX_CORRECTIONS)
@@ -6690,10 +6690,10 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
 
     test('with corrections the block is appended to the system prompt for the main thread and for subagents', async ($, on) => {
       const seen = world($, on, LOOKUP, { store: seeded('rename the helper') })
-      await $.prompt.submit({ text: 'rename the helper again' } as never)
+      await $.prompt.submit({ text: 'find every TODO' } as never)
       expect(seen.systems[0]!.startsWith(classifierSystem('en'))).toBe(true)
       expect(seen.systems[0]).toContain('- "rename the helper" → decide (was routed lookup)')
-      await $.agent.spawn({ prompt: 'rename the helper in the utils file', description: 'search', subagentType: 'general-purpose', parentModel: 'claude-opus-5-5' } as never)
+      await $.agent.spawn({ prompt: 'search the repo for usages of the helper', description: 'search', subagentType: 'general-purpose', parentModel: 'claude-opus-5-5' } as never)
       expect(seen.systems).toHaveLength(2)
       expect(seen.systems[1]).toContain('rename the helper')
     })
@@ -7715,13 +7715,13 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
     test('a failed first read of the stored corrections is retried, not given up on', async ($, on) => {
       let failing = true
       on('store.get', { key: 'corrections' }, async (_$: unknown, e: any, next: any) => failing ? { deny: 'store unavailable' } : next(e))
-      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'find more files', routed: 'lookup', right: 'decide', source: 'manual' }] } })
-      await $.prompt.submit({ text: 'find more files' } as never)
+      const seen = world($, on, LOOKUP, { store: { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] } })
+      await $.prompt.submit({ text: 'find files' } as never)
       expect(seen.systems[0]).toBe(classifierSystem('en'))
       failing = false
       await new Promise(resolve => (globalThis as any).setTimeout(resolve, 1100))
       await $.prompt.submit({ text: 'find more files' } as never)
-      expect(seen.systems[1]).toContain('find more files')
+      expect(seen.systems[1]).toContain('rename the helper')
     })
 
     test('clear and pacing say when the store write failed', async ($, on) => {
@@ -7755,217 +7755,181 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
 })
 
 // ---------------------------------------------------------------------------------------------------------------------
-// 1.2.0: calibrated tier probabilities, per-tier bars, the risk guard and the replay command
+// 1.2.0: the policy (b) classifier prompt, the risk floor in code, the assignment text and the replay command
 // ---------------------------------------------------------------------------------------------------------------------
 
-const P = (lookup: number, execute: number, decide: number, risk = 0, reason = 'r') => JSON.stringify({ p: { lookup, execute, decide }, risk, reason })
+const T = (tier: 'lookup' | 'execute' | 'decide', sure = true, reason = 'r') => JSON.stringify({ tier, sure, reason })
 
-describe('pickTier (1.2.0)', () => {
-  const none = { lookup: 0, execute: 0, decide: 0 }
-
-  test('the defaults are the provisional bars', async () => {
-    expect(TIER_BARS).toEqual({ lookup: 0.85, execute: 0.6, decide: 0.3 })
-    expect(RISK_BAR).toBe(0.7)
+describe('risk detector (1.2.0)', () => {
+  // WHY: these are the instructed actions that must never run on Haiku, in the ways people actually type them.
+  test('English instructions to push, merge, deploy, delete, force, touch prod, open a PR, message people or pay are risky', async () => {
+    for (const t of [
+      'push the branch', 'git push origin feat/x', 'merge it into develop', 'deploy to UAT', 'release v1.2 now', 'delete the old bucket',
+      'drop table users', 'rm -rf dist', 'git push --force', 'force-push the rebased branch', 'run the migration on prod',
+      'open a PR to develop', 'create a pull request for this', 'decline the PR', 'cherry-pick it to staging',
+      'reply to the customer', 'post the summary to slack', 'comment on the jira ticket', 'send the email to the client', 'pay the invoice',
+      'can you push it?', 'I pushed the fix already, now merge it',
+    ]) expect([t, isRisky(t)]).toEqual([t, true])
   })
 
-  // WHY: lookup is the dearest tier to get wrong, so it must clear the highest bar; a miss moves work up, never down.
-  test('lookup is taken at its bar exactly, and one hair below it goes to the more capable of the top two, unsure', async () => {
-    expect(pickTier({ ...none, lookup: 0.85, execute: 0.15 }, 0)).toEqual({ tier: 'lookup', sure: true })
-    expect(pickTier({ ...none, lookup: 0.84, execute: 0.16 }, 0)).toEqual({ tier: 'execute', sure: false })
-    expect(pickTier({ ...none, lookup: 0.5, execute: 0.1, decide: 0.4 }, 0)).toEqual({ tier: 'decide', sure: false })
-  })
-
-  test('execute is taken at its bar exactly, and below it the pick is unsure', async () => {
-    expect(pickTier({ lookup: 0.2, execute: 0.6, decide: 0.2 }, 0)).toEqual({ tier: 'execute', sure: true })
-    expect(pickTier({ lookup: 0.3, execute: 0.5, decide: 0.2 }, 0)).toEqual({ tier: 'execute', sure: false })
-    expect(pickTier({ lookup: 0.1, execute: 0.5, decide: 0.4 }, 0)).toEqual({ tier: 'decide', sure: false })
-  })
-
-  test('decide is taken at its bar exactly (a custom bar, since three probabilities leave the top one above 0.3)', async () => {
-    const bars = { lookup: 0.85, execute: 0.6, decide: 0.5 }
-    expect(pickTier({ lookup: 0.3, execute: 0.2, decide: 0.5 }, 0, bars)).toEqual({ tier: 'decide', sure: true })
-    expect(pickTier({ lookup: 0.34, execute: 0.25, decide: 0.41 }, 0, bars)).toEqual({ tier: 'decide', sure: false })
-    expect(pickTier({ lookup: 0.1, execute: 0.1, decide: 0.8 }, 0)).toEqual({ tier: 'decide', sure: true })
-  })
-
-  test('a tie goes to the more capable tier', async () => {
-    expect(pickTier({ lookup: 0.45, execute: 0.1, decide: 0.45 }, 0)).toEqual({ tier: 'decide', sure: true })
-    expect(pickTier({ lookup: 0.5, execute: 0.5, decide: 0 }, 0)).toEqual({ tier: 'execute', sure: false })
-    expect(pickTier({ lookup: 0, execute: 0.5, decide: 0.5 }, 0).tier).toBe('decide')
-  })
-
-  // WHY: an irreversible or outward-facing request is worth the top model however sure the tier looks.
-  test('risk at the bar exactly sends the work to decide, sure, with the guard named; just below it does not', async () => {
-    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, RISK_BAR)).toEqual({ tier: 'decide', sure: true, guard: 'risk' })
-    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, 0.69)).toEqual({ tier: 'lookup', sure: true })
-    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, 0.9, TIER_BARS, 0.9).guard).toBe('risk')
-    expect(pickTier({ lookup: 1, execute: 0, decide: 0 }, 0.8, TIER_BARS, 0.9)).toEqual({ tier: 'lookup', sure: true })
-  })
-
-  test('the guard only raises: a verdict already at decide stays decide', async () => {
-    expect(pickTier({ lookup: 0, execute: 0, decide: 1 }, 0.9).tier).toBe('decide')
-  })
-})
-
-describe('parseDecision, calibrated reply (1.2.0)', () => {
-  test('reads p, risk and reason and returns the pick with them', async () => {
-    expect(parseDecision(P(0.9, 0.1, 0, 0.2, 'find files'))).toEqual({ tier: 'lookup', sure: true, reason: 'find files', p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0.2 })
-    expect(parseDecision(P(0.5, 0.1, 0.4, 0, 'maybe'))).toMatchObject({ tier: 'decide', sure: false })
-    expect(parseDecision(P(0.1, 0.1, 0.1, 0.9))).toMatchObject({ tier: 'decide', sure: true, guard: 'risk' })
-  })
-
-  test('a reply fenced in prose still parses', async () => {
-    expect(parseDecision(`Here you go:\n\`\`\`json\n${P(0, 0.9, 0.1)}\n\`\`\``)?.tier).toBe('execute')
-  })
-
-  test('p is clamped to [0,1] and scaled to add up to 1; a sum already 1 is not nudged', async () => {
-    // 1.5 clamps to 1 and -3 to 0, which leaves 1 and 0.5 to scale: two thirds and one third.
-    const d = parseDecision(P(1.5, 0.5, -3))
-    expect(Math.abs((d?.p?.lookup ?? 0) - 2 / 3) < 1e-12 && Math.abs((d?.p?.execute ?? 0) - 1 / 3) < 1e-12 && d?.p?.decide === 0).toBe(true)
-    expect(d).toMatchObject({ tier: 'execute', sure: false })
-    const half = parseDecision(P(0.2, 0.2, 0.4))
-    expect(Math.abs((half?.p?.execute ?? 0) - 0.25) < 1e-12).toBe(true)
-    // 0.85 + 0.1 + 0.05 is 1 within rounding, so the lookup probability stays exactly at its bar.
-    expect(parseDecision(P(0.85, 0.1, 0.05))?.p?.lookup).toBe(0.85)
-    expect(parseDecision(P(0.85, 0.1, 0.05))).toMatchObject({ tier: 'lookup', sure: true })
-    // A tier left out counts as 0.
-    expect(parseDecision('{"p":{"execute":1},"reason":"x"}')?.p).toEqual({ lookup: 0, execute: 1, decide: 0 })
-  })
-
-  test('a missing risk is 0, an out-of-range one is clamped, a non-number one is 0', async () => {
-    expect(parseDecision('{"p":{"lookup":1,"execute":0,"decide":0},"reason":"x"}')).toMatchObject({ risk: 0, tier: 'lookup', sure: true })
-    expect(parseDecision(P(1, 0, 0, 7))).toMatchObject({ risk: 1, guard: 'risk' })
-    expect(parseDecision('{"p":{"lookup":1,"execute":0,"decide":0},"risk":"high"}')?.risk).toBe(0)
-  })
-
-  test('an all-zero, non-object or non-numeric p is unparseable', async () => {
-    expect(parseDecision(P(0, 0, 0))).toBe(null)
-    expect(parseDecision('{"p":"lookup","reason":"x"}')).toBe(null)
-    expect(parseDecision('{"p":[1,0,0],"reason":"x"}')).toBe(null)
-    expect(parseDecision('{"p":{"lookup":"high","execute":0,"decide":0}}')).toBe(null)
-    expect(parseDecision('{"p":null,"tier":"lookup"}')).toBe(null)
-  })
-
-  test('a calibrated reply cut off after p still routes, unsure, with no reason', async () => {
-    expect(parseDecision('{"p":{"lookup":0.9,"execute":0.1,"decide":0},"risk":0.1,"rea')).toMatchObject({ tier: 'lookup', sure: false, reason: '', p: { lookup: 0.9, execute: 0.1, decide: 0 } })
-    // A cut reply never moves work down, and the guard still applies to what was read.
-    expect(parseDecision('{"p":{"lookup":0.9,"execute":0.1,"decide":0},"risk":0.9,"rea')).toMatchObject({ tier: 'decide', sure: true, guard: 'risk' })
-    expect(parseDecision('{"p":{"lookup":0.9,"exec')).toBe(null)
-  })
-
-  test('the 1.1 reply shape still parses and carries no p or risk', async () => {
-    expect(parseDecision('{"tier":"lookup","sure":false,"reason":"maybe"}')).toEqual({ tier: 'lookup', reason: 'maybe', sure: false })
-    expect(parseDecision('{"tier":"decide","reason":"x"}')).toEqual({ tier: 'decide', reason: 'x', sure: true })
-    expect(parseDecision('{"tier":"execute","sure":false')).toEqual({ tier: 'execute', reason: '', sure: false })
-    expect(parseDecision('{"tier":"huge"}')).toBe(null)
-  })
-
-  test('the prompt asks for probabilities and a risk and drops the two rules the bars replace', async () => {
-    for (const lang of ['en', 'zh'] as const) {
-      const text = classifierSystem(lang)
-      expect(text).toContain('{"p":{"lookup":<0-1>,"execute":<0-1>,"decide":<0-1>},"risk":<0-1>,"reason":string}')
-      expect(text).toContain('Be calibrated: 0.9 means you expect to be wrong about one time in ten.')
-      expect(text).not.toContain('When unsure between two tiers')
-      expect(text).not.toContain('sure:')
-      expect(text).toContain('- If a message mixes tiers, use the highest one it contains.')
+  test('Simplified Chinese instructions are risky', async () => {
+    for (const t of ['推送到 develop', '推上去吧', '改完 push上去', '合并到 main', '部署到 UAT', '上线吧', '删除旧的分支', '发送给客户', '回复客户', '付款', '帮我推送一下吗', '开个PR']) {
+      expect([t, isRisky(t)]).toEqual([t, true])
     }
-    expect(classifierSystem('zh')).toContain('Simplified Chinese, at most 15 字')
-    expect(legacyClassifierSystem('en')).toContain('When unsure between two tiers, pick the higher one.')
-    expect(legacyClassifierSystem('en')).toContain('{"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}')
+  })
+
+  test('Traditional Chinese instructions are risky', async () => {
+    for (const t of ['合併到 main', '上線吧', '刪除這個檔案', '發送給客戶', '回覆他', '轉帳給供應商', '開個PR']) expect([t, isRisky(t)]).toEqual([t, true])
+  })
+
+  // WHY: asking what a command does is a lookup; flooring it would put every git question on Sonnet.
+  test('a question about the words is not risky, in English and Chinese', async () => {
+    for (const t of ['what does git push do?', 'how does merge work', 'explain git rebase vs merge', 'is it safe to deploy on Friday?', 'git push 是什么？', '推送是什么意思', '为什么部署失败', '合併是什麼']) {
+      expect([t, isRisky(t)]).toEqual([t, false])
+    }
+  })
+
+  // WHY: a report that something is already done asks for nothing irreversible.
+  test('a past-tense report is not risky, in English and Chinese', async () => {
+    for (const t of ['merged', 'I pushed it already', 'the PR was merged yesterday', 'it is already deployed to prod', 'I deleted the branch', '已经推送了', '推送了', '已合併', '剛部署完了']) {
+      expect([t, isRisky(t)]).toEqual([t, false])
+    }
+  })
+
+  test('a negated action and ordinary work are not risky', async () => {
+    for (const t of ["don't push yet", 'do not merge it', '不要推送', '先不合并', 'fix the typo in the error message', 'add a comment to the function', 'rename the helper', 'find every TODO', 'look at the PR', 'check the product page', 'fix the release notes typo', 'add push notifications', 'send the request with axios', 'pay attention to the tests', '']) {
+      expect([t, isRisky(t)]).toEqual([t, false])
+    }
   })
 })
 
-describe('classification with probabilities (1.2.0)', () => {
-  const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
+describe('risk floor (1.2.0)', () => {
   const route = (seen: Seen, i = 0) => seen.submits[i]!.context?.[0] ?? ''
 
-  function ui($: any, on: any) {
-    on('ui.toast', async () => ({ value: undefined }))
-    on('session.model', async () => ({ value: 'claude-opus-5-5' }))
-    on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
-    on('tool.register', async () => ({ value: { tool: 'mcp__model-router__escalate' } }))
-    on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
-    on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
-  }
-
-  test('a probability over its bar routes as sure; the prompt that was sent is the calibrated one', async ($, on) => {
-    const seen = world($, on, P(0.9, 0.1, 0, 0, 'find files'))
-    await $.prompt.submit({ text: 'find every TODO' } as never)
-    expect(route(seen)).toContain('assigned to haiku')
-    expect(route(seen)).toContain('find files')
-    expect(seen.systems).toEqual([classifierSystem('en')])
-    expect(seen.systems[0]).toContain('"p":{"lookup"')
+  test('the floor raises a risky lookup to execute and never moves any other tier', async () => {
+    expect(riskFloor('lookup', true)).toBe('execute')
+    expect(riskFloor('execute', true)).toBe('execute')
+    expect(riskFloor('decide', true)).toBe('decide')
+    expect(riskFloor('lookup', false)).toBe('lookup')
+    expect(riskFloor('execute', false)).toBe('execute')
+    expect(riskFloor('decide', false)).toBe('decide')
   })
 
-  test('a probability under its bar is unsure: on a first turn it goes to the more capable of the top two', async ($, on) => {
-    const seen = world($, on, P(0.7, 0.3, 0, 0, 'maybe a lookup'))
-    await $.prompt.submit({ text: 'look at the config' } as never)
-    expect(route(seen)).toContain('assigned to sonnet')
+  // WHY: policy (b): an instructed push is settled work, so it runs on Sonnet at the tier's own effort, not on Haiku and not on Opus.
+  test('a risky message classified lookup runs on Sonnet at medium, says why, and is counted', async ($, on) => {
+    const seen = world($, on, T('lookup', true, 'run git'))
+    await $.prompt.submit({ text: 'push the branch to origin' } as never)
+    expect(route(seen)).toContain('assigned to sonnet at medium effort')
+    expect(route(seen)).toContain('run git · risky action: at least Sonnet')
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
   })
 
-  // WHY: settleTier is unchanged: an unsure pick must never drop a turn below the tier before it.
-  test('an unsure pick after a decide keeps the decide, a sure lower pick does not', async ($, on) => {
-    const seen = world($, on, [P(0, 0.1, 0.9, 0, 'design'), P(0.7, 0.3, 0, 0, 'maybe lookup'), P(0.95, 0.05, 0, 0, 'find')])
-    await $.prompt.submit({ text: 'design the queue' } as never)
-    expect(route(seen, 0)).toContain('assigned to opus')
-    await $.prompt.submit({ text: 'and the config?' } as never)
-    expect(route(seen, 1)).toContain('assigned to opus')
-    expect(route(seen, 1)).toContain('(unsure: not downgrading)')
-    await $.prompt.submit({ text: 'grep for TODO' } as never)
-    expect(route(seen, 2)).toContain('assigned to haiku')
-  })
-
-  test('the risk guard sends a lookup-looking request to Opus, says so, and is counted; one hair under the bar is not', async ($, on) => {
-    const seen = world($, on, [P(0.95, 0.05, 0, 0.7, 'run the deploy'), P(0.95, 0.05, 0, 0.69, 'run the check')])
-    await $.prompt.submit({ text: 'run the deploy script' } as never)
-    expect(route(seen, 0)).toContain('assigned to opus')
-    expect(route(seen, 0)).toContain('run the deploy (irreversible or outward-facing)')
-    expect(await statsOf($)).toContain('Risk guard sent to decide: 1.')
-    await $.prompt.submit({ text: 'run the check script' } as never)
-    expect(route(seen, 1)).not.toContain('(irreversible or outward-facing)')
-    expect(await statsOf($)).toContain('Risk guard sent to decide: 1.')
-  })
-
-  test('the guard note is in Chinese for a Chinese session', { options: { language: 'zh' } }, async ($, on) => {
-    const seen = world($, on, P(0.95, 0.05, 0, 0.9, '推送'))
-    await $.prompt.submit({ text: '推送到主分支' } as never)
-    expect(route(seen)).toContain('推送（不可逆或对外操作）')
-  })
-
-  test('the pacing steer still acts only on an unsure decide: the guard and a sure decide are left alone', { options: { weeklyPacing: 'steer' } }, async ($, on) => {
-    const seen = world($, on, [P(0.5, 0.1, 0.4, 0, 'maybe design'), P(0.1, 0.2, 0.7, 0, 'design'), P(0.95, 0.05, 0, 0.9, 'push it')])
-    ui($, on)
-    const resetsAt = new Date((seen.clock as any).now() + 3.5 * 24 * 3600 * 1000).toISOString()
-    await $.session.measure({ context: { window: 1e6 }, rateLimits: [{ kind: 'seven_day', percentUsed: 82, resetsAt }], changed: ['rateLimits'] } as never)
-    await $.prompt.submit({ text: 'think about it' } as never)
+  test('a risky execute or decide verdict is left alone and not counted', async ($, on) => {
+    const seen = world($, on, [T('execute', true, 'ship'), T('decide', true, 'plan')])
+    await $.prompt.submit({ text: 'merge it into develop' } as never)
     expect(route(seen, 0)).toContain('assigned to sonnet')
-    expect(route(seen, 0)).toContain('(pacing: weekly 82%')
-    await $.prompt.submit({ text: 'a sure decision' } as never)
+    expect(route(seen, 0)).not.toContain('risky action')
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    await $.prompt.submit({ text: 'deploy, but first work out the rollout order' } as never)
     expect(route(seen, 1)).toContain('assigned to opus')
-    await $.prompt.submit({ text: 'push it' } as never)
-    expect(route(seen, 2)).toContain('assigned to opus')
-    expect(route(seen, 2)).not.toContain('pacing')
-    expect(await statsOf($)).toContain('weekly pacing: 1')
+    expect(route(seen, 1)).not.toContain('risky action')
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
   })
 
-  test('the 1.1 reply shape still routes end to end', async ($, on) => {
-    const seen = world($, on, ['{"tier":"decide","sure":false,"reason":"old shape"}', '{"tier":"lookup","reason":"old shape"}'])
-    await $.prompt.submit({ text: 'think' } as never)
-    expect(route(seen, 0)).toContain('assigned to opus')
-    await $.turn.complete(completion('t1'))
-    await $.prompt.submit({ text: 'find' } as never)
-    expect(route(seen, 1)).toContain('assigned to haiku')
-    expect(await statsOf($)).toContain('Risk guard sent to decide: 0.')
+  test('a question about a risky word stays on Haiku', async ($, on) => {
+    const seen = world($, on, T('lookup', true, 'explain'))
+    await $.prompt.submit({ text: 'what does git push do?' } as never)
+    expect(route(seen)).toContain('assigned to haiku')
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
   })
 
-  test('a subagent uses the same pick: sure lookup to Haiku, under the bar to Sonnet, a decision inherits, the guard inherits and counts', async ($, on) => {
-    const seen = world($, on, [P(0.9, 0.1, 0), P(0.7, 0.3, 0), P(0.1, 0.1, 0.8), P(0.95, 0.05, 0, 0.9)])
+  test('the floor note is in Chinese for a Chinese session', { options: { language: 'zh' } }, async ($, on) => {
+    const seen = world($, on, T('lookup', true, '推送'))
+    await $.prompt.submit({ text: '推送到主分支' } as never)
+    expect(route(seen)).toContain('assigned to sonnet')
+    expect(route(seen)).toContain('推送 · 风险操作：至少用 Sonnet')
+  })
+
+  test('a failed classification after a lookup turn keeps the tier but still floors a risky message', async ($, on) => {
+    const seen = world($, on, [T('lookup', true, 'find'), null])
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    expect(route(seen, 0)).toContain('assigned to haiku')
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    await $.prompt.submit({ text: 'now push it' } as never)
+    expect(route(seen, 1)).toContain('assigned to sonnet')
+    expect(route(seen, 1)).toContain('kept previous tier · risky action: at least Sonnet')
+  })
+
+  test('a general-purpose subagent with a risky lookup task runs on Sonnet and counts', async ($, on) => {
+    const seen = world($, on, [T('lookup'), T('lookup')])
     await spawnAgent($, { prompt: 'grep for TODO' })
-    await spawnAgent($, { prompt: 'look around the config' })
-    await spawnAgent($, { prompt: 'audit the save system' })
-    await spawnAgent($, { prompt: 'delete the old bucket' })
-    expect(seen.agents).toEqual(['haiku', 'sonnet', undefined, undefined])
-    expect(await statsOf($)).toContain('Risk guard sent to decide: 1.')
+    await spawnAgent($, { prompt: 'push the release branch to origin' })
+    expect(seen.agents).toEqual(['haiku', 'sonnet'])
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
+  })
+})
+
+describe('classifier prompt and reply (1.2.0)', () => {
+  // WHY: the round 2 measurement used these definitions word for word; a paraphrase would invalidate it.
+  test('the prompt carries the round 2 tier definitions and rules word for word', async () => {
+    const p = classifierSystem('en')
+    for (const line of [
+      'A tier is how much judgement the work needs, not how dangerous it is.',
+      '- **lookup (Haiku):** retrieval or mechanical work with nothing to judge. Find, grep or list files; read and report a value or status; run a command the user named and report the output; rename; fix a typo; format; translate or re-explain a short text; look up a fact or a doc; acknowledge; answer a quick factual follow-up.',
+      '- **execute (Sonnet):** work whose "what" is already settled in the message or the visible context, by a plan, a spec or an exact instruction. Examples:',
+      '  - carry out a plan that was already agreed, including an instructed push, merge, PR, deploy, or a message whose content is settled;',
+      '  - cherry-pick or port a change when the code is the same on both branches.',
+      '- **decide (Opus):** judgement is needed before acting. Examples:',
+      '  - porting a change to a branch whose version of the code differs.',
+      '- A reply that only continues work already in progress ("yes", "go on", "继续") keeps the previous tier.',
+      '- Approving a plan that was just made ("照这个做", "开始吧", "go ahead with that") is execute, because the plan settles what to do.',
+      '- A short message that asks for something new ("explain it in Chinese", "how long will it take?") is judged on its own.',
+      '- A message that is only an image or an attachment, with no words, keeps the previous tier.',
+      '- If a message mixes tiers, use the highest one it contains.',
+      '- When unsure between two tiers, pick the higher one.',
+    ]) expect([line, p.includes(line)]).toEqual([line, true])
+  })
+
+  // WHY: risk is decided in code; asking the model for it again would bring back the uncalibrated guard.
+  test('the prompt asks for tier, sure and reason only, and no longer makes risky work decide', async () => {
+    const p = classifierSystem('en')
+    expect(p).toContain('Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}')
+    expect(p).toContain('- sure: set false when the message is ambiguous')
+    expect(p).not.toMatch(/"risk"|\*\*risk|"p"/)
+    expect(p).not.toContain('Danger is labelled')
+    expect(p).not.toContain('anything irreversible or outward-facing')
+    expect(classifierSystem('zh')).toContain('Simplified Chinese, at most 15 字')
+    expect(legacyClassifierSystem('en')).toContain('anything irreversible or outward-facing')
+    expect(legacyClassifierSystem('en')).not.toBe(classifierSystem('en'))
+  })
+
+  test('a reply is tier, sure and reason; sure defaults to true; a cut reply is unsure; a probability reply is unreadable', async () => {
+    expect(parseDecision('{"tier":"lookup","reason":"x"}')).toEqual({ tier: 'lookup', reason: 'x', sure: true })
+    expect(parseDecision('{"tier":"decide","sure":false,"reason":"x"}')).toEqual({ tier: 'decide', reason: 'x', sure: false })
+    expect(parseDecision('{"tier":"execute","sure":true,"reas')).toEqual({ tier: 'execute', reason: '', sure: false })
+    expect(parseDecision('{"p":{"lookup":0.9,"execute":0.1,"decide":0},"risk":0.1,"reason":"x"}')).toBe(null)
+  })
+})
+
+describe('assignment text for policy (b) (1.2.0)', () => {
+  // WHY: the old text made Sonnet escalate to Opus on every instructed push; settled actions need care, not Opus.
+  test('a settled risky action no longer forces escalation; decisions still do', async () => {
+    for (const tier of ['lookup', 'execute'] as const) {
+      const t = assignmentContext(routeFor(tier, 'x'))
+      expect(t).not.toContain('anything irreversible')
+      expect(t).toContain('Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews) must be made on opus')
+      expect(t).toContain('call mcp__model-router__escalate FIRST')
+      expect(t).toContain('An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus')
+      expect(t).toContain("confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled")
+    }
+  })
+
+  test('the opus text is unchanged', async () => {
+    const t = assignmentContext(routeFor('decide', 'x'))
+    expect(t).toContain('You are on opus at medium effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed.')
+    expect(t).not.toContain('already settled')
   })
 })
 
@@ -7974,10 +7938,11 @@ describe('/model-router replay (1.2.0)', () => {
   const OUT = '/work/labelled.replay.json'
   const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
   const items = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `m${i}`, message: `message ${i}`, context: i % 2 ? '[user] earlier' : '', previous: i % 3 === 0 ? 'execute' : null }))
+  const macrotask = () => new Promise(resolve => (globalThis as any).setTimeout(resolve, 5))
 
   // The world's classifier for these tests: answers every haiku call (live or replayed) by what was asked, and records
   // the requests and how many ran at once. null is a timeout.
-  function classifierBy(answer: (system: string, prompt: string, n: number) => string | null) {
+  function classifierBy(answer: (system: string, prompt: string, n: number) => string | null | Promise<string | null>) {
     const calls = { n: 0, inFlight: 0, max: 0, requests: [] as { system: string; prompt: string }[] }
     const fn = async (e: { system?: string; prompt: string }): Promise<string | null> => {
       const n = calls.n++
@@ -7985,12 +7950,13 @@ describe('/model-router replay (1.2.0)', () => {
       calls.inFlight++
       calls.max = Math.max(calls.max, calls.inFlight)
       for (let i = 0; i < 50; i++) await Promise.resolve()
+      const reply = await answer(e.system ?? '', e.prompt, n)
       calls.inFlight--
-      return answer(e.system ?? '', e.prompt, n)
+      return reply
     }
     return { calls, fn }
   }
-  const bothShapes = (system: string) => (system === classifierSystem('en') ? P(0.9, 0.1, 0, 0.1, 'new') : '{"tier":"execute","sure":false,"reason":"old"}')
+  const bothShapes = (system: string) => (system === classifierSystem('en') ? T('lookup', true, 'new') : T('execute', false, 'old'))
   // The engine turns a path such as /work/x.json into an absolute one on Windows, so the input is stored under both
   // spellings and the output is found by its name.
   const put = (seen: Seen, text: string) => {
@@ -7999,24 +7965,38 @@ describe('/model-router replay (1.2.0)', () => {
   }
   const outFile = (seen: Seen) => Object.keys(seen.files).find(k => /labelled\.replay\.json$/.test(k))
   const readOut = (seen: Seen) => JSON.parse(seen.files[outFile(seen)!]!) as any[]
+  // A replay that hits a timeout pauses on the clock: run it while moving the clock on.
+  async function withClock(seen: Seen, run: Promise<string>): Promise<string> {
+    let done = false
+    void run.then(() => { done = true }, () => { done = true })
+    for (let i = 0; i < 40 && !done; i++) {
+      await macrotask()
+      await seen.clock.advance(REPLAY_PAUSE_MS)
+    }
+    return run
+  }
 
-  test('argument parsing: a path with spaces, an optional variant, the output beside the input', async () => {
-    expect(parseReplayArgs(' /a b/c.json ')).toEqual({ path: '/a b/c.json', variants: ['current', 'legacy'] })
-    expect(parseReplayArgs('/a.json legacy')).toEqual({ path: '/a.json', variants: ['legacy'] })
+  test('argument parsing: a path with spaces, an optional variant, --repeat 1 to 3, the output beside the input', async () => {
+    expect(parseReplayArgs(' /a b/c.json ')).toEqual({ path: '/a b/c.json', variants: ['current', 'legacy'], repeat: 1 })
+    expect(parseReplayArgs('/a.json legacy')).toEqual({ path: '/a.json', variants: ['legacy'], repeat: 1 })
     expect(parseReplayArgs('/a.json current')?.variants).toEqual(['current'])
     expect(parseReplayArgs('/a.json both')?.variants).toEqual(['current', 'legacy'])
-    expect(parseReplayArgs('   ')).toBe(null)
+    expect(parseReplayArgs('/my files/a.json legacy --repeat 3')).toEqual({ path: '/my files/a.json', variants: ['legacy'], repeat: 3 })
+    for (const bad of ['/a.json --repeat 0', '/a.json --repeat 4', '/a.json --repeat x', '/a.json --repeat 1.5', '/a.json --examples /e.json', '   ']) {
+      expect([bad, parseReplayArgs(bad)]).toEqual([bad, null])
+    }
     expect(replayOutPath('/work/labelled.json')).toBe(OUT)
     expect(replayOutPath('/work/labelled')).toBe(OUT)
   })
 
-  test('it is not advertised: the usage text does not mention it, and a bare replay gets its own usage', async ($, on) => {
-    world($, on, P(1, 0, 0))
+  test('it is not advertised: the usage text does not mention it, and a bare replay or a bad flag gets its own usage', async ($, on) => {
+    world($, on, T('lookup'))
     expect(await cmd($, 'nonsense')).not.toContain('replay')
-    expect(await cmd($, 'replay')).toContain('Usage: /model-router replay <path>')
+    expect(await cmd($, 'replay')).toContain('Usage: /model-router replay <path> [current|legacy|both] [--repeat <1-3>]')
+    expect(await cmd($, `replay ${IN} --examples /e.json`)).toContain('Usage: /model-router replay')
   })
 
-  test('both variants run over every item, the results file has one row per item and variant, and a summary comes back', async ($, on) => {
+  test('both variants run over every item, both are parsed the same way, and a summary comes back', async ($, on) => {
     const { calls, fn } = classifierBy(bothShapes)
     const seen = world($, on, fn)
     put(seen, JSON.stringify(items(3)))
@@ -8027,16 +8007,15 @@ describe('/model-router replay (1.2.0)', () => {
     const current = rows.filter(r => r.variant === 'current')
     const legacy = rows.filter(r => r.variant === 'legacy')
     expect(current.map(r => r.id).sort()).toEqual(['m0', 'm1', 'm2'])
-    expect(current[0]).toMatchObject({ ok: true, tier: 'lookup', sure: true, risk: 0.1, p: { lookup: 0.9, execute: 0.1, decide: 0 } })
-    expect(current[0].raw).toContain('"risk"')
-    expect(legacy[0]).toMatchObject({ ok: true, legacyTier: 'execute', legacySure: false })
-    expect(legacy[0].tier).toBeUndefined()
-    expect(text).toContain('results in /work/labelled.replay.json')
+    expect(current[0]).toMatchObject({ ok: true, run: 1, tier: 'lookup', sure: true, risk: false })
+    expect(legacy[0]).toMatchObject({ ok: true, run: 1, tier: 'execute', sure: false, risk: false })
+    expect(typeof current[0].ms).toBe('number')
+    expect(text).toContain('Replay of 3 items (0 risky by the code check): results in /work/labelled.replay.json')
     expect(text).toContain('current: 3/3 answered · lookup 3 · execute 0 · decide 0 · unsure 0')
     expect(text).toContain('legacy: 3/3 answered · lookup 0 · execute 3 · decide 0 · unsure 3')
   })
 
-  test('a single variant runs only that one', async ($, on) => {
+  test('a single variant runs only that one, with its own prompt', async ($, on) => {
     const { calls, fn } = classifierBy(bothShapes)
     const seen = world($, on, fn)
     put(seen, JSON.stringify(items(2)))
@@ -8046,26 +8025,69 @@ describe('/model-router replay (1.2.0)', () => {
     expect(readOut(seen).every(r => r.variant === 'legacy')).toBe(true)
     await cmd($, `replay ${IN} current`)
     expect(calls.n).toBe(4)
+    expect(calls.requests.slice(2).every(r => r.system === classifierSystem('en'))).toBe(true)
     expect(readOut(seen).every(r => r.variant === 'current')).toBe(true)
+  })
+
+  // WHY: run-to-run noise is what round 2 measures; each repeat must be a separate real call with its run number.
+  test('--repeat runs each variant n times and records the run', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    const text = await cmd($, `replay ${IN} --repeat 3`)
+    expect(calls.n).toBe(12)
+    const rows = readOut(seen)
+    expect(rows).toHaveLength(12)
+    for (const id of ['m0', 'm1']) {
+      for (const variant of ['current', 'legacy']) {
+        expect(rows.filter(r => r.id === id && r.variant === variant).map(r => r.run).sort()).toEqual([1, 2, 3])
+      }
+    }
+    expect(text).toContain('Replay of 2 items × 3 runs')
+    expect(text).toContain('current: 6/6 answered')
+  })
+
+  // WHY: the row must say what the code floor would do, while the tier stays the classifier answer, so both can be scored.
+  test('each row records the code risk check of its message, and the tier as the classifier gave it', async ($, on) => {
+    const { fn } = classifierBy(() => T('lookup'))
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify([{ id: 'p', message: 'push the branch' }, { id: 'q', message: 'what does git push do?' }, { id: 'z', message: '已经推送了' }]))
+    const text = await cmd($, `replay ${IN} current`)
+    const rows = readOut(seen)
+    expect(rows.find(r => r.id === 'p')).toMatchObject({ risk: true, tier: 'lookup' })
+    expect(rows.find(r => r.id === 'q')).toMatchObject({ risk: false, tier: 'lookup' })
+    expect(rows.find(r => r.id === 'z')).toMatchObject({ risk: false })
+    expect(text).toContain('(1 risky by the code check)')
+  })
+
+  test('each row records how long its call took', async ($, on) => {
+    const box: { seen?: Seen } = {}
+    const { fn } = classifierBy(async (_s, prompt) => {
+      await box.seen!.clock.advance(prompt.includes('message 0') ? 1500 : 200)
+      return T('execute')
+    })
+    const seen = world($, on, fn)
+    box.seen = seen
+    put(seen, JSON.stringify(items(1)))
+    await cmd($, `replay ${IN} current`)
+    expect(readOut(seen)[0].ms).toBe(1500)
   })
 
   // WHY: the replay measures the real call, so it must send what classifyTier sends, minus the few-shot block.
   test('each request is the live call minus the few-shot block, even when corrections exist', async ($, on) => {
     const { calls, fn } = classifierBy(bothShapes)
-    const stored = { corrections: [{ at: 1, text: 'find every TODO comment', routed: 'lookup', right: 'decide', source: 'manual' }] }
+    const stored = { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] }
     const seen = world($, on, fn, { store: stored })
     put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: '', previous: null }, { id: 'b', message: 'now the tests', context: '[user] x', previous: 'decide' }]))
-    // The live call first, for the parameters to compare with.
     await $.prompt.submit({ text: 'find every TODO' } as never)
-    expect(seen.systems[0]).toContain('find every TODO comment')
+    expect(seen.systems[0]).toContain('rename the helper')
     await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
     await cmd($, `replay ${IN} both`)
     const replayed = calls.requests.slice(1)
     expect(replayed).toHaveLength(4)
     expect(new Set(replayed.map(r => r.prompt))).toEqual(new Set([classifierPrompt(null, '', 'find every TODO'), classifierPrompt('decide', '[user] x', 'now the tests')]))
     expect(replayed.map(r => r.system).sort()).toEqual([classifierSystem('en'), classifierSystem('en'), legacyClassifierSystem('en'), legacyClassifierSystem('en')].sort())
-    expect(replayed.every(r => !r.system.includes('find every TODO comment'))).toBe(true)
-    // The same model call as the live one: haiku, the same token limit.
+    expect(replayed.every(r => !r.system.includes('rename the helper'))).toBe(true)
     expect(seen.asked.every(m => m === 'haiku')).toBe(true)
     expect(seen.maxTokens.every(n => n === seen.maxTokens[0])).toBe(true)
   })
@@ -8082,7 +8104,7 @@ describe('/model-router replay (1.2.0)', () => {
   })
 
   test('the message is masked and cut to 6000 characters like a live one, and a secret in the raw reply is masked', async ($, on) => {
-    const { calls, fn } = classifierBy(() => `{"p":{"lookup":1,"execute":0,"decide":0},"reason":"sk-ant-api03-${'e'.repeat(30)}"}`)
+    const { calls, fn } = classifierBy(() => `{"tier":"lookup","reason":"sk-ant-api03-${'e'.repeat(30)}"}`)
     const seen = world($, on, fn)
     put(seen, JSON.stringify([{ id: 'k', message: `use sk-ant-api03-${'q'.repeat(30)} ${'x'.repeat(7000)}`, context: `token sk-ant-api03-${'w'.repeat(30)}`, previous: null }]))
     await cmd($, `replay ${IN} current`)
@@ -8104,22 +8126,42 @@ describe('/model-router replay (1.2.0)', () => {
   })
 
   test('a timeout and an unreadable reply are rows with a reason, and the summary counts them', async ($, on) => {
-    const { fn } = classifierBy((_s, prompt) => (prompt.includes('message 0') ? null : prompt.includes('message 1') ? 'no json here' : P(0, 1, 0)))
+    const { fn } = classifierBy((_s, prompt) => (prompt.includes('message 0') ? null : prompt.includes('message 1') ? 'no json here' : T('execute')))
     const seen = world($, on, fn)
     put(seen, JSON.stringify(items(3)))
-    const text = await cmd($, `replay ${IN} current`)
+    const text = await withClock(seen, cmd($, `replay ${IN} current`))
     const rows = readOut(seen)
-    expect(rows.find(r => r.id === 'm0')).toMatchObject({ ok: false, why: 'timeout' })
+    expect(rows.find(r => r.id === 'm0')).toMatchObject({ ok: false, why: 'timeout', risk: false })
     expect(rows.find(r => r.id === 'm1')).toMatchObject({ ok: false, why: 'unparseable', raw: 'no json here' })
     expect(rows.find(r => r.id === 'm2')).toMatchObject({ ok: true, tier: 'execute' })
     expect(text).toContain('current: 1/3 answered')
     expect(text).toContain('failures: timeout ×1 · unparseable ×1')
   })
 
+  // WHY: a timeout usually means the API is struggling; starting more calls at once turns one timeout into a storm.
+  test('after a timeout no new request starts until the pause has passed', async ($, on) => {
+    const { calls, fn } = classifierBy((_s, prompt) => (prompt.includes('message 0') ? null : T('execute')))
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(6)))
+    let text: string | undefined
+    const run = cmd($, `replay ${IN} current`).then(t => { text = t; return t })
+    const drain = async () => { for (let i = 0; i < 5; i++) { await macrotask(); await seen.clock.advance(0) } }
+    await drain()
+    expect(calls.n).toBe(4)
+    expect(text).toBeUndefined()
+    await seen.clock.advance(REPLAY_PAUSE_MS - 1)
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(1)
+    await drain()
+    await run
+    expect(calls.n).toBe(6)
+    expect(readOut(seen)).toHaveLength(6)
+  })
+
   // WHY: a replay is a measuring instrument; if it moved routing it would change the numbers it exists to read.
   test('it changes no routing state, count, correction or band; only the spend moves', async ($, on) => {
-    // The live turns: a decide first, and after the replay an unsure execute that the remembered decide must hold.
-    const { fn } = classifierBy((system, prompt) => (prompt.includes('design the queue') ? P(0, 0.1, 0.9, 0, 'design') : prompt.includes('and the tests?') ? P(0.7, 0.3, 0) : bothShapes(system)))
+    const { fn } = classifierBy((system, prompt) => (prompt.includes('design the queue') ? T('decide', true, 'design') : prompt.includes('and the tests?') ? T('lookup', false) : bothShapes(system)))
     const seen = world($, on, fn)
     await $.prompt.submit({ text: 'design the queue' } as never)
     await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
@@ -8185,535 +8227,5 @@ describe('/model-router replay (1.2.0)', () => {
     await cmd($, `replay ${IN} current`)
     expect(calls.requests[0]!.prompt).toBe(classifierPrompt(null, '', 'hello'))
     expect(readOut(seen)[0].id).toBe('0')
-  })
-
-  test('--examples adds the current+examples variant, and a path with spaces still parses', async () => {
-    expect(parseReplayArgs('/a.json --examples /e.json')).toEqual({ path: '/a.json', variants: ['current', 'legacy', 'current+examples'], examples: '/e.json' })
-    expect(parseReplayArgs('/my files/a.json legacy --examples /my files/e.json')).toEqual({ path: '/my files/a.json', variants: ['legacy', 'current+examples'], examples: '/my files/e.json' })
-    expect(parseReplayArgs('/a.json')).toEqual({ path: '/a.json', variants: ['current', 'legacy'] })
-  })
-
-  // WHY: an example that is the item itself would hand the classifier its own answer and make the measurement look better than it is.
-  test('with --examples each item is classified with similar examples from the file, never with its own entry', async ($, on) => {
-    const { calls, fn } = classifierBy(bothShapes)
-    const seen = world($, on, fn)
-    put(seen, JSON.stringify([
-      { id: 'a', message: 'rename the helper in utils', context: '', previous: null },
-      { id: 'z', message: 'rename the helper in utils', context: '', previous: 'decide' },
-    ]))
-    const examples = JSON.stringify([
-      { id: 'a', message: 'rename the helper in utils', right: 'decide' },
-      { id: 'b', message: 'deploy the release to production', right: 'decide' },
-    ])
-    seen.files['/work/examples.json'] = examples
-    seen.files['C:\\work\\examples.json'] = examples
-    const text = await cmd($, `replay ${IN} current --examples /work/examples.json`)
-    const withExamples = calls.requests.filter(r => r.system.startsWith(classifierSystem('en')) && r.system !== classifierSystem('en'))
-    // Item a: its only similar entry is itself, so it gets no block. Item z gets that entry, and not the unrelated one.
-    const forA = calls.requests.filter(r => r.prompt === classifierPrompt(null, '', 'rename the helper in utils'))
-    expect(forA.map(r => r.system)).toEqual([classifierSystem('en'), classifierSystem('en')])
-    expect(withExamples).toHaveLength(1)
-    expect(withExamples[0]!.prompt).toBe(classifierPrompt('decide', '', 'rename the helper in utils'))
-    expect(withExamples[0]!.system).toContain('Corrections this developer made to earlier routing (newest last)')
-    expect(withExamples[0]!.system).toContain('- "rename the helper in utils" → decide (was routed execute)')
-    expect(withExamples[0]!.system).not.toContain('deploy the release')
-    const rows = readOut(seen)
-    expect(rows.filter(r => r.variant === 'current+examples').map(r => r.id).sort()).toEqual(['a', 'z'])
-    expect(rows.filter(r => r.variant === 'current+examples')[0]).toMatchObject({ ok: true, tier: 'lookup', sure: true })
-    expect(text).toContain('current+examples: 2/2 answered')
-  })
-
-  test('an unreadable or malformed examples file is refused with a reason and asks the model nothing', async ($, on) => {
-    const { calls, fn } = classifierBy(bothShapes)
-    const seen = world($, on, fn)
-    put(seen, JSON.stringify(items(2)))
-    expect(await cmd($, `replay ${IN} --examples /work/none.json`)).toContain('cannot read /work/none.json')
-    seen.files['/work/bad.json'] = '[{"id":"a","message":"x","right":"huge"}]'
-    seen.files['C:\\work\\bad.json'] =seen.files['/work/bad.json']
-    expect(await cmd($, `replay ${IN} --examples /work/bad.json`)).toContain('examples item 0 needs a message and a right tier')
-    expect(calls.n).toBe(0)
-  })
-})
-
-// ---------------------------------------------------------------------------------------------------------------------
-// 1.2.0 (A): examples chosen by similarity
-// ---------------------------------------------------------------------------------------------------------------------
-
-describe('similar examples (1.2.0)', () => {
-  const c = (text: string, at = 1, right: 'lookup' | 'execute' | 'decide' = 'decide'): Correction => ({ at, text, routed: 'lookup', right, source: 'manual' })
-  const RELATED: [string, string][] = [
-    ['rename the helper in utils', 'rename the helper function in the utils file'],
-    ['fix the typo in the readme', 'fix typo in README.md'],
-    ['look at the auth flow', 'look at the login flow'],
-    ['commit the fixes', 'commit the fix'],
-  ]
-  const UNRELATED: [string, string][] = [
-    ['rename the helper in utils', 'deploy the release to production'],
-    ['look at the auth flow', 'write tests for the payment module'],
-    ['find every TODO', 'rename the helper'],
-  ]
-
-  // WHY: the number is a judgement; these pairs fix which side of it realistic wordings fall on, so moving it is a visible decision.
-  test('the minimum sits between related wordings and unrelated work, in English', async () => {
-    expect(MIN_SIMILARITY).toBe(0.12)
-    for (const [a, b] of RELATED) expect(similarity(a, b)).toBeGreaterThan(MIN_SIMILARITY * 2)
-    for (const [a, b] of UNRELATED) expect(similarity(a, b)).toBeLessThan(MIN_SIMILARITY)
-  })
-
-  test('Chinese is compared by character bigrams', async () => {
-    expect(similarity('把这个函数重命名一下', '请把函数重命名')).toBeGreaterThan(MIN_SIMILARITY * 2)
-    expect(similarity('部署到生产环境', '把代码部署到生产环境吧')).toBeGreaterThan(MIN_SIMILARITY * 2)
-    expect(similarity('把这个函数重命名一下', '部署到生产环境')).toBeLessThan(MIN_SIMILARITY)
-    // A single Chinese character is its own gram, so a one-character message is comparable.
-    expect(similarity('改', '改')).toBe(1)
-  })
-
-  test('mixed text compares both parts: the English by trigrams, the Chinese by bigrams', async () => {
-    expect(similarity('run the migration in 生产环境', 'run the migration on production')).toBeGreaterThan(MIN_SIMILARITY * 2)
-    expect(similarity('migrate 生产环境', '部署到生产环境')).toBeGreaterThan(MIN_SIMILARITY)
-    expect(similarity('run the migration in 生产环境', 'rename the helper')).toBeLessThan(MIN_SIMILARITY)
-  })
-
-  test('case, spacing and masked secrets do not matter, and empty text is similar to nothing', async () => {
-    expect(similarity('Rename   THE helper', 'rename the helper')).toBe(1)
-    expect(similarity(`use sk-ant-api03-${'a'.repeat(30)}`, `use sk-ant-api03-${'b'.repeat(30)}`)).toBe(1)
-    expect(similarity('', 'rename the helper')).toBe(0)
-    expect(similarity('', '')).toBe(0)
-  })
-
-  test('the best EXAMPLES_K are taken, oldest first so the block still reads newest last', async () => {
-    const list = Array.from({ length: 10 }, (_, i) => c(`rename the helper in utils ${'x'.repeat(i)}`, i + 1))
-    list.push(c('deploy the release to production', 99))
-    const picked = similarExamples(list, 'rename the helper in utils')
-    expect(EXAMPLES_K).toBe(6)
-    expect(picked).toHaveLength(6)
-    // The least extra text scores highest: entries 1 to 3 differ from the message by 0, 1 and 2 grams; from the fourth on
-    // every entry adds the same three grams (a repeated letter adds none), so those tie and the newest of them win.
-    expect(picked.map(x => x.at)).toEqual([1, 2, 3, 8, 9, 10])
-    expect(picked.every(x => !x.text.includes('deploy'))).toBe(true)
-  })
-
-  test('nothing reaching the minimum means no examples at all', async () => {
-    expect(similarExamples([c('deploy the release to production'), c('部署到生产环境')], 'rename the helper in utils')).toEqual([])
-    expect(similarExamples([], 'rename the helper')).toEqual([])
-    expect(similarExamples([c('rename the helper')], '')).toEqual([])
-  })
-
-  test('an entry exactly at the minimum is kept, one under it is not', async () => {
-    const list = [c('rename the helper')]
-    const score = similarity('rename the helper', 'rename the helper please do')
-    expect(similarExamples(list, 'rename the helper please do', 6, score)).toHaveLength(1)
-    expect(similarExamples(list, 'rename the helper please do', 6, score + 1e-9)).toHaveLength(0)
-  })
-
-  test('a tie goes to the newer entry', async () => {
-    const list = [c('rename the helper in utils', 5), c('rename the helper in utils', 9), c('rename the helper in utils', 2)]
-    expect(similarExamples(list, 'rename the helper in utils', 1).map(x => x.at)).toEqual([9])
-    expect(similarExamples(list, 'rename the helper in utils', 2).map(x => x.at)).toEqual([5, 9])
-  })
-
-  test('the store holds 300; a repeated text replaces its entry, and an entry pushed out can no longer be found', async () => {
-    let list: Correction[] = []
-    for (let i = 0; i < MAX_CORRECTIONS + 10; i++) list = addCorrection(list, c(`unrelated job number ${i} about ${'q'.repeat(i % 7)}`, i))
-    expect(MAX_CORRECTIONS).toBe(300)
-    expect(list).toHaveLength(300)
-    expect(list[0]!.text).toContain('number 10 ')
-    list = addCorrection(list, c('unrelated job number 11 about ', 1000, 'execute'))
-    expect(list).toHaveLength(300)
-    expect(list.filter(x => x.text === 'unrelated job number 11 about ')).toHaveLength(1)
-    expect(list.at(-1)!.right).toBe('execute')
-    expect(readCorrections(Array.from({ length: 305 }, (_, i) => c(`t${i}`, i)))).toHaveLength(300)
-  })
-})
-
-describe('classifier prompt with similar examples (1.2.0)', () => {
-  const stored = (...texts: string[]) => ({ corrections: texts.map((text, i) => ({ at: i + 1, text, routed: 'lookup', right: 'decide', source: 'manual' })) })
-  const LOOKUP_REPLY = P(0.9, 0.1, 0)
-
-  test('a similar correction is added, a dissimilar one is not, and the block keeps its format', async ($, on) => {
-    const seen = world($, on, LOOKUP_REPLY, { store: stored('rename the helper in utils', 'deploy the release to production') })
-    await $.prompt.submit({ text: 'rename the helper function in the utils file' } as never)
-    expect(seen.systems[0]!.startsWith(classifierSystem('en'))).toBe(true)
-    expect(seen.systems[0]).toContain('Corrections this developer made to earlier routing (newest last)')
-    expect(seen.systems[0]).toContain('- "rename the helper in utils" → decide (was routed lookup)')
-    expect(seen.systems[0]).not.toContain('deploy the release')
-  })
-
-  // WHY: with nothing similar the prompt must be exactly the one without corrections, so it caches and behaves as before.
-  test('with nothing similar the prompt is the plain one', async ($, on) => {
-    const seen = world($, on, LOOKUP_REPLY, { store: stored('deploy the release to production', '部署到生产环境') })
-    await $.prompt.submit({ text: 'find every TODO' } as never)
-    expect(seen.systems).toEqual([classifierSystem('en')])
-  })
-
-  test('the examples follow the message: each classification chooses its own', async ($, on) => {
-    const seen = world($, on, [LOOKUP_REPLY, LOOKUP_REPLY], { store: stored('rename the helper in utils', 'deploy the release to production') })
-    await $.prompt.submit({ text: 'rename the helper function in the utils file' } as never)
-    await $.prompt.submit({ text: 'deploy the release to production now' } as never)
-    expect(seen.systems[0]).toContain('rename the helper in utils')
-    expect(seen.systems[0]).not.toContain('deploy the release')
-    expect(seen.systems[1]).toContain('deploy the release to production')
-    expect(seen.systems[1]).not.toContain('rename the helper')
-  })
-
-  test('a subagent gets the examples similar to its task', async ($, on) => {
-    const seen = world($, on, LOOKUP_REPLY, { store: stored('rename the helper in utils', 'deploy the release to production') })
-    await spawnAgent($, { prompt: 'rename the helper function in the utils file' })
-    expect(seen.systems).toHaveLength(1)
-    expect(seen.systems[0]).toContain('rename the helper in utils')
-    expect(seen.systems[0]).not.toContain('deploy the release')
-  })
-
-  test('learning off leaves the prompt plain even for a similar message', { options: { learnFromCorrections: false } }, async ($, on) => {
-    const seen = world($, on, LOOKUP_REPLY, { store: stored('rename the helper in utils') })
-    await $.prompt.submit({ text: 'rename the helper function in the utils file' } as never)
-    expect(seen.systems).toEqual([classifierSystem('en')])
-  })
-
-  test('selection reads no store: the corrections are read once, not per classification', async ($, on) => {
-    let reads = 0
-    const seen = world($, on, [LOOKUP_REPLY, LOOKUP_REPLY, LOOKUP_REPLY], { store: stored('rename the helper in utils') })
-    on('store.get', { key: 'corrections' }, async (_$: unknown, e: any, next: any) => {
-      reads++
-      return next(e)
-    })
-    for (let i = 0; i < 3; i++) await $.prompt.submit({ text: `rename the helper in utils ${i}` } as never)
-    expect(seen.systems.every(s => s.includes('rename the helper in utils'))).toBe(true)
-    expect(reads).toBeLessThanOrEqual(1)
-  })
-})
-
-// ---------------------------------------------------------------------------------------------------------------------
-// 1.2.0 (C): calibration records and /model-router tune
-// ---------------------------------------------------------------------------------------------------------------------
-
-describe('tuning math (1.2.0)', () => {
-  type T = 'lookup' | 'execute' | 'decide'
-  const s = (n: number, p: [number, number, number], right: T, risk = 0): Sample[] =>
-    Array.from({ length: n }, () => ({ p: { lookup: p[0], execute: p[1], decide: p[2] }, risk, right }))
-  // The optimum is known: 20 lookups the classifier gives 0.75, 20 executes it gives 0.70 for lookup, and 10 decisions.
-  // The default lookup bar (0.85) over-routes the first group; the lowest bar that does not under-route the second is 0.75.
-  const SYNTHETIC: Sample[] = [...s(20, [0.75, 0.25, 0], 'lookup'), ...s(20, [0.7, 0.3, 0], 'execute'), ...s(10, [0.1, 0.2, 0.7], 'decide')]
-
-  test('evaluate counts right, under-routed, over-routed and the cost proxy', async () => {
-    const e = evaluate(SYNTHETIC, TIER_BARS, RISK_BAR)
-    expect(e).toMatchObject({ n: 50, accuracy: 30 / 50, under: 0, over: 20 / 50 })
-    // Weights 1 : 2 : 4: cache reads at 200k cost Haiku $0.05, Sonnet $0.10, Opus $0.20 per million (long-prompt Haiku).
-    expect(COST).toEqual({ lookup: 1, execute: 2, decide: 4 })
-    expect(Math.abs(e.cost - (20 * 2 + 20 * 2 + 10 * 4) / 50) < 1e-12).toBe(true)
-    expect(evaluate([], TIER_BARS)).toEqual({ n: 0, accuracy: 0, under: 0, over: 0, cost: 0 })
-    // A risky message goes to decide: over-routing when the right tier was lower.
-    expect(evaluate(s(1, [1, 0, 0], 'lookup', 0.9), TIER_BARS)).toMatchObject({ over: 1, accuracy: 0 })
-  })
-
-  test('the fit finds the known optimum and does not raise under-routing', async () => {
-    const fit = fitBars(SYNTHETIC, TIER_BARS)
-    expect(fit.bars).toEqual({ lookup: 0.75, execute: 0.6, decide: 0.3 })
-    expect(fit.suggested.under).toBeLessThanOrEqual(fit.current.under)
-    expect(fit.suggested.cost).toBeLessThan(fit.current.cost)
-    expect(fit.suggested.accuracy).toBe(1)
-  })
-
-  // WHY: cheaper is only an improvement if it does not send more work to a model too small for it. Without the
-  // constraint the cheapest bars are 0.70, which routes the second group to Haiku.
-  test('the under-routing limit holds the bar at 0.75 even though 0.70 is cheaper', async () => {
-    const cheaper = evaluate(SYNTHETIC, { lookup: 0.7, execute: 0.6, decide: 0.3 })
-    expect(cheaper.cost).toBeLessThan(fitBars(SYNTHETIC, TIER_BARS).suggested.cost)
-    expect(cheaper.under).toBeGreaterThan(0)
-    expect(fitBars(SYNTHETIC, TIER_BARS).bars.lookup).toBe(0.75)
-  })
-
-  test('with current bars already under-routing, the fit may keep that rate but never exceed it', async () => {
-    const data = [...SYNTHETIC, ...s(5, [0.9, 0.1, 0], 'execute')]
-    const fit = fitBars(data, TIER_BARS)
-    expect(fit.current.under).toBeGreaterThan(0)
-    expect(fit.suggested.under).toBeLessThanOrEqual(fit.current.under + 1e-12)
-    expect(fit.suggested.cost).toBeLessThanOrEqual(fit.current.cost + 1e-12)
-  })
-
-  test('the fit leaves already-best bars alone', async () => {
-    const best = { lookup: 0.75, execute: 0.6, decide: 0.3 }
-    expect(fitBars(SYNTHETIC, best).bars).toEqual(best)
-  })
-
-  // WHY: one apply must not swing the classifier on a small or lucky sample.
-  test('a bar moves at most 0.05 per apply and stays inside 0.2 to 0.95', async () => {
-    expect(STEP_MAX).toBe(0.05)
-    expect(stepBars({ lookup: 0.85, execute: 0.6, decide: 0.3 }, { lookup: 0.5, execute: 0.6, decide: 0.3 })).toEqual({ lookup: 0.8, execute: 0.6, decide: 0.3 })
-    expect(stepBars({ lookup: 0.5, execute: 0.6, decide: 0.3 }, { lookup: 0.95, execute: 0.2, decide: 0.9 })).toEqual({ lookup: 0.55, execute: 0.55, decide: 0.35 })
-    expect(stepBars({ lookup: 0.75, execute: 0.6, decide: 0.3 }, { lookup: 0.75, execute: 0.6, decide: 0.3 })).toEqual({ lookup: 0.75, execute: 0.6, decide: 0.3 })
-    // The clamp: a stored bar outside the range is pulled in.
-    expect(stepBars({ lookup: 0.98, execute: 0.15, decide: 0.3 }, { lookup: 0.95, execute: 0.2, decide: 0.3 })).toEqual({ lookup: 0.95, execute: 0.2, decide: 0.3 })
-    expect(BAR_MIN).toBe(0.2)
-    expect(BAR_MAX).toBe(0.95)
-  })
-
-  test('three apply steps from 0.85 reach 0.75 and stop there, without float drift', async () => {
-    let bars = { lookup: 0.85, execute: 0.6, decide: 0.3 }
-    const goal = { lookup: 0.75, execute: 0.6, decide: 0.3 }
-    bars = stepBars(bars, goal)
-    expect(bars.lookup).toBe(0.8)
-    bars = stepBars(bars, goal)
-    expect(bars.lookup).toBe(0.75)
-    expect(stepBars(bars, goal)).toEqual(bars)
-  })
-
-  test('a stored override is read only when it is three numbers in range', async () => {
-    expect(readBars({ lookup: 0.7, execute: 0.5, decide: 0.3 })).toEqual({ lookup: 0.7, execute: 0.5, decide: 0.3 })
-    expect(readBars({ lookup: 0.1, execute: 0.5, decide: 0.3 })).toBeUndefined()
-    expect(readBars({ lookup: 0.99, execute: 0.5, decide: 0.3 })).toBeUndefined()
-    expect(readBars({ lookup: 0.7, execute: 0.5 })).toBeUndefined()
-    expect(readBars('x')).toBeUndefined()
-    expect(readBars(null)).toBeUndefined()
-  })
-
-  test('the stored records are not trusted: malformed ones are dropped', async () => {
-    const ok = { at: 1, turnId: 't1', p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0, tier: 'lookup', sure: true }
-    expect(readCalib([ok, { ...ok, tier: 'huge' }, null, { ...ok, p: 'x' }, { at: 'now' }])).toEqual([ok])
-    expect(readCalib('nope')).toEqual([])
-  })
-
-  test('labels join a replay results file by id, and only answered current rows count', async () => {
-    const rows = [
-      { id: 'a', variant: 'current', ok: true, p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0 },
-      { id: 'a', variant: 'legacy', ok: true },
-      { id: 'b', variant: 'current', ok: false },
-      { id: 'c', variant: 'current+examples', ok: true, p: { lookup: 1, execute: 0, decide: 0 }, risk: 0 },
-    ]
-    const calib = [{ at: 1, turnId: 't', p: { lookup: 0.5, execute: 0.5, decide: 0 }, risk: 0, tier: 'execute' as const, sure: false, right: 'decide' as const }, { at: 2, turnId: 'u', p: { lookup: 1, execute: 0, decide: 0 }, risk: 0, tier: 'lookup' as const, sure: true }]
-    const out = labelledSamples(calib, [{ id: 'a', right: 'execute' }, { id: 'b', right: 'lookup' }, { id: 'c', right: 'lookup' }, { id: 'zz', right: 'lookup' }], rows)
-    expect(out).toMatchObject({ fromCorrections: 1, fromReplay: 1 })
-    expect(out.samples).toEqual([{ p: { lookup: 0.5, execute: 0.5, decide: 0 }, risk: 0, right: 'decide' }, { p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0, right: 'execute' }])
-    expect(parseLabels('[{"id":"a","right":"lookup"},{"id":2,"right":"decide"}]')).toEqual({ ok: true, labels: [{ id: 'a', right: 'lookup' }, { id: '2', right: 'decide' }] })
-    expect(parseLabels('[{"id":"a","right":"huge"}]')).toMatchObject({ ok: false })
-    expect(parseLabels('{')).toMatchObject({ ok: false })
-  })
-
-  test('below 30 labelled turns there is no suggestion and the report says how many more', async () => {
-    const few = { samples: SYNTHETIC.slice(0, 12), fromCorrections: 12, fromReplay: 0 }
-    const plan = planFor(few, TIER_BARS)
-    expect(plan).toEqual({ enough: false, labelled: 12, need: 18 })
-    const text = tuneReport('en', [], TIER_BARS, RISK_BAR, few, plan)
-    expect(text).toContain('Not enough labelled turns to suggest bars: 12 of 30, 18 more needed.')
-    expect(text).not.toContain('Suggested bars')
-    expect(planFor({ samples: SYNTHETIC.slice(0, 30), fromCorrections: 30, fromReplay: 0 }, TIER_BARS).enough).toBe(true)
-  })
-
-  test('with enough turns the report sets current and suggested side by side', async () => {
-    const labelled = { samples: SYNTHETIC, fromCorrections: 0, fromReplay: 50 }
-    const text = tuneReport('en', [], TIER_BARS, RISK_BAR, labelled, planFor(labelled, TIER_BARS))
-    expect(text).toContain('Suggested bars: lookup 0.75 · execute 0.6 · decide 0.3 · risk 0.7')
-    expect(text).toContain('accuracy: 60.0% → 100.0%')
-    expect(text).toContain('under-routing: 0.0% → 0.0%')
-    expect(text).toContain('over-routing: 40.0% → 0.0%')
-    expect(text).toContain('cost proxy (current = 100%): 100% → 83%')
-    expect(text).toContain('Nothing has changed.')
-    expect(tuneReport('zh', [], TIER_BARS, RISK_BAR, labelled, planFor(labelled, TIER_BARS))).toContain('建议阈值')
-  })
-})
-
-describe('calibration records and /model-router tune (1.2.0)', () => {
-  const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
-  const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
-  const route = (seen: Seen, i = 0) => seen.submits[i]!.context?.[0] ?? ''
-  const calibKeys = (seen: Seen) => Object.keys(seen.store).filter(k => k.startsWith('calib:'))
-  const calibAll = (seen: Seen) => calibKeys(seen).flatMap(k => seen.store[k] as any[])
-  const rec = (i: number, p: [number, number, number], right: 'lookup' | 'execute' | 'decide') => ({
-    at: i, turnId: `s${i}`, p: { lookup: p[0], execute: p[1], decide: p[2] }, risk: 0, tier: 'execute', sure: true, right,
-  })
-  // 50 labelled turns whose best lookup bar is 0.75 (see the math tests).
-  const seeded = () => ({
-    [`calib:${storeDay(0)}:sess-x`]: [
-      ...Array.from({ length: 20 }, (_, i) => rec(i, [0.75, 0.25, 0], 'lookup')),
-      ...Array.from({ length: 20 }, (_, i) => rec(20 + i, [0.7, 0.3, 0], 'execute')),
-      ...Array.from({ length: 10 }, (_, i) => rec(40 + i, [0.1, 0.2, 0.7], 'decide')),
-    ],
-  })
-
-  describe('the record', () => {
-    test('a classified turn keeps its numbers and pick, with no prompt text', async ($, on) => {
-      const seen = world($, on, P(0.9, 0.1, 0, 0.2, 'find files'))
-      await $.prompt.submit({ text: 'find every TODO in the secret project' } as never)
-      expect(calibKeys(seen)).toEqual([`calib:${storeDay(0)}:sess-1`])
-      const [r] = calibAll(seen)
-      expect(r).toMatchObject({ turnId: 't1', p: { lookup: 0.9, execute: 0.1, decide: 0 }, risk: 0.2, tier: 'lookup', sure: true })
-      expect(Object.keys(r).sort()).toEqual(['at', 'p', 'risk', 'sure', 'tier', 'turnId'])
-      expect(JSON.stringify(seen.store[calibKeys(seen)[0]!])).not.toContain('secret')
-    })
-
-    test('a guard decision is marked, and an unsure pick says so', async ($, on) => {
-      const seen = world($, on, [P(0.95, 0.05, 0, 0.9, 'push'), P(0.5, 0.1, 0.4, 0, 'maybe')])
-      await $.prompt.submit({ text: 'push to main' } as never)
-      await $.turn.complete(completion('t1'))
-      await $.prompt.submit({ text: 'think about it' } as never)
-      const records = calibAll(seen)
-      expect(records[0]).toMatchObject({ tier: 'decide', sure: true, guard: 'risk', risk: 0.9 })
-      expect(records[1]).toMatchObject({ tier: 'decide', sure: false })
-      expect(records[1].guard).toBeUndefined()
-    })
-
-    test('forced, pinned and old-shape turns leave no record', async ($, on) => {
-      const seen = world($, on, '{"tier":"lookup","reason":"old"}')
-      await $.prompt.submit({ text: 'pick a database #opus' } as never)
-      await $.turn.complete(completion('t1'))
-      await cmd($, 'pin opus 1')
-      await $.prompt.submit({ text: 'pinned work' } as never)
-      await $.turn.complete(completion('t2'))
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(calibKeys(seen)).toEqual([])
-    })
-
-    test('a correction attaches its right tier, an escalation the model it reached, to that turn alone', async ($, on) => {
-      const seen = world($, on, [P(0.9, 0.1, 0), P(0.9, 0.1, 0)])
-      await $.prompt.submit({ text: 'rename the helper' } as never)
-      await $.turn.complete(completion('t1'))
-      await $.prompt.submit({ text: 'look at the auth flow' } as never)
-      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)
-      await $.turn.complete(completion('t2'))
-      expect(await cmd($, 'wrong decide')).toContain('should have been decide')
-      const [first, second] = calibAll(seen)
-      expect(first.right).toBeUndefined()
-      expect(first.escalatedTo).toBeUndefined()
-      expect(second).toMatchObject({ turnId: 't2', right: 'decide', escalatedTo: 'opus' })
-    })
-
-    test('an effort-only raise is no escalation record', async ($, on) => {
-      const seen = world($, on, P(0.9, 0.1, 0))
-      await $.prompt.submit({ text: 'look at the auth flow' } as never)
-      await $.tool.call({ tool: 'mcp__model-router__escalate', effort: 'high', reason: 'harder' } as never)
-      expect(calibAll(seen)[0].escalatedTo).toBeUndefined()
-    })
-
-    test('records older than the 30-day retention are pruned with the meter, newer ones stay', async ($, on) => {
-      const recent = `calib:${storeDay(0)}:sess-old`
-      const seen = world($, on, P(0.9, 0.1, 0), { store: { 'calib:19000101:sess-old': [rec(1, [1, 0, 0], 'lookup')], [recent]: [rec(2, [1, 0, 0], 'lookup')] } })
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(seen.store['calib:19000101:sess-old']).toBeUndefined()
-      expect(seen.store[recent]).toBeDefined()
-    })
-  })
-
-  describe('the report', () => {
-    test('with too little data it shows the per-tier numbers, the bars and how many more labels are needed', async ($, on) => {
-      const seen = world($, on, [P(0.9, 0.1, 0), P(0.1, 0.1, 0.8)])
-      await $.prompt.submit({ text: 'find files' } as never)
-      await $.turn.complete(completion('t1'))
-      await $.prompt.submit({ text: 'design the queue' } as never)
-      await $.turn.complete(completion('t2'))
-      const text = await cmd($, 'tune')
-      expect(text).toContain('2 classified turns recorded')
-      expect(text).toContain('lookup: 1 routed · corrected 0 (0%) · escalated to a higher model 0 (0%)')
-      expect(text).toContain('decide: 1 routed')
-      expect(text).toContain('Weak signal: escalations are not proof the tier was wrong.')
-      expect(text).toContain('Bars (default): lookup 0.85 · execute 0.6 · decide 0.3 · risk 0.7')
-      expect(text).toContain('Labelled turns: 0')
-      expect(text).toContain('Not enough labelled turns to suggest bars: 0 of 30, 30 more needed.')
-      expect(seen.store.bars).toBeUndefined()
-    })
-
-    test('a tier row counts its corrections and its escalations', async ($, on) => {
-      world($, on, P(0.9, 0.1, 0))
-      await $.prompt.submit({ text: 'look at the auth flow' } as never)
-      await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)
-      await $.turn.complete(completion('t1'))
-      await cmd($, 'wrong decide')
-      expect(await cmd($, 'tune')).toContain('lookup: 1 routed · corrected 1 (100%) · escalated to a higher model 1 (100%)')
-    })
-
-    test('with enough labelled turns it suggests bars and changes nothing', async ($, on) => {
-      const seen = world($, on, P(1, 0, 0), { store: seeded() })
-      const text = await cmd($, 'tune')
-      expect(text).toContain('Labelled turns: 50 (corrections 50, labels joined to a replay 0).')
-      expect(text).toContain('Suggested bars: lookup 0.75 · execute 0.6 · decide 0.3 · risk 0.7')
-      expect(text).toContain('under-routing:')
-      expect(seen.store.bars).toBeUndefined()
-      expect(await statsOf($)).toContain('Classifier bars: default')
-    })
-
-    test('--labels joined with --replay supplies the labels, and one flag alone is refused', async ($, on) => {
-      const seen = world($, on, P(1, 0, 0))
-      const rows = Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, variant: 'current', ok: true, p: i < 20 ? { lookup: 0.75, execute: 0.25, decide: 0 } : { lookup: 0.7, execute: 0.3, decide: 0 }, risk: 0 }))
-      const labels = Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, right: i < 20 ? 'lookup' : 'execute' }))
-      for (const [name, data] of [['labels', labels], ['replay', rows]] as const) {
-        seen.files[`/work/${name}.json`] = JSON.stringify(data)
-        seen.files[`C:\\work\\${name}.json`] = JSON.stringify(data)
-      }
-      const text = await cmd($, 'tune --labels /work/labels.json --replay /work/replay.json')
-      expect(text).toContain('Labelled turns: 40 (corrections 0, labels joined to a replay 40).')
-      expect(text).toContain('Suggested bars: lookup 0.75')
-      expect(await cmd($, 'tune --labels /work/labels.json')).toContain('--labels and --replay go together.')
-      expect(await cmd($, 'tune --labels /work/none.json --replay /work/replay.json')).toContain('Cannot read /work/none.json')
-    })
-  })
-
-  describe('apply and reset', () => {
-    test('apply moves each bar by at most 0.05, says what changed, stores it, and the next classification uses it', async ($, on) => {
-      const seen = world($, on, [P(0.78, 0.22, 0), P(0.78, 0.22, 0), P(0.78, 0.22, 0)], { store: seeded() })
-      await $.prompt.submit({ text: 'find files' } as never)
-      // Under the default 0.85 bar the 0.78 lookup is unsure, so the first turn goes to Sonnet.
-      expect(route(seen, 0)).toContain('assigned to sonnet')
-      const first = await cmd($, 'tune apply')
-      expect(first).toContain('lookup 0.85 → 0.8')
-      expect(first).not.toContain('execute 0.6 →')
-      expect(seen.store.bars).toEqual({ lookup: 0.8, execute: 0.6, decide: 0.3 })
-      expect(await statsOf($)).toContain('Classifier bars: tuned (lookup 0.8 · execute 0.6 · decide 0.3 · risk 0.7)')
-      await $.turn.complete(completion('t1'))
-      await $.prompt.submit({ text: 'find more files' } as never)
-      expect(route(seen, 1)).toContain('assigned to sonnet')
-      const second = await cmd($, 'tune apply')
-      expect(second).toContain('lookup 0.8 → 0.75')
-      expect(seen.store.bars).toEqual({ lookup: 0.75, execute: 0.6, decide: 0.3 })
-      await $.turn.complete(completion('t2'))
-      // Now a 0.78 lookup clears the bar: the override is what classification reads.
-      await $.prompt.submit({ text: 'find even more files' } as never)
-      expect(route(seen, 2)).toContain('assigned to haiku')
-      expect(await cmd($, 'tune apply')).toContain('No change')
-    })
-
-    test('apply refuses with too little data and stores nothing', async ($, on) => {
-      const seen = world($, on, P(1, 0, 0))
-      expect(await cmd($, 'tune apply')).toContain('Not enough labelled turns')
-      expect(seen.store.bars).toBeUndefined()
-    })
-
-    test('a stored override is loaded with the prefs, and a bad one is ignored', async ($, on) => {
-      const seen = world($, on, P(0.72, 0.28, 0), { store: { bars: { lookup: 0.7, execute: 0.6, decide: 0.3 } } })
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(route(seen, 0)).toContain('assigned to haiku')
-      expect(await statsOf($)).toContain('Classifier bars: tuned')
-      expect(await cmd($, 'status')).toContain('Classifier bars: tuned (lookup 0.7')
-    })
-
-    test('a stored override out of range is ignored', async ($, on) => {
-      const seen = world($, on, P(0.72, 0.28, 0), { store: { bars: { lookup: 0.1, execute: 0.6, decide: 0.3 } } })
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(route(seen, 0)).toContain('assigned to sonnet')
-      expect(await statsOf($)).toContain('Classifier bars: default')
-    })
-
-    test('reset deletes the override and classification goes back to the defaults', async ($, on) => {
-      const seen = world($, on, [P(0.72, 0.28, 0), P(0.72, 0.28, 0)], { store: { bars: { lookup: 0.7, execute: 0.6, decide: 0.3 } } })
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(route(seen, 0)).toContain('assigned to haiku')
-      await $.turn.complete(completion('t1'))
-      expect(await cmd($, 'tune reset')).toBe('Bars reset to the defaults.')
-      expect(seen.store.bars).toBeUndefined()
-      await $.prompt.submit({ text: 'find more files' } as never)
-      expect(route(seen, 1)).toContain('assigned to sonnet')
-      expect(await statsOf($)).toContain('Classifier bars: default')
-    })
-
-    test('reset says when the stored override could not be deleted, and still resets this session', async ($, on) => {
-      on('store.delete', { key: 'bars' }, async () => ({ deny: 'disk full' }))
-      const seen = world($, on, P(0.72, 0.28, 0), { store: { bars: { lookup: 0.7, execute: 0.6, decide: 0.3 } } })
-      expect(await cmd($, 'tune reset')).toContain('could not be deleted')
-      await $.prompt.submit({ text: 'find files' } as never)
-      expect(route(seen, 0)).toContain('assigned to sonnet')
-    })
-
-    test('an unknown tune argument gets the usage text, and the usage and hint now list tune', async ($, on) => {
-      world($, on, P(1, 0, 0))
-      expect(await cmd($, 'tune nonsense')).toContain('tune [apply|reset]')
-    })
   })
 })

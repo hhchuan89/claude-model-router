@@ -15,34 +15,39 @@ export type Lang = 'zh' | 'en'
 
 export function classifierSystem(lang: Lang): string {
   return `You route a developer's message to Claude Code (an AI coding agent) to the cheapest model that can do it well.
-Return ONLY one JSON object:
-{"p":{"lookup":<0-1>,"execute":<0-1>,"decide":<0-1>},"risk":<0-1>,"reason":string}
-- p: your probability that each tier is the cheapest one that does the work well. The three add up to 1.
-  Be calibrated: 0.9 means you expect to be wrong about one time in ten.
-- risk: your probability that the message asks for, or approves, an irreversible or outward-facing action (deploy,
-  push, merge, delete, production or shared data, money, a message or comment to people).
-- reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.
+Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}
 
-lookup (fast model): pure retrieval or mechanical work with nothing to judge — find/grep/list files, read and report a value
-  or status, run a command the user named and report the output, rename, fix a typo, format, translate a short text,
-  look up a fact or a doc.
-execute (mid model): doing work whose "what" is already settled in the message or the context you can see — a plan, a
-  spec or an exact instruction: implement a clearly specified change, fix a bug whose cause is known, write tests,
-  refactor to a stated target, write docs or a report from known material, extract or transform data, explain how
-  existing code works, carry out a plan that was already agreed.
-decide (top model): anything that needs judgment before acting — design or architecture, choosing between approaches,
-  trade-offs, planning multi-step or multi-file work, finding the root cause of an unexplained failure, security or
-  correctness review, research synthesis or recommendations, evaluating quality, ambiguous requests that need
-  interpreting, working out how a change to business rules, production data or stored procedures should behave,
-  porting a change to a branch whose version of the code differs, and anything irreversible or outward-facing
-  (deploy, push, delete, money, production, messages to people).
+A tier is how much judgement the work needs, not how dangerous it is.
+
+- **lookup (Haiku):** retrieval or mechanical work with nothing to judge. Find, grep or list files; read and report a value or status; run a command the user named and report the output; rename; fix a typo; format; translate or re-explain a short text; look up a fact or a doc; acknowledge; answer a quick factual follow-up.
+- **execute (Sonnet):** work whose "what" is already settled in the message or the visible context, by a plan, a spec or an exact instruction. Examples:
+  - implement a clearly specified change, or fix a bug whose cause is known;
+  - write tests, or refactor to a stated target;
+  - write docs or a report from known material;
+  - extract or transform data;
+  - explain how existing code works;
+  - carry out a plan that was already agreed, including an instructed push, merge, PR, deploy, or a message whose content is settled;
+  - cherry-pick or port a change when the code is the same on both branches.
+- **decide (Opus):** judgement is needed before acting. Examples:
+  - design or architecture, choosing between approaches, trade-offs;
+  - planning multi-step or multi-file work;
+  - finding the root cause of an unexplained failure;
+  - a security or correctness review;
+  - research synthesis or recommendations, evaluating quality;
+  - an ambiguous request that needs interpreting;
+  - working out how a change to business rules, production data or stored procedures should behave;
+  - porting a change to a branch whose version of the code differs.
 
 Rules:
-- A short reply that continues the previous turn ("做吧", "yes", "继续", "go on") keeps the previous tier,
-  except: approving a plan that was just made ("照这个做", "开始吧") is execute, because the plan settles what to do.
-- "Implement it", "add it to the PR", "commit the fixes" or "cherry-pick it" is execute when the context shows what to
-  change (an approved plan, a spec, an exact instruction). When what to change still has to be worked out, it is decide.
-- If a message mixes tiers, use the highest one it contains.`
+- A reply that only continues work already in progress ("yes", "go on", "继续") keeps the previous tier.
+- Approving a plan that was just made ("照这个做", "开始吧", "go ahead with that") is execute, because the plan settles what to do.
+- A short message that asks for something new ("explain it in Chinese", "how long will it take?") is judged on its own.
+- A message that is only an image or an attachment, with no words, keeps the previous tier.
+- If a message mixes tiers, use the highest one it contains.
+- When unsure between two tiers, pick the higher one.
+- sure: set false when the message is ambiguous, could reasonably be read at two tiers, or depends on context you cannot
+  see; otherwise true. An unsure verdict is never used to move work to a cheaper model.
+- reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.`
 }
 
 // The user prompt of one classification: the same text the router and the replay command both send.
@@ -65,102 +70,33 @@ export function shorten(text: string, max: number): string {
   return `${cut.replace(/[\s,;:.\-—]+$/, '')}…`
 }
 
-const TIERS: Tier[] = ['lookup', 'execute', 'decide']
-const TIER_RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }
-
 function isTier(x: unknown): x is Tier {
   return x === 'lookup' || x === 'execute' || x === 'decide'
 }
 
-export type Probs = Record<Tier, number>
-// What one classifier reply says, plus the pick made from it. p and risk are absent for a reply in the 1.1 format
-// ({"tier","sure","reason"}), which already is a pick. guard says why the risk guard decided.
-export type Decision = { tier: Tier; reason: string; sure: boolean; p?: Probs; risk?: number; guard?: 'risk' }
-
-// Provisional: refit from a replay over labelled messages (/model-router replay). A tier is accepted outright when it is
-// the most likely one and its probability reaches its own bar; lookup is the dearest mistake to make, so its bar is highest.
-export const TIER_BARS: Probs = { lookup: 0.85, execute: 0.6, decide: 0.3 }
-// An irreversible or outward-facing request goes to decide when the classifier's risk reaches this.
-export const RISK_BAR = 0.7
-
-// The tier a calibrated reply asks for. The risk guard can only raise the tier. Otherwise the most likely tier (a tie goes
-// to the more capable one) is taken when it clears its bar; if not, the more capable of the top two is taken and the
-// pick is unsure, which settleTier never lets move work to a cheaper model.
-export function pickTier(p: Probs, risk: number, bars: Probs = TIER_BARS, riskBar: number = RISK_BAR): { tier: Tier; sure: boolean; guard?: 'risk' } {
-  if (risk >= riskBar) return { tier: 'decide', sure: true, guard: 'risk' }
-  const ranked = TIERS.slice().sort((a, b) => p[b] - p[a] || TIER_RANK[b] - TIER_RANK[a])
-  const top = ranked[0]!
-  if (p[top] >= bars[top]) return { tier: top, sure: true }
-  const second = ranked[1]!
-  return { tier: TIER_RANK[top] > TIER_RANK[second] ? top : second, sure: false }
-}
-
-const unit = (x: number) => Math.min(1, Math.max(0, x))
-
-// The reply's p, clamped to [0,1] and scaled to add up to 1. An absent tier counts as 0; a present one that is not a
-// number, or all zeros, makes the whole reply unreadable. A sum already 1 (within rounding) is left exactly as given,
-// so a boundary value such as 0.85 is not nudged by the division.
-function normaliseP(raw: unknown): Probs | null {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
-  const o = raw as Record<string, unknown>
-  const p = { lookup: 0, execute: 0, decide: 0 }
-  for (const t of TIERS) {
-    const v = o[t]
-    if (v === undefined) continue
-    if (typeof v !== 'number' || !Number.isFinite(v)) return null
-    p[t] = unit(v)
-  }
-  const sum = p.lookup + p.execute + p.decide
-  if (!(sum > 0)) return null
-  if (Math.abs(sum - 1) < 1e-9) return p
-  return { lookup: p.lookup / sum, execute: p.execute / sum, decide: p.decide / sum }
-}
-
-const riskOf = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) ? unit(x) : 0)
-
-function calibrated(p: Probs, risk: number, reason: string, bars: Probs, riskBar: number): Decision {
-  return { ...pickTier(p, risk, bars, riskBar), reason, p, risk }
-}
-
 // Anything unreadable becomes null, and the caller falls back to execute.
-// A reply in the 1.1 format ({"tier","sure","reason"}) still parses: sure defaults to true, so an older reply routes.
-// A reply cut off before its closing brace still carries its tier (or its p) when that came first: it parses as unsure
-// with no reason, so it can never move work to a cheaper model.
-export function parseDecision(text: string, bars: Probs = TIER_BARS, riskBar: number = RISK_BAR): Decision | null {
+// sure defaults to true, so a reply in the old format (no "sure") still parses.
+// A reply cut off before its closing brace still carries the tier when that came first: it parses as unsure with
+// no reason, so it can never move work to a cheaper model.
+export function parseDecision(text: string): { tier: Tier; reason: string; sure: boolean } | null {
   const start = text.indexOf('{')
   if (start === -1) return null
   const end = text.lastIndexOf('}')
-  const truncated = (): Decision | null => {
-    const tail = text.slice(start)
-    const pm = /"p"\s*:\s*(\{[^{}]*\})/.exec(tail)
-    if (pm) {
-      try {
-        const p = normaliseP(JSON.parse(pm[1]!))
-        if (p) {
-          const rm = /"risk"\s*:\s*([0-9.]+)\s*[,}]/.exec(tail)
-          const d = calibrated(p, rm ? riskOf(Number(rm[1])) : 0, '', bars, riskBar)
-          return d.guard ? d : { ...d, sure: false }
-        }
-      } catch { /* Fall through to the tier. */ }
-    }
-    const m = /"tier"\s*:\s*"(lookup|execute|decide)"/.exec(tail)
+  const truncated = (): { tier: Tier; reason: string; sure: boolean } | null => {
+    const m = /"tier"\s*:\s*"(lookup|execute|decide)"/.exec(text.slice(start))
     return m ? { tier: m[1] as Tier, reason: '', sure: false } : null
   }
   if (end <= start) return truncated()
   try {
     const o = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
-    const reason = typeof o.reason === 'string' ? shorten(o.reason, 60) : ''
-    if (o.p !== undefined) {
-      const p = normaliseP(o.p)
-      return p ? calibrated(p, riskOf(o.risk), reason, bars, riskBar) : null
-    }
     if (!isTier(o.tier)) return null
-    return { tier: o.tier, reason, sure: o.sure !== false }
+    return { tier: o.tier, reason: typeof o.reason === 'string' ? shorten(o.reason, 60) : '', sure: o.sure !== false }
   } catch {
     return truncated()
   }
 }
 
+const TIER_RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }
 
 // Low confidence never downgrades: after a higher-tier turn the previous tier stays, and a first turn
 // never starts on lookup. A wrong guess upward costs cents; a wrong guess downward costs a failed turn.
@@ -225,7 +161,7 @@ export function assignmentContext(r: Route): string {
   const opus =
     r.model === 'opus'
       ? `You are on opus at ${r.effort} effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed. If it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work. Once the plan is settled, if carrying it out spans several files or many steps, delegate it to a general-purpose subagent without a model (the router puts settled work on sonnet) with the plan, the paths and the checks to run, then verify the result yourself; make small changes directly.`
-      : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews, anything irreversible) must be made on opus. If the task is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. If it fits, just start.`
+      : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews) must be made on opus. If the task needs one, is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus, but care: confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled. If it fits, just start.`
   return `${head}\n${opus}\nEscalation only goes up within a turn; never call it to go down.`
 }
 
