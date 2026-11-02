@@ -51,12 +51,12 @@ shortcuts.
 | Tier | Model · effort | What lands here |
 |------|----------------|-----------------|
 | lookup | Haiku · medium | Retrieval and mechanical work with nothing to judge: find/grep/list, read a value or status, run a named command, rename, typo, format, short translation |
-| execute | Sonnet · medium | Work whose "what" is settled in the message or visible context: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan |
-| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs, anything irreversible or outward-facing |
+| execute | Sonnet · medium | Work whose "what" is settled in the message or visible context: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan, including an instructed push, merge, PR, deploy or a message whose content is settled |
+| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs |
 
 1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
-   A short continuation ("yes", "继续") keeps the previous tier and a mix of tiers takes the highest. See "How the
-   classifier decides" below for how its answer becomes a tier. **An unsure verdict never downgrades**: after a
+   A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
+   picks the higher tier. The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
    higher-tier turn the previous tier stays (shown as "unsure: not downgrading"), a first turn never starts on lookup
    (it runs on Sonnet), and an unsure `general-purpose` subagent lookup runs on Sonnet instead of Haiku. Likely secrets
    are masked before classification. **A failed classification never downgrades**: the turn keeps the previous turn's
@@ -66,12 +66,25 @@ shortcuts.
    `unparseable` reply is logged with its first 120 characters (single line, masked) so the cause can be read in the
    events log; a reply cut off after the tier still parses, as an unsure verdict. In earlier versions a failure ran on Sonnet, and 24% of those turns later escalated to Opus (6% of classified turns did).
    `#haiku`, `#sonnet` or `#opus` in a message pins the model.
+   **A risky action never runs on Haiku (the risk floor).** A tier measures how much judgement the work needs, not how
+   dangerous it is. Plain code (no model call) checks the masked message for an instruction to push, merge, deploy,
+   release, delete, drop a table, force, touch production, open, merge or decline a PR, cherry-pick onto a shared
+   branch, message people (Slack, Jira, email, a reply or comment) or move money, in English and in Simplified and
+   Traditional Chinese (推送 / 合并 / 合併 / 部署 / 上线 / 上線 / 删除 / 刪除 / 发送 / 發送 / 回复 / 回覆 / 付款 …). A
+   question about such a word ("what does git push do?"), a report that it is done ("merged", "已经推送了") and a
+   negation ("don't push yet") do not count. When it fires on a lookup, the turn runs on Sonnet at Sonnet's effort and
+   the reason ends "· risky action: at least Sonnet"; execute and decide are left as they are. It applies to classified
+   main turns, to a failed classification that keeps a lookup tier, and to `general-purpose` subagents;
+   `/model-router stats` counts it. A `#model` or a pin still wins.
    **The classifier is skipped when it could not change the outcome.** If the last main request was Opus, is within the
    cache TTL and had a context of 50,000 tokens or more (see the round-trip guard, 4), the turn stays on Opus whatever
    the tier, so the prompt goes straight to Opus at the decide effort ("warm large context: classifier skipped") with no
    Haiku call; `/model-router stats` counts these. A `#model` pin still wins.
 2. **Decide before working.** The model reads its assignment beside your prompt and must judge whether the task fits
-   *before* doing any work. If not, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
+   *before* doing any work. Decisions (design, trade-offs, plans, unexplained root causes, reviews) belong on Opus. An
+   irreversible or outward-facing action you asked for and already settled (a push, merge, PR, deploy or a message whose
+   content is given) does not need Opus; the assignment asks for care instead: confirm what it will affect, follow the
+   project's confirmation rules, and escalate only if what to do is not settled. If the task does not fit, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
    effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. A move to a higher model lands at that
    tier's effort in the table (Sonnet medium, Opus medium) unless a higher effort is asked. Escalation only goes up within a turn.
    Effort-only escalation (same model, more effort) exists for the main thread and for subagents alike (a subagent's own effort is capped, see 6).
@@ -208,39 +221,6 @@ option is enabled. Pass `id` (the tool-use id), optionally `startLine` / `endLin
 at `shrinkToolOutput` characters, including continuation instructions; use the returned `offset` with the same
 selection to page through long lines without losing characters. Stats count reductions and characters removed.
 
-## How the classifier decides
-
-The classifier does not name a tier. It gives the probability that each tier is the cheapest one that does the work
-well (the three add up to 1), and a separate `risk`: the probability that the message asks for or approves an
-irreversible or outward-facing action (deploy, push, merge, delete, production or shared data, money, a message to
-people). The router then decides:
-
-1. **Risk guard.** A risk of 0.7 or more goes to decide, whatever the tiers say. It can only raise a tier, and
-   `/model-router stats` counts it ("Risk guard sent to decide").
-2. **Per-tier bars.** The most likely tier is taken when its probability reaches its own bar: lookup 0.85, execute 0.60,
-   decide 0.30. Lookup has the highest bar because a wrong lookup is the dearest mistake.
-3. **Otherwise unsure.** The more capable of the two most likely tiers is taken, and the verdict is unsure, so
-   "unsure never downgrades" applies (see above), as does the weekly pacing steer for an unsure decide.
-
-These bars are provisional starting values, to be fitted on your own messages (see Tuning).
-
-## Tuning
-
-The router keeps a small record of every classified main turn for 30 days: the probabilities, the risk and the pick, plus
-any correction (`/model-router wrong`) and any escalation to a higher model that followed. No prompt text is in it.
-
-- `/model-router tune` prints a report and changes nothing: per tier the turns routed, the correction rate and the
-  escalation rate (**a weak signal: an escalation is not proof the tier was wrong**), and the current bars and risk bar
-  (default or tuned).
-- With at least 30 labelled turns it also suggests bars: the cheapest bars on a 0.05 grid (cost proxy Haiku 1, Sonnet 2,
-  Opus 4, from the cache-read prices at a 200k context) whose under-routing rate does not exceed the current bars', shown beside the current ones (accuracy,
-  under-routing, over-routing, cost). Labels come from your corrections, or from `--labels <file>` (`[{ "id", "right" }]`)
-  joined by id to a replay results file given as `--replay <file>`. Corrections alone are only the turns that were wrong,
-  so they lean toward under-routing; labelled replays do not. With fewer than 30 the report says how many more it needs.
-- `/model-router tune apply` stores the suggestion as an override, each bar moving at most 0.05 per apply and staying
-  between 0.2 and 0.95, and says what changed. `/model-router tune reset` deletes it. Stats and status show whether the
-  bars are tuned. Nothing is tuned unless you run `apply`.
-
 ## Details and history
 
 The band's **Details** button (see above) is the place to look at recent replies, the week's spend and to tell the router
@@ -260,9 +240,8 @@ The classifier is not always right. When it sorted a turn too low, tell it: `/mo
 buttons) records the turn's masked prompt snippet with the tier it should have had; so does the model escalating itself
 to a bigger **model** than the classified tier's (an effort-only raise does not count). Only turns the classifier
 actually sorted can be corrected, not forced, pinned, inherited or failed-classification turns. With `learnFromCorrections`
-on (the default) the up to 6 stored corrections most similar to the message (Jaccard similarity of character trigrams,
-bigrams for Chinese; at least 0.12) are added to the classifier's system prompt as examples, for the main conversation
-and for subagents. With no similar correction, or with the option off, the prompt is exactly the plain one.
+on (the default) the newest 8 corrections are added to the classifier's system prompt as examples, for the main
+conversation and for subagents. With no corrections, or with the option off, the prompt is exactly the plain one.
 `/model-router corrections` lists them, `/model-router corrections clear` deletes them, and stats count them.
 
 ## Weekly pacing
@@ -329,9 +308,9 @@ own effort. `stats` covers routed subagents only.
 - **Nothing else is collected.** No telemetry and no analytics. The router makes no network call of its own: the only
   traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
   the events log are written to local files only.
-- **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store up to 300
-  masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the up to 6 most similar to
-  the message are sent to Haiku as part of a classifier call (none when nothing is similar). Turn `learnFromCorrections` off to stop recording and sending, and run
+- **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store up to 40
+  masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, and the newest 8 are sent to
+  Haiku as part of every classifier call. Turn `learnFromCorrections` off to stop recording and sending, and run
   `/model-router corrections clear` to delete what is stored. The band and history keep no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
@@ -365,7 +344,6 @@ This is an estimate; see "Assumptions in the meter" below.
 | `/model-router pin <haiku\|sonnet\|opus> [turns]` / `/model-router unpin` | Hold the main conversation on one model for the next `turns` turns, or until unpinned (see "Pin and corrections") |
 | `/model-router wrong <lookup\|execute\|decide>` | Tell the router the last classified turn should have been that tier |
 | `/model-router corrections` / `/model-router corrections clear` | List the stored corrections, or delete them |
-| `/model-router tune` / `tune apply` / `tune reset` | Report how the classifier's bars are doing and suggest new ones; move the bars at most 0.05 toward the suggestion; remove the override (see Tuning) |
 | `/model-router pacing [off\|warn\|steer\|default]` | Show or override the weekly pacing mode (see "Weekly pacing") |
 
 With no argument, `/model-router` shows stats. Other arguments, including `help`, show the usage line.
@@ -412,7 +390,7 @@ values, including router on/off, idle minutes, the context cap and `compactMinCo
 | `compactMinContext` | `100000` | Tokens ≥ 0; no configured maximum | Minimum context for idle compaction and checkpoint hints (a small context is cheap to rewrite) |
 | `checkpointHints` | `false` (off) | `true`, `false` | Suggest a task-boundary checkpoint when estimated savings exceed its cost; never compacts automatically |
 | `shrinkToolOutput` | `0` (off) | 0–1,000,000 characters; active at 20,000–1,000,000 | Reduce large Bash/MCP logs and progress output, archive originals and fetch capped slices. Values outside the active range count as off |
-| `learnFromCorrections` | `true` (on) | `true`, `false` | Record corrections and send the most similar ones to the classifier (see "Pin and corrections" and Privacy). Off: none are written or sent |
+| `learnFromCorrections` | `true` (on) | `true`, `false` | Record corrections and send the newest 8 to the classifier (see "Pin and corrections" and Privacy). Off: none are written or sent |
 | `weeklyPacing` | `warn` | `off`, `warn`, `steer` | What the router does when weekly usage runs ahead of an even pace (see "Weekly pacing"); `/model-router pacing` overrides it |
 | `compactAtContext` | `0` (off) | Tokens ≥ 0; active at ≥ 100,000; no configured maximum | Compact between turns when main context reaches this size (e.g. `200000`), so every step does not re-read a huge cache. Below `100000` counts as off |
 
@@ -453,17 +431,18 @@ claude plugin validate .
 claude plugin test .
 ```
 
-**Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both] [--examples <file>]` (default `both`)
-reads a JSON array of `{ "id", "message", "context", "previous" }` (`previous` is a tier or `null`; at most 500 items),
-sends each message to Haiku exactly as a live classification would (same model, effort, limits, masking and 6,000-character
-cut), and writes `<path without .json>.replay.json` with one row per item and variant: the masked start of the reply, then
-`p`, `risk`, `tier` and `sure` for `current` (the 1.2 prompt), or `legacyTier` and `legacySure` for `legacy` (the 1.1
-prompt, kept in `hooks/replay.ts`), or `why` when there was no usable reply. The corrections block is not used, so the
-base prompt is what is measured. At most 4 requests run at once; it refuses while a turn is running. It changes no
-routing state, count, correction or band: only the Haiku spend is added to the meter. `--examples <file>` (a JSON array of `{ "id", "message", "right" }`, used like stored corrections) adds a third variant,
-`current+examples`: each item is classified with the corrections block chosen by similarity from that file, leaving out the
-entry with the item's own id (leave-one-out), to measure what the examples are worth. It is not listed in the command's
-usage text.
+**Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`
+(default `both`, once) reads a JSON array of `{ "id", "message", "context", "previous" }` (`previous` is a tier or
+`null`; at most 500 items), sends each message to Haiku exactly as a live classification would (same model, effort,
+limits, masking and 6,000-character cut), and writes `<path without .json>.replay.json` with one row per item, variant
+and run: `id`, `variant` (`current` is the 1.2 prompt, `legacy` the 1.1 prompt kept in `hooks/replay.ts`), `run`, the
+masked start of the reply, `tier` and `sure` as the classifier gave them (both variants are parsed the same way, so the
+unsure rule can be applied to either), `risk` (what the code's risk floor check says about the message; the tier is
+recorded before the floor), `ms` (how long the call took) and `why` when there was no usable reply. `--repeat` runs
+each variant up to 3 times, to measure run-to-run noise. The corrections block is not used, so the base prompt is what
+is measured. At most 4 requests run at once, and after a timeout no new request starts for 3 seconds. It refuses while
+a turn is running and changes no routing state, count, correction or band: only the Haiku spend is added to the meter.
+It is not listed in the command's usage text.
 
 ## Contributors
 

@@ -5,40 +5,48 @@ All notable changes to this project are documented here. The format follows
 
 ## [1.2.0] - 2026-11-02
 
-1.2.0 changes how the classifier's answer becomes a tier: it now gives a probability for each tier and a separate risk
-score, and the router applies a bar per tier and a guard for irreversible or outward-facing requests. **The bars are
-provisional**: they are starting values, to be refitted from a `/model-router replay` over labelled messages in a later
-release.
+1.2.0 changes what an irreversible or outward-facing request costs. **Policy change:** an action you asked for and
+already settled (a push, merge, PR, deploy or a message whose content is given) is now execute work on Sonnet, not a
+decision for Opus; risk only guarantees that such an action never runs on Haiku. Design, trade-offs, plans,
+unexplained root causes and reviews still go to Opus.
 
 ### Changed
 
-- The classifier returns `{"p":{"lookup","execute","decide"},"risk","reason"}` instead of one tier and `sure`. The two
-  prompt rules the bars replace ("when unsure, pick the higher tier" and the `sure` rule) are removed; the tier
-  definitions and the other rules are unchanged. A reply in the 1.1 shape still parses.
-- A tier is accepted when it is the most likely one and its probability reaches its own bar (lookup 0.85, execute 0.60,
-  decide 0.30). Otherwise the more capable of the top two is taken and the verdict is unsure, which as before never
-  moves work to a cheaper model. Subagent classification uses the same rule.
-
-- Corrections: the store holds up to 300 (was 40), and a classification gets the up to 6 corrections most similar to its
-  message instead of the newest 8, chosen by Jaccard similarity of character trigrams (bigrams for Chinese) with no model
-  call and no store read (minimum 0.12; ties go to the newer entry). When none is similar enough the prompt has no
-  corrections block at all.
+- New classifier prompt: the round 2 tier definitions and rules. A tier is how much judgement the work needs, not how
+  dangerous it is: decide no longer lists "anything irreversible or outward-facing", and execute now includes carrying
+  out an agreed plan with an instructed push, merge, PR, deploy or settled message, and a cherry-pick or port where the
+  code is the same on both branches. New rules cover a reply that only continues work in progress, a short message that
+  asks for something new, and a message that is only an image or an attachment. The separate "implement it / add it to
+  the PR" rule is gone (the execute definition covers it). The reply is still `{"tier","sure","reason"}`, with
+  "when unsure, pick the higher tier" and the `sure` rule; the model is not asked about risk.
+- The assignment text for Haiku and Sonnet no longer says that anything irreversible must be decided on Opus. It says
+  that a settled irreversible or outward-facing action needs care instead (confirm what it will affect, follow the
+  project's confirmation rules) and escalation only when what to do is not settled. The Opus text is unchanged.
 
 ### Added
 
-- `/model-router tune`: what the classifier decided is kept per classified turn (its probabilities, risk and pick, with any
-  correction and any escalation to a higher model; no prompt text) for 30 days. `tune` prints, per tier, the turns routed,
-  the correction rate and the escalation rate (a weak signal) and the current bars, and, from at least 30 labelled turns
-  (corrections, or `--labels <file>` joined to a `--replay <file>` results file), suggested bars: the cheapest on a 0.05
-  grid (Haiku 1, Sonnet 2, Opus 4 as a cost proxy, from cache-read prices at a 200k context) that do not under-route more than the current bars do. It changes
-  nothing. `tune apply` stores the bars, each moving at most 0.05 and staying in 0.2 to 0.95; `tune reset` removes them.
-  Stats and status show whether the bars are tuned. Nothing is tuned unless you run `tune apply`.
-- Risk guard: a risk of 0.7 or more sends the request to decide, whatever its tier probabilities, and the reason ends
-  with "(irreversible or outward-facing)". It can only raise the tier. `/model-router stats` counts how often it fired.
-- `/model-router replay <path> [current|legacy|both]`, a maintainer tool for fitting the bars: it runs the real classifier
-  call over a JSON file of up to 500 messages, with the 1.2 prompt, the 1.1 prompt or both, and writes
-  `<path>.replay.json`. It changes no routing state; only its Haiku spend is added to the meter. `--examples <file>` adds
-  a `current+examples` variant that uses the file's `{ id, message, right }` entries as corrections, leave-one-out.
+- Risk floor, in code: a multilingual keyword check (English, Simplified and Traditional Chinese) over the masked
+  message finds instructions to push, merge, deploy, release, delete, drop a table, force, touch production, open, merge
+  or decline a PR, cherry-pick onto a shared branch, message people (Slack, Jira, email, a reply or comment) or move
+  money. Questions about these words, reports that they are done, and negations do not count. A lookup it fires on
+  becomes execute (Sonnet at Sonnet's effort), with "· risky action: at least Sonnet" (or "· 风险操作：至少用 Sonnet")
+  on the reason; execute and decide are never changed, and no effort changes. It covers classified main turns, a failed
+  classification that keeps a lookup tier, and `general-purpose` subagents. `/model-router stats` counts it ("Risky
+  actions raised from lookup to Sonnet").
+- `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`, a maintainer tool not listed in the usage text:
+  it runs the real classifier call over a JSON file of up to 500 labelled messages with the 1.2 prompt, the 1.1 prompt
+  (kept word for word in `hooks/replay.ts`) or both, each up to 3 times, and writes `<path>.replay.json`. Each row holds
+  the run, the tier and `sure` (both prompts parsed the same way), the code risk check of the message and the call's
+  time in ms. At most 4 calls run at once, and after a timeout no new call starts for 3 seconds. It changes no routing
+  state; only its Haiku spend is added to the meter.
+
+### Not shipped
+
+- An earlier draft of 1.2.0 had the classifier return a probability per tier and a risk score, with per-tier acceptance
+  bars, a model-scored risk guard, corrections chosen by similarity, and `/model-router tune` with stored calibration
+  records. A replay on 102 labelled prompts showed none of it beating the 1.1.0 classifier: the probabilities were not
+  calibrated, the examples lowered accuracy and the guard added nothing. It was removed before release; corrections
+  stay as in 1.1.0 (up to 40 stored, the newest 8 sent).
 
 ## [1.1.0] - 2026-11-02
 
