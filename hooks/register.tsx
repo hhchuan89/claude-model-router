@@ -10,7 +10,7 @@ import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
 import type { PaceMode } from './pace'
-import { barChartSvg, chartAlt, hhmm, lastDays, sparkline } from './history'
+import { barChartSvg, cellWidth, chartAlt, hhmm, lastDays, textChart, weekdayOf } from './history'
 import type { DayCost } from './history'
 import { redact } from './redact'
 import type { Lang } from './route'
@@ -113,6 +113,8 @@ let uiNow = 0
 let uiLang: Lang = 'en'
 // A reading newer than the last main request. Cleared by the next request; measurements never move the cache timestamp.
 let measuredContext: number | undefined
+// The session model's context window in tokens, when the engine says (usage and measure carry it).
+let contextWindow: number | undefined
 // A summary keeps the observed request family after forgetContext clears its timestamp. The session model is
 // only a fallback: routing may have sent the request to a different family.
 let observedModel: keyof typeof PRICES | undefined
@@ -283,9 +285,15 @@ const STR = {
     todayWord: '今天',
     week: (pct: string) => `本周已用 ${pct}%`,
     aheadOfPace: '，进度偏快',
-    lessThan: (usd: string) => `比全程 Opus 少 ${usd}`,
-    moreThan: (usd: string) => `比全程 Opus 多 ${usd}`,
     underCent: '不足 $0.01',
+    cmpLess: (usd: string) => `（比全程 Opus 少 ${usd}）`,
+    cmpMore: (usd: string) => `（比全程 Opus 多 ${usd}）`,
+    contextPart: (size: string, window?: string) => `上下文 ${size}${window ? ` / ${window}` : ''}`,
+    ctxLine: (size: string, window: string | undefined, pct: number | undefined) => `上下文 ${size}${window ? ` / ${window}` : ''} token${pct === undefined ? '' : `（${pct}%）`}`,
+    cacheWarm: (n: number) => `缓存还能保持 ${n} 分钟`,
+    cacheOver: '缓存已过期',
+    chartTitle: (n: number) => `每日花费，近 ${n} 天（API 价格）`,
+    chartTotal: (cost: string, base: string) => `合计 ${cost} · 全程 Opus 则为 ${base}`,
     comma: '，',
     cacheSoon: (min: number, extra: string) => `⏳ 请在 ${min} 分钟内回复以保持对话缓存——之后下一条回复将多花约 ${extra}`,
     cacheGone: (size: string, cost: string) => `⏳ 缓存已过期——下一条回复将重新读取 ${size} 个 token（约 ${cost}）`,
@@ -409,9 +417,15 @@ const STR = {
     todayWord: 'Today',
     week: (pct: string) => `Week ${pct}% used`,
     aheadOfPace: ', ahead of pace',
-    lessThan: (usd: string) => `${usd} less than all-Opus`,
-    moreThan: (usd: string) => `${usd} more than all-Opus`,
     underCent: 'under $0.01',
+    cmpLess: (usd: string) => `(−${usd} vs all-Opus)`,
+    cmpMore: (usd: string) => `(+${usd} vs all-Opus)`,
+    contextPart: (size: string, window?: string) => `Context ${size}${window ? ` of ${window}` : ''}`,
+    ctxLine: (size: string, window: string | undefined, pct: number | undefined) => `Context ${size}${window ? ` of ${window}` : ''} tokens${pct === undefined ? '' : ` (${pct}%)`}`,
+    cacheWarm: (n: number) => `cache warm for ${n} more min`,
+    cacheOver: 'cache expired',
+    chartTitle: (n: number) => `Spend per day, last ${n} days (API prices)`,
+    chartTotal: (cost: string, base: string) => `Total ${cost} · all-Opus would be ${base}`,
     comma: ', ',
     cacheSoon: (min: number, extra: string) => `⏳ Reply within ${min} min to keep the conversation cached — after that the next reply costs ≈${extra} more`,
     cacheGone: (size: string, cost: string) => `⏳ The cache expired — your next reply re-reads ${size} tokens (≈${cost})`,
@@ -750,6 +764,7 @@ function resetSession($: EngineInterface, cancel = true) {
   turnOutput = 0
   lastHint = null
   measuredContext = undefined
+  contextWindow = undefined
   observedModel = undefined
   sessionModel = 'opus'
   pin = null
@@ -1257,6 +1272,28 @@ async function toggleDetails($: EngineInterface, session: Session) {
   weekCache = undefined
   redraw($)
   await bookkeeping($, () => $.store.set('bandExpanded', bandExpanded), undefined, retryFor(session, 'band write'))
+}
+
+// 106k, 1M, 1.5M: how big a conversation is, at a glance.
+function compactTokens(n: number): string {
+  if (n >= 1e6) return `${Number.isInteger(n / 1e6) ? n / 1e6 : (n / 1e6).toFixed(1)}M`
+  return n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(Math.round(n))
+}
+
+// Details' first line: how big the conversation is, and the cache when it is known. The one place the cache is shown when
+// no warning is due.
+function contextLine(lang: Lang, now: number): string {
+  const str = STR[lang]
+  const { tokens } = contextReading()
+  const parts: string[] = []
+  if (tokens !== undefined) {
+    parts.push(str.ctxLine(compactTokens(tokens), contextWindow ? compactTokens(contextWindow) : undefined, contextWindow ? Math.round(tokens / contextWindow * 100) : undefined))
+  }
+  if (lastMain !== null) {
+    const left = lastMain.at + CACHE_TTL_MS - now
+    parts.push(left > 0 ? str.cacheWarm(Math.ceil(left / 60_000)) : str.cacheOver)
+  }
+  return parts.join(' · ')
 }
 
 // Row 1 of the band: what the router chose, in words.
@@ -1855,6 +1892,7 @@ export const register: Register = (on, options) => {
       if (await stillHere($, session) !== 'same') return next(e)
       rateLimits = usage.rateLimits
       measuredContext = usage.context.tokens
+      if (usage.context.window > 0) contextWindow = usage.context.window
       const model = priceKey(await $.session.model())
       if (await stillHere($, session) !== 'same') return next(e)
       sessionModel = model
@@ -1931,6 +1969,7 @@ export const register: Register = (on, options) => {
     if (await stillHere($, session) !== 'same') return next(e)
     rateLimits = e.rateLimits
     measuredContext = e.context.tokens ?? measuredContext
+    if (typeof e.context.window === 'number' && e.context.window > 0) contextWindow = e.context.window
     try {
       const model = priceKey(await $.session.model())
       if (await stillHere($, session) !== 'same') return next(e)
@@ -2544,17 +2583,31 @@ export const register: Register = (on, options) => {
     const diff = saved(today).usd
     const w = weeklyLimit()
     const ahead = w !== undefined && pacingMode() !== 'off' && paceOf(w, now).state === 'ahead'
-    const cost =
-      `${str.thisReply} ${plainUsd(lang, m.turn.cost)} · ${str.todayWord} ${plainUsd(lang, today.cost)}` +
-      (Math.abs(diff) > 0 ? `${str.comma}${(diff >= 0 ? str.lessThan : str.moreThan)(plainUsd(lang, Math.abs(diff)))}` : '') +
-      (w ? ` · ${str.week(String(w.percentUsed))}` : '')
+    // Row 2, in the order it is cut at narrow widths: the comparison goes first, then the week, then the context.
+    const tokens = contextReading().tokens
+    const warnAt = Math.min(contextWindow ? contextWindow * 0.8 : Infinity, capOn ? compactAtContext : Infinity)
+    const contextPart = tokens === undefined ? undefined : { text: str.contextPart(compactTokens(tokens), contextWindow ? compactTokens(contextWindow) : undefined), warn: tokens >= warnAt }
+    const cmp = Math.abs(diff) > 0 ? `${lang === 'zh' ? '' : ' '}${(diff >= 0 ? str.cmpLess : str.cmpMore)(fmtUsd(Math.abs(diff)))}` : ''
+    type Seg = { text: string; warn?: boolean }
+    const row = (withCmp: boolean, withWeek: boolean, withContext: boolean): Seg[] => [
+      { text: `${str.thisReply} ${plainUsd(lang, m.turn.cost)}` },
+      { text: ` · ${str.todayWord} ${plainUsd(lang, today.cost)}${withCmp ? cmp : ''}` },
+      ...(withContext && contextPart ? [{ text: ` · ${contextPart.text}`, warn: contextPart.warn }] : []),
+      ...(withWeek && w ? [{ text: ` · ${str.week(String(w.percentUsed))}` }] : []),
+      ...(withWeek && w && ahead ? [{ text: str.aheadOfPace, warn: true }] : []),
+    ]
+    const room = e.props.bodyColumns - 2
+    const wide = (segs: Seg[]) => segs.reduce((sum, sg) => sum + cellWidth(sg.text), 0)
+    // Whole parts only: the first arrangement that fits, else the shortest.
+    const costSegs = [row(true, true, true), row(false, true, true), row(false, false, true), row(false, false, false)].find(segs => wide(segs) <= room) ?? row(false, false, false)
     const cache = cacheWarning(lang, now, compactMinContext > 0 ? compactMinContext : 100_000)
 
-    // The terminal's table has no Svg (it would draw a fragment: nothing): it gets a text sparkline instead.
+    // The terminal's table has no Svg (it would draw a fragment: nothing): it gets a labelled text chart instead.
     const Svg = e.surface === 'terminal' ? undefined : (table as unknown as { Svg?: ElementConstructor<SvgProps> }).Svg
     const shown = list.slice(-BAND_ROWS)
     const series = weekCache?.series ?? []
-    const total = weekTotals(series)
+    const chart = Svg === undefined && series.length > 0 ? textChart(series, e.props.bodyColumns - 2, lang) : undefined
+    const total = weekTotals(chart?.days ?? series)
     const target = learning ? [...shown].reverse().find(isCorrectable) : undefined
     const answers: [string, Tier][] = [['Haiku', 'lookup'], ['Sonnet', 'execute'], ['Opus', 'decide']]
 
@@ -2568,14 +2621,12 @@ export const register: Register = (on, options) => {
           <Button key="band-details" label={expanded ? str.hideDetails : str.details} onPress={() => toggleDetails($, session)} />
           <Button key="router-disable" label={str.disable} onPress={() => setEnabled($, session, false)} />
         </Box>
-        <Box flexDirection="row" paddingLeft={2}>
-          <Box flexShrink={1}>
-            <Text dimColor wrap="truncate-end">{cost}</Text>
-          </Box>
-          {ahead && <Text color="warning">{str.aheadOfPace}</Text>}
+        <Box paddingLeft={2}>
+          <Text dimColor wrap="truncate-end">{costSegs.map(sg => sg.warn ? <Text color="warning">{sg.text}</Text> : sg.text)}</Text>
         </Box>
         {expanded && (
           <Box flexDirection="column" paddingLeft={2}>
+            {contextLine(lang, now) !== '' && <Text dimColor wrap="truncate-end">{contextLine(lang, now)}</Text>}
             {shown.length === 0 && <Text dimColor>{str.histNone}</Text>}
             {shown.map(t => {
               const p = turnParts(t, lang)
@@ -2593,10 +2644,17 @@ export const register: Register = (on, options) => {
                 </Box>
               )
             })}
-            {series.length > 0 && (Svg
-              ? <Svg source={barChartSvg(series)} alt={chartAlt(series)} />
-              : <Text dimColor>{sparkline(series.map(d => d.cost))}</Text>)}
-            <Text dimColor wrap="truncate-end">{str.histTotal(fmtUsd(total.cost), fmtUsd(total.base))}</Text>
+            {series.length > 0 && <Text dimColor wrap="truncate-end">{str.chartTitle((chart?.days ?? series).length)}</Text>}
+            {series.length > 0 && Svg && <Svg source={barChartSvg(series, 320, 80, series.map(d => weekdayOf(d.day, lang)))} alt={chartAlt(series)} />}
+            {chart && <Text dimColor>{`  ${chart.amounts.join('')}`}</Text>}
+            {chart && <Text dimColor>{`  ${chart.bars.join('')}`}</Text>}
+            {chart && (
+              <Box flexDirection="row">
+                <Text dimColor>{'  '}</Text>
+                {chart.labels.map((label, i) => i === chart.today ? <Text weight="bold" color="claude">{label}</Text> : <Text dimColor>{label}</Text>)}
+              </Box>
+            )}
+            {series.length > 0 && <Text dimColor wrap="truncate-end">{str.chartTotal(fmtUsd(total.cost), fmtUsd(total.base))}</Text>}
             {target && thanks === target.turnId && <Text dimColor>{str.thanks}</Text>}
             {target && thanks !== target.turnId && (
               <Box flexDirection="row" gap={1} alignItems="center">

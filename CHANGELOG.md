@@ -12,8 +12,9 @@ routes and prompts exactly as 1.0.1 does.
 
 ### Added
 
-- A plainer band. Two rows (what the router chose and why, and `This reply $0.74 · Today $28.00, $8.94 less than all-Opus ·
-  Week 20% used`), a **Details** button that opens the last 5 replies, a small 7-day chart with its total, and `Wrong model for
+- A plainer band. Two rows (what the router chose and why, and `This reply $0.74 · Today $28.00 (−$8.94 vs all-Opus) · Context 106k of
+  1M · Week 20% used`, whole parts dropped on a narrow terminal, the context in warning colour from 80% of the window), a **Details** button that opens the last 5 replies, a conversation line first (size, window, percent, how long the cache stays warm), a titled 7-day chart with its total
+  (three aligned rows on the terminal: amounts, bars, weekdays, today in bold), and `Wrong model for
   the last reply? Should have been: [Haiku] [Sonnet] [Opus]` buttons (with learning on), and **Pause router** / **Resume
   router**. The choice to show details is remembered. A third line appears only when it matters: `⏳ Reply within 12 min to
   keep the conversation cached …` in the last 15 minutes of a large conversation's cache, or `⏳ The cache expired …` after

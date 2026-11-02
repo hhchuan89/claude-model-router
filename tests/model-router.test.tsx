@@ -9,7 +9,7 @@ import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMP
 import { addCorrection, fewShot, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
-import { barChartSvg, chartAlt, hhmm, sparkline } from '../hooks/history'
+import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
@@ -471,7 +471,7 @@ test('each step goes on the meter, shown in the band and in /model-router stats'
   seen.usage.push(U(1000, 200, 20_000, 0, 'claude-haiku-5-5'))
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.find({ text: /^本次回复 不足 \$0\.01 · 今天 不足 \$0\.01，比全程 Opus 少 \$0\.01$/ })).toBeDefined()
+  expect(await ui.find({ text: /^本次回复 不足 \$0\.01 · 今天 不足 \$0\.01（比全程 Opus 少 \$0\.01）/ })).toBeDefined()
   const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('haiku')
   expect(r.text).toContain('same work tokens at Opus prices')
@@ -871,7 +871,7 @@ test('the band speaks English by default', async ($, on) => {
   await step($, 't1')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /Haiku · medium — find files/ })).toBeDefined()
-  expect(await ui.find({ text: /^This reply under \$0\.01 · Today under \$0\.01, \$0\.01 less than all-Opus$/ })).toBeDefined()
+  expect(await ui.find({ text: /^This reply under \$0\.01 · Today under \$0\.01 \(−\$0\.01 vs all-Opus\)/ })).toBeDefined()
   // The precise wording lives in /model-router stats, not in the band.
   expect(await ui.find({ text: /work tokens at Opus prices/ })).toBeUndefined()
 })
@@ -6499,25 +6499,77 @@ describe('corrections store and few-shot block (1.1.0)', () => {
 })
 
 describe('history helpers (1.1.0)', () => {
-  test('the sparkline scales to the largest day and an empty week is flat', async () => {
-    expect(sparkline([0, 1, 2, 4])).toBe('▁▃▅█')
-    expect(sparkline([0, 0, 0])).toBe('▁▁▁')
-    expect(sparkline([])).toBe('')
+  // Mon 2026-10-26 to Sun 2026-11-01; no spend on Saturday. The last day is today.
+  const WEEK = [98, 140, 190, 160, 60, 0, 5].map((cost, i) => ({ day: ['20261026', '20261027', '20261028', '20261029', '20261030', '20261031', '20261101'][i]!, cost, baseline: cost * 1.2 }))
+
+  test('amounts: whole dollars from $10, two decimals below, a dash for a day with none', async () => {
+    expect([98, 190.4, 10, 9.99, 5, 0.5, 0].map(chartAmount)).toEqual(['$98', '$190', '$10', '$9.99', '$5.00', '$0.50', '—'])
   })
 
-  test('the bar chart draws a bar and a baseline marker per day and says its totals in the alt text', async () => {
-    const days = [{ day: '20261030', cost: 1, baseline: 4 }, { day: '20261031', cost: 2, baseline: 8 }]
-    const svg = barChartSvg(days)
-    expect(svg.startsWith('<svg')).toBe(true)
-    expect(svg.match(/fill="#4f8cff"/g)).toHaveLength(2)
+  test('six-character columns line up: amounts above, bars scaled to the week, weekdays below', async () => {
+    const chart = textChart(WEEK, 60, 'en')
+    expect(chart.colWidth).toBe(6)
+    expect(chart.days).toHaveLength(7)
+    expect(chart.amounts).toEqual([' $98  ', ' $140 ', ' $190 ', ' $160 ', ' $60  ', '  —   ', '$5.00 '])
+    // $190 is the full block; $98 is about half; a day with nothing has no bar at all; $5 is the lowest block.
+    expect(chart.bars).toEqual([' ▅▅▅  ', ' ▆▆▆  ', ' ███  ', ' ▇▇▇  ', ' ▃▃▃  ', '      ', ' ▁▁▁  '])
+    expect(chart.labels).toEqual([' Mon  ', ' Tue  ', ' Wed  ', ' Thu  ', ' Fri  ', ' Sat  ', ' Sun  '])
+    for (const row of [chart.amounts, chart.bars, chart.labels]) expect(row.every(cell => cellWidth(cell) === 6)).toBe(true)
+    expect(chart.today).toBe(6)
+  })
+
+  test('four-character columns when seven of six do not fit', async () => {
+    // 7 x 6 + 2 = 44 columns do not fit 30; 7 x 4 + 2 = 30 do.
+    const chart = textChart(WEEK, 30, 'en')
+    expect(chart.colWidth).toBe(4)
+    expect(chart.days).toHaveLength(7)
+    expect(chart.amounts).toEqual(['$98 ', '$140', '$190', '$160', '$60 ', ' —  ', '$5.0'])
+    expect(chart.bars).toEqual([' ▅▅ ', ' ▆▆ ', ' ██ ', ' ▇▇ ', ' ▃▃ ', '    ', ' ▁▁ '])
+    expect(chart.labels).toEqual(['Mon ', 'Tue ', 'Wed ', 'Thu ', 'Fri ', 'Sat ', 'Sun '])
+    for (const row of [chart.amounts, chart.bars, chart.labels]) expect(row.every(cell => cellWidth(cell) === 4)).toBe(true)
+  })
+
+  test('only the last four days when even four-character columns do not fit; today stays the last', async () => {
+    const six = textChart(WEEK, 26, 'en')
+    expect(six.days.map(d => d.day)).toEqual(['20261029', '20261030', '20261031', '20261101'])
+    expect(six.colWidth).toBe(6)
+    expect(six.labels).toEqual([' Thu  ', ' Fri  ', ' Sat  ', ' Sun  '])
+    const four = textChart(WEEK, 20, 'en')
+    expect(four.days).toHaveLength(4)
+    expect(four.colWidth).toBe(4)
+    expect(four.today).toBe(3)
+  })
+
+  test('a very large day still fits its column, and the Chinese weekdays are one wide character', async () => {
+    const big = [{ day: '20261026', cost: 1234, baseline: 0 }]
+    expect(textChart(big, 30, 'en').amounts[0]).toBe('$1234 ')
+    expect(textChart(big, 6, 'en').amounts[0]).toBe('1.2k')
+    expect(weekdayOf('20261026', 'zh')).toBe('一')
+    expect(weekdayOf('20261101', 'zh')).toBe('日')
+    const zh = textChart(WEEK, 60, 'zh')
+    expect(zh.labels.every(cell => cellWidth(cell) === 6)).toBe(true)
+    expect(zh.labels[0]).toBe('  一  ')
+  })
+
+  test('the bar chart draws a bar and a baseline marker per day, weekday names, today in the accent, and says its totals in the alt text', async () => {
+    const days = [{ day: '20261030', cost: 1, baseline: 4 }, { day: '20261031', cost: 0, baseline: 0 }, { day: '20261101', cost: 2, baseline: 8 }]
+    const svg = barChartSvg(days, 320, 80, ['Fri', 'Sat', 'Sun'])
+    expect(svg).toContain('height="80"')
+    expect(svg.match(/rx="2" fill="#4f8cff"/g)).toHaveLength(3)
     expect(svg.match(/fill="#e0a030"/g)).toHaveLength(2)
-    // Text is 10px, and a label that does not fit its slot is dropped (the bar and the day stay).
-    expect(svg).toContain('font-size="10"')
+    // Text is 11px; each bar has its amount, a day with nothing has a dash; the last day is today, bold in the accent.
+    expect(svg).toContain('font-size="11"')
     expect(svg).not.toContain('font-size="8"')
+    expect(svg).toContain('>$1.00<')
+    expect(svg).toContain('>—<')
+    expect(svg).toContain('>$2.00<')
+    expect(svg).toContain('font-weight="bold" fill="#4f8cff">Sun<')
+    expect(svg).toContain('fill="#8a8f98">Fri<')
+    // A label that does not fit its slot is dropped (the bar and the day stay).
     const narrow = barChartSvg([{ day: '20261030', cost: 745.99, baseline: 885.8 }, { day: '20261031', cost: 2, baseline: 8 }], 40)
     expect(narrow.match(/>\$/g)).toBeNull()
-    expect(narrow.match(/<rect x="[^"]*" y="[^"]*" width="[^"]*" height="[^"]*" rx="2"/g)).toHaveLength(2)
-    expect(chartAlt(days)).toBe('Spend over the last 2 days: $3.00, against $12 for the same work tokens at Opus prices.')
+    expect(narrow.match(/rx="2" fill="#4f8cff"/g)).toHaveLength(2)
+    expect(chartAlt(days)).toBe('Spend over the last 3 days: $3.00, against $12 for the same work tokens at Opus prices.')
   })
 })
 
@@ -6921,12 +6973,12 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         await step($, 't1')
         const band = await mountBand($)
         expect(await band.find({ type: 'Text', text: /^⚙ Haiku · medium — find$/ })).toBeDefined()
-        expect(await band.find({ type: 'Text', text: /^This reply \$0\.30 · Today \$0\.30, \$0\.30 less than all-Opus$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^This reply \$0\.30 · Today \$0\.30 \(−\$0\.30 vs all-Opus\) · Context 100k$/ })).toBeDefined()
         const buttons = (await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)
         expect(buttons).toEqual(['Details', 'Pause router'])
         expect((await texts(band)).join(' ')).not.toMatch(/ctx|cold resume|deadline|unknown|\bstep\b|switch-adjusted|work tokens/)
         // Nothing of the details is there.
-        expect(await band.find({ type: 'Text', text: /Last 7 days/ })).toBeUndefined()
+        expect(await band.find({ type: 'Text', text: /Spend per day/ })).toBeUndefined()
         await band.unmount()
       })
 
@@ -6936,7 +6988,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         await $.prompt.submit({ text: 'find files' } as never)
         void seen
         const band = await mountBand($)
-        expect(await band.find({ type: 'Text', text: /^This reply under \$0\.01 · Today under \$0\.01, under \$0\.01 more than all-Opus$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^This reply under \$0\.01 · Today under \$0\.01 \(\+<\$0\.01 vs all-Opus\)$/ })).toBeDefined()
         await band.unmount()
       })
 
@@ -6954,8 +7006,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         await band.unmount()
         await weekly($, seen, 80, 0.5)
         band = await mountBand($)
-        expect(await band.find({ type: 'Text', text: /· Week 80% used$/ })).toBeDefined()
-        expect(await band.find({ type: 'Text', text: /^, ahead of pace$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /· Week 80% used, ahead of pace$/ })).toBeDefined()
         await band.unmount()
       })
 
@@ -6982,7 +7033,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         seen.usage.push(SONNET_TURN)
         await step($, 't1')
         const band = await mountBand($)
-        expect(await band.find({ type: 'Text', text: /^本次回复 \$0\.30 · 今天 \$0\.30，比全程 Opus 少 \$0\.30$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^本次回复 \$0\.30 · 今天 \$0\.30（比全程 Opus 少 \$0\.30） · 上下文 100k$/ })).toBeDefined()
         expect((await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)).toEqual(['详情', '暂停路由器'])
         await band.unmount()
       })
@@ -7137,11 +7188,14 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         const band = await opened($)
         expect(await band.find({ type: 'Text', text: /^Haiku · medium$/ })).toBeDefined()
         expect(await band.find({ type: 'Text', text: /^\$\d+\.\d\d \(cache expired\) — find$/ })).toBeDefined()
-        expect(await band.find({ type: 'Text', text: /^Last 7 days \$\d+\.\d\d · all-Opus would be \$\d+\.\d\d$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^Spend per day, last 7 days \(API prices\)$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^Total \$\d+\.\d\d · all-Opus would be \$\d+\.\d\d$/ })).toBeDefined()
+        // The conversation comes first: its size and how long the cache stays warm.
+        expect(await band.find({ type: 'Text', text: /^Context 151k tokens · cache warm for 60 more min$/ })).toBeDefined()
         expect(await band.find({ type: 'Text', text: /^\/model-router for stats, settings and commands$/ })).toBeDefined()
         expect(await band.find({ type: 'Button', text: 'Hide details' } as never)).toBeDefined()
         await band.press({ key: 'band-details' })
-        expect(await band.find({ type: 'Text', text: /Last 7 days/ })).toBeUndefined()
+        expect(await band.find({ type: 'Text', text: /Spend per day/ })).toBeUndefined()
         await band.unmount()
       })
 
@@ -7159,16 +7213,16 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         await band.unmount()
       })
 
-      for (const [surface, drawn] of [['desktop', 'svg'], ['terminal', 'sparkline']] as const) {
-        test(`the week is a ${drawn} (${surface})`, async ($, on) => {
-          const seen = world($, on, LOOKUP)
-          await lookupTurn($, seen, 'find files', 't1')
-          const band = await opened($, surface)
-          if (drawn === 'svg') expect(await band.find({ type: 'Svg' } as never)).toBeDefined()
-          else expect(await band.find({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]{7}$/ })).toBeDefined()
-          await band.unmount()
-        })
-      }
+      test('on desktop the week is an SVG with the same title and total', async ($, on) => {
+        const seen = world($, on, LOOKUP)
+        await lookupTurn($, seen, 'find files', 't1')
+        const band = await opened($, 'desktop')
+        expect(await band.find({ type: 'Svg' } as never)).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^Spend per day, last 7 days \(API prices\)$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^Total \$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^ +—/ })).toBeUndefined()
+        await band.unmount()
+      })
 
       test('markers are spelled out: you chose, pinned, raised, and the reason is dropped where the marker says it', async ($, on) => {
         world($, on, LOOKUP)
@@ -7203,6 +7257,208 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         world($, on, LOOKUP, { store: { bandExpanded: true } })
         const band = await mountBand($, 'terminal')
         expect(await band.find({ type: 'Text', text: /^\/model-router for stats/ })).toBeDefined()
+        await band.unmount()
+      })
+    })
+
+    describe('context in the band', () => {
+      const WINDOW = { window: 1_000_000 }
+      const measure = ($: any, tokens: number | undefined, window = 1_000_000, rateLimits: unknown[] = []) =>
+        $.session.measure({ context: { window, tokens }, rateLimits, changed: ['context'] } as never)
+      const rowOf = async (band: any) => (await band.find({ type: 'Text', text: /^(This reply|本次回复)/ })) as { text: string; children: any[] }
+      const warned = (row: { children: any[] }) => row.children.some(c => typeof c === 'object' && c?.props?.color === 'warning')
+      void WINDOW
+
+      test('the size of the conversation, and the window when the engine gives one', async ($, on) => {
+        world($, on, LOOKUP)
+        await measure($, 106_000)
+        const band = await mountBand($)
+        expect((await rowOf(band)).text).toBe('This reply $0.00 · Today $0.00 · Context 106k of 1M')
+        expect(warned(await rowOf(band))).toBe(false)
+        await band.unmount()
+      })
+
+      test('without a window it is just the size', async ($, on) => {
+        world($, on, LOOKUP)
+        await measure($, 106_000, 0)
+        const band = await mountBand($)
+        expect((await rowOf(band)).text).toBe('This reply $0.00 · Today $0.00 · Context 106k')
+        await band.unmount()
+      })
+
+      test('an unknown size leaves the part out', async ($, on) => {
+        world($, on, LOOKUP)
+        const band = await mountBand($)
+        expect((await rowOf(band)).text).toBe('This reply $0.00 · Today $0.00')
+        await band.unmount()
+      })
+
+      test('a window of 1.5 million tokens and one of 200k read plainly', async ($, on) => {
+        world($, on, LOOKUP)
+        await measure($, 90_000, 200_000)
+        let band = await mountBand($)
+        expect((await rowOf(band)).text).toContain('Context 90k of 200k')
+        await band.unmount()
+        await measure($, 90_000, 1_500_000)
+        band = await mountBand($)
+        expect((await rowOf(band)).text).toContain('Context 90k of 1.5M')
+        await band.unmount()
+      })
+
+      // WHY: at 80% of the window the conversation is close to being compacted or cut; that is worth the person's eye.
+      test('it turns to a warning at 80% of the window, and not a token before', async ($, on) => {
+        world($, on, LOOKUP)
+        await measure($, 799_999)
+        let band = await mountBand($)
+        expect(warned(await rowOf(band))).toBe(false)
+        await band.unmount()
+        await measure($, 800_000)
+        band = await mountBand($)
+        expect(warned(await rowOf(band))).toBe(true)
+        expect((await rowOf(band)).text).toContain('Context 800k of 1M')
+        await band.unmount()
+      })
+
+      test('compactAtContext warns earlier when it is nearer than 80% of the window', { options: { compactAtContext: 300_000 } }, async ($, on) => {
+        world($, on, LOOKUP)
+        await measure($, 299_999)
+        let band = await mountBand($)
+        expect(warned(await rowOf(band))).toBe(false)
+        await band.unmount()
+        await measure($, 300_000)
+        band = await mountBand($)
+        expect(warned(await rowOf(band))).toBe(true)
+        await band.unmount()
+      })
+
+      test('without a window and without a cap there is nothing to measure against, so no warning', async ($, on) => {
+        world($, on, LOOKUP)
+        await measure($, 900_000, 0)
+        const band = await mountBand($)
+        expect(warned(await rowOf(band))).toBe(false)
+        await band.unmount()
+      })
+
+      describe('narrow bands drop whole parts: the comparison first, then the week, then the context', () => {
+        const FULL = 'This reply $0.30 · Today $0.30 (−$0.30 vs all-Opus) · Context 106k of 1M · Week 20% used'
+        const NO_CMP = 'This reply $0.30 · Today $0.30 · Context 106k of 1M · Week 20% used'
+        const NO_WEEK = 'This reply $0.30 · Today $0.30 · Context 106k of 1M'
+        const SHORTEST = 'This reply $0.30 · Today $0.30'
+        async function band($: any, on: any, columns: number) {
+          const seen = world($, on, LOOKUP)
+          ui($, on)
+          await $.prompt.submit({ text: 'find files' } as never)
+          seen.usage.push(SONNET_TURN)
+          await step($, 't1')
+          const resetsAt = new Date((seen.clock as any).now() + 3.5 * 24 * 3600 * 1000).toISOString()
+          await $.session.measure({ context: { window: 1e6, tokens: 106_000 }, rateLimits: [{ kind: 'seven_day', percentUsed: 20, resetsAt }], changed: ['context', 'rateLimits'] } as never)
+          return $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: { ...(BAND_PROPS as {}), bodyColumns: columns } as never })
+        }
+        // The row has two columns of indent; each text fits exactly at its own length, and the next one down one column less.
+        for (const [text, shorter] of [[FULL, NO_CMP], [NO_CMP, NO_WEEK], [NO_WEEK, SHORTEST]] as const) {
+          test(`${text.length + 2} columns hold "${text.slice(-24)}", one fewer drops to "${shorter.slice(-24)}"`, async ($, on) => {
+            let ui = await band($, on, text.length + 2)
+            expect((await rowOf(ui)).text).toBe(text)
+            await ui.unmount()
+            ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: { ...(BAND_PROPS as {}), bodyColumns: text.length + 1 } as never })
+            expect((await rowOf(ui)).text).toBe(shorter)
+            await ui.unmount()
+          })
+        }
+
+        test('the reply and today always stay, even where nothing else fits', async ($, on) => {
+          const ui = await band($, on, 20)
+          expect((await rowOf(ui)).text).toBe(SHORTEST)
+          await ui.unmount()
+        })
+      })
+    })
+
+    describe('details: context line and the labelled week chart', () => {
+      const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+      async function withWeek($: any, on: any, columns = 100, surface: 'terminal' | 'desktop' = 'terminal', language?: string) {
+        const seen = world($, on, LOOKUP)
+        await $.session.measure({ context: { window: 1e6 }, rateLimits: [], changed: ['context'] } as never)
+        await $.prompt.submit({ text: 'find files' } as never)
+        seen.usage.push(U(1000, 500, 105_000))
+        await step($, 't1')
+        await $.turn.complete(completion('t1'))
+        void language
+        const band = await $.ui.mount({ plugin: 'model-router', surface, component: 'AbovePrompt', props: { ...(BAND_PROPS as {}), bodyColumns: columns } as never })
+        await band.press({ key: 'band-details' })
+        return { seen, band }
+      }
+      const labelCells = async (band: any) => (await band.findAll({ type: 'Text' })).filter((t: any) => WEEKDAYS.includes(t.text.trim()))
+
+      test('the context line comes first: size, window, percent and how long the cache stays warm', async ($, on) => {
+        const { seen, band } = await withWeek($, on)
+        await seen.clock.advance(16 * 60_000)
+        const all = (await band.findAll({ type: 'Text' })).map((t: any) => t.text as string)
+        expect(all.indexOf('Context 106k of 1M tokens (11%) · cache warm for 44 more min')).toBeGreaterThan(-1)
+        expect(all.indexOf('Context 106k of 1M tokens (11%) · cache warm for 44 more min')).toBeLessThan(all.findIndex((t: string) => /^\d\d:\d\d$/.test(t)))
+        await band.unmount()
+      })
+
+      test('the cache part is left out when it is not known, and the whole line when nothing is', async ($, on) => {
+        world($, on, LOOKUP)
+        await $.session.measure({ context: { window: 1e6, tokens: 106_000 }, rateLimits: [], changed: ['context'] } as never)
+        let band = await mountBand($, 'terminal')
+        await band.press({ key: 'band-details' })
+        expect(await band.find({ type: 'Text', text: /^Context 106k of 1M tokens \(11%\)$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('an expired cache says so on the context line', async ($, on) => {
+        const { seen, band } = await withWeek($, on)
+        await seen.clock.advance(61 * 60_000)
+        expect(await band.find({ type: 'Text', text: /^Context 106k of 1M tokens \(11%\) · cache expired$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('six-character columns: title, amounts, bars, weekdays and a total, aligned', async ($, on) => {
+        const { band } = await withWeek($, on)
+        const texts = (await band.findAll({ type: 'Text' })).map((t: any) => t.text as string)
+        const at = texts.indexOf('Spend per day, last 7 days (API prices)')
+        expect(at).toBeGreaterThan(-1)
+        // Six days of nothing and today's $0.04: dashes, then the amount; one bar, the tallest, under it.
+        expect(texts[at + 1]).toBe(`  ${'  —   '.repeat(6)}$0.04 `)
+        expect(texts[at + 2]).toBe(`  ${' '.repeat(36)} ███  `)
+        const labels = await labelCells(band)
+        expect(labels).toHaveLength(7)
+        expect(labels.every((l: any) => l.text.length === 6)).toBe(true)
+        expect(texts.some((t: string) => /^Total \$0\.04 · all-Opus would be \$[\d.]+$/.test(t))).toBe(true)
+        await band.unmount()
+      })
+
+      test('today is the last day, drawn bold in the accent colour; the other days are plain', async ($, on) => {
+        const { band } = await withWeek($, on)
+        const labels = await labelCells(band)
+        expect(labels.map((l: any) => l.props.weight)).toEqual([undefined, undefined, undefined, undefined, undefined, undefined, 'bold'])
+        expect(labels.at(-1).props.color).toBe('claude')
+        await band.unmount()
+      })
+
+      test('four-character columns when seven of six do not fit', async ($, on) => {
+        const { band } = await withWeek($, on, 40)
+        const labels = await labelCells(band)
+        expect(labels).toHaveLength(7)
+        expect(labels.every((l: any) => l.text.length === 4)).toBe(true)
+        await band.unmount()
+      })
+
+      test('only the last four days when even those do not fit, and the title says four', async ($, on) => {
+        const { band } = await withWeek($, on, 30)
+        expect(await labelCells(band)).toHaveLength(4)
+        expect(await band.find({ type: 'Text', text: /^Spend per day, last 4 days \(API prices\)$/ })).toBeDefined()
+        await band.unmount()
+      })
+
+      test('the Chinese chart has a Chinese title and one-character weekdays', { options: { language: 'zh' } }, async ($, on) => {
+        const { band } = await withWeek($, on)
+        expect(await band.find({ type: 'Text', text: /^每日花费，近 7 天（API 价格）$/ })).toBeDefined()
+        expect(await band.find({ type: 'Text', text: /^合计 \$0\.04 · 全程 Opus 则为/ })).toBeDefined()
+        const zh = (await band.findAll({ type: 'Text' })).filter((t: any) => /^ *[日一二三四五六] *$/.test(t.text))
+        expect(zh).toHaveLength(7)
         await band.unmount()
       })
     })

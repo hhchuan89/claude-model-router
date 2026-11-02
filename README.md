@@ -21,22 +21,26 @@ The screenshot is from an earlier version. The band is two plain rows, and every
 
 ```
 ⚙ Opus · medium — design work                                   [Details] [Pause router]
-  This reply $0.74 · Today $28.00, $8.94 less than all-Opus · Week 20% used
+  This reply $0.74 · Today $28.00 (−$8.94 vs all-Opus) · Context 106k of 1M · Week 20% used
 ```
 
 Row 1 is what the router chose and why: `📌 Sonnet · medium — pinned, 2 more replies`, `📌 Haiku · medium — you chose it (#haiku)`,
 or `⚙ Opus · medium — kept on Opus: switching would re-read the whole conversation`. Row 2 is what it costs: this reply,
 today against the same work on Opus (API-equivalent estimates at the rates in `hooks/meter.ts`, not subscription
-charges), and the week's usage from the engine's rate-limit window (`, ahead of pace` is added only when you are ahead
-and pacing is not off). Only when it matters a third line appears above them: with a conversation of 100k tokens or more
+charges), how big the conversation is (and the model's window, when the engine gives it; shown as a warning from 80% of
+the window, or from `compactAtContext` if that is nearer), and the week's usage from the engine's rate-limit window
+(`, ahead of pace` is added only when you are ahead and pacing is not off). On a narrow terminal whole parts are dropped:
+the comparison first, then the week, then the context. Only when it matters a third line appears above them: with a conversation of 100k tokens or more
 (`compactMinContext`), `⏳ Reply within 12 min to keep the conversation cached — after that the next reply costs ≈$2.38 more`
 in the last 15 minutes of the cache, and `⏳ The cache expired — your next reply re-reads 298k tokens (≈$2.38)` after it.
 Nothing is shown when the cache's age is unknown (after a reload).
 
-**Details** opens, in the same band, the last 5 replies (time, model and effort coloured by model, cost, a short reason and
-markers such as `(pinned)`, `(you chose)`, `(raised to Opus)`, `(cache expired)`, `(corrected)`), a small 7-day spend chart
-(bars with the dollar amount above each and a thin marker for the same work on Opus; a sparkline on the terminal) with
-`Last 7 days $763.57 · all-Opus would be $908.78`, and, with learning on, `Wrong model for the last reply? Should have been:
+**Details** opens, in the same band, a line on the conversation (`Context 106k of 1M tokens (11%) · cache warm for 44 more
+min`, the one place the cache is shown when no warning is due), the last 5 replies (time, model and effort coloured by
+model, cost, a short reason and markers such as `(pinned)`, `(you chose)`, `(raised to Opus)`, `(cache expired)`,
+`(corrected)`), a titled 7-day spend chart with `Total $777.22 · all-Opus would be $928.25` (on the terminal three aligned
+rows: dollar amounts, bars scaled to the week's biggest day, weekdays, with today in bold; four-character columns or the
+last four days on a narrow terminal; on desktop an SVG with an amount over each bar) and, with learning on, `Wrong model for the last reply? Should have been:
 [Haiku] [Sonnet] [Opus]`. Your choice (open or closed) is remembered. **Pause router** (or `/model-router off`) leaves
 every request on your own model; the band then says so and offers **Resume router**. No flow needs a command: they are
 shortcuts.
