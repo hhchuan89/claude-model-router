@@ -1,4 +1,5 @@
 import type { ModelKey, Tier } from '../types'
+import { priceOf } from './meter'
 import { pickTier, RISK_BAR, TIER_BARS } from './route'
 import type { Lang, Probs } from './route'
 
@@ -25,8 +26,11 @@ export const BAR_MIN = 0.2
 export const BAR_MAX = 0.95
 // Fewer labelled turns than this and no bars are suggested.
 export const MIN_LABELLED = 30
-// A cost proxy from the price ratios (Haiku : Sonnet : Opus), one unit for the cheapest.
-export const COST: Record<Tier, number> = { lookup: 1, execute: 3, decide: 6 }
+// A cost proxy, one unit for the cheapest: a main turn's cost is mostly cache reads of a large conversation, so each
+// tier is weighed by its model's cache-read price at a 200k-token context (Haiku's long-prompt tier applies there).
+const PROXY_CONTEXT = 200_000
+const READ = { haiku: priceOf('haiku', PROXY_CONTEXT).read, sonnet: priceOf('sonnet', PROXY_CONTEXT).read, opus: priceOf('opus', PROXY_CONTEXT).read }
+export const COST: Record<Tier, number> = { lookup: 1, execute: READ.sonnet / READ.haiku, decide: READ.opus / READ.haiku }
 
 const TIERS: Tier[] = ['lookup', 'execute', 'decide']
 const RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }

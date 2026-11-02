@@ -30,7 +30,7 @@ release.
   correction and any escalation to a higher model; no prompt text) for 30 days. `tune` prints, per tier, the turns routed,
   the correction rate and the escalation rate (a weak signal) and the current bars, and, from at least 30 labelled turns
   (corrections, or `--labels <file>` joined to a `--replay <file>` results file), suggested bars: the cheapest on a 0.05
-  grid (Haiku 1, Sonnet 3, Opus 6 as a cost proxy) that do not under-route more than the current bars do. It changes
+  grid (Haiku 1, Sonnet 2, Opus 4 as a cost proxy, from cache-read prices at a 200k context) that do not under-route more than the current bars do. It changes
   nothing. `tune apply` stores the bars, each moving at most 0.05 and staying in 0.2 to 0.95; `tune reset` removes them.
   Stats and status show whether the bars are tuned. Nothing is tuned unless you run `tune apply`.
 - Risk guard: a risk of 0.7 or more sends the request to decide, whatever its tier probabilities, and the reason ends

@@ -12,7 +12,7 @@ import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, pickTier, RISK_BAR, routeFor, settleTier, shorten, TIER_BARS, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath } from '../hooks/replay'
-import { BAR_MAX, BAR_MIN, evaluate, fitBars, labelledSamples, parseLabels, planFor, readBars, readCalib, STEP_MAX, stepBars, tuneReport } from '../hooks/tune'
+import { BAR_MAX, BAR_MIN, COST, evaluate, fitBars, labelledSamples, parseLabels, planFor, readBars, readCalib, STEP_MAX, stepBars, tuneReport } from '../hooks/tune'
 import type { Sample } from '../hooks/tune'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
@@ -8398,7 +8398,9 @@ describe('tuning math (1.2.0)', () => {
   test('evaluate counts right, under-routed, over-routed and the cost proxy', async () => {
     const e = evaluate(SYNTHETIC, TIER_BARS, RISK_BAR)
     expect(e).toMatchObject({ n: 50, accuracy: 30 / 50, under: 0, over: 20 / 50 })
-    expect(Math.abs(e.cost - (20 * 3 + 20 * 3 + 10 * 6) / 50) < 1e-12).toBe(true)
+    // Weights 1 : 2 : 4: cache reads at 200k cost Haiku $0.05, Sonnet $0.10, Opus $0.20 per million (long-prompt Haiku).
+    expect(COST).toEqual({ lookup: 1, execute: 2, decide: 4 })
+    expect(Math.abs(e.cost - (20 * 2 + 20 * 2 + 10 * 4) / 50) < 1e-12).toBe(true)
     expect(evaluate([], TIER_BARS)).toEqual({ n: 0, accuracy: 0, under: 0, over: 0, cost: 0 })
     // A risky message goes to decide: over-routing when the right tier was lower.
     expect(evaluate(s(1, [1, 0, 0], 'lookup', 0.9), TIER_BARS)).toMatchObject({ over: 1, accuracy: 0 })
@@ -8504,7 +8506,7 @@ describe('tuning math (1.2.0)', () => {
     expect(text).toContain('accuracy: 60.0% → 100.0%')
     expect(text).toContain('under-routing: 0.0% → 0.0%')
     expect(text).toContain('over-routing: 40.0% → 0.0%')
-    expect(text).toContain('cost proxy (current = 100%): 100% → 78%')
+    expect(text).toContain('cost proxy (current = 100%): 100% → 83%')
     expect(text).toContain('Nothing has changed.')
     expect(tuneReport('zh', [], TIER_BARS, RISK_BAR, labelled, planFor(labelled, TIER_BARS))).toContain('建议阈值')
   })

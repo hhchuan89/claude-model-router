@@ -232,8 +232,8 @@ any correction (`/model-router wrong`) and any escalation to a higher model that
 - `/model-router tune` prints a report and changes nothing: per tier the turns routed, the correction rate and the
   escalation rate (**a weak signal: an escalation is not proof the tier was wrong**), and the current bars and risk bar
   (default or tuned).
-- With at least 30 labelled turns it also suggests bars: the cheapest bars on a 0.05 grid (cost proxy Haiku 1, Sonnet 3,
-  Opus 6) whose under-routing rate does not exceed the current bars', shown beside the current ones (accuracy,
+- With at least 30 labelled turns it also suggests bars: the cheapest bars on a 0.05 grid (cost proxy Haiku 1, Sonnet 2,
+  Opus 4, from the cache-read prices at a 200k context) whose under-routing rate does not exceed the current bars', shown beside the current ones (accuracy,
   under-routing, over-routing, cost). Labels come from your corrections, or from `--labels <file>` (`[{ "id", "right" }]`)
   joined by id to a replay results file given as `--replay <file>`. Corrections alone are only the turns that were wrong,
   so they lean toward under-routing; labelled replays do not. With fewer than 30 the report says how many more it needs.
