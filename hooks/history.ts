@@ -34,11 +34,12 @@ export function chartAlt(days: readonly DayCost[]): string {
   return `Spend over the last ${days.length} days: ${usd(cost)}, against ${usd(base)} for the same work tokens at Opus prices.`
 }
 
-// Bars are the cost, each with its dollar amount above it; a thin marker across each is the Opus-priced baseline. Fixed
-// mid-tone colours that read on a light and a dark surface alike, since an image cannot follow the theme. About 66px
-// tall: room for the label, the bars and the day.
+// Bars are the cost, each with its dollar amount above it where the amount fits; a thin marker across each is the Opus-priced
+// baseline. Fixed mid-tone colours that read on a light and a dark surface alike, since an image cannot follow the theme.
+// About 66px tall, text at 10px.
 export function barChartSvg(days: readonly DayCost[], width = 320, height = 66): string {
-  const top = 12
+  const font = 10
+  const top = 14
   const bottom = 12
   const plot = height - top - bottom
   const max = Math.max(0.0001, ...days.flatMap(d => [d.cost, d.baseline]))
@@ -49,10 +50,13 @@ export function barChartSvg(days: readonly DayCost[], width = 320, height = 66):
     const x = Math.round(i * slot + (slot - barW) / 2)
     const h = Math.max(d.cost > 0 ? 1 : 0, (d.cost / max) * plot)
     const barTop = top + plot - h
+    const label = usd(d.cost)
+    // About 0.6em a character: a label that does not fit its slot is left off, the bar and the day stay.
+    const fits = label.length * font * 0.6 <= slot - 2
     return `<rect x="${x}" y="${barTop.toFixed(1)}" width="${barW}" height="${h.toFixed(1)}" rx="2" fill="#4f8cff"/>` +
       (d.baseline > 0 ? `<rect x="${x - 2}" y="${(y(d.baseline) - 1).toFixed(1)}" width="${barW + 4}" height="2" fill="#e0a030"/>` : '') +
-      (d.cost > 0 ? `<text x="${x + barW / 2}" y="${Math.max(8, Math.min(barTop, y(d.baseline)) - 2).toFixed(1)}" font-size="8" text-anchor="middle" fill="#8a8f98">${usd(d.cost)}</text>` : '') +
-      `<text x="${x + barW / 2}" y="${height - 2}" font-size="8" text-anchor="middle" fill="#8a8f98">${d.day.slice(6)}</text>`
+      (d.cost > 0 && fits ? `<text x="${x + barW / 2}" y="${Math.max(font, Math.min(barTop, y(d.baseline)) - 2).toFixed(1)}" font-size="${font}" text-anchor="middle" fill="#8a8f98">${label}</text>` : '') +
+      `<text x="${x + barW / 2}" y="${height - 2}" font-size="${font}" text-anchor="middle" fill="#8a8f98">${d.day.slice(6)}</text>`
   })
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">${parts.join('')}</svg>`
 }

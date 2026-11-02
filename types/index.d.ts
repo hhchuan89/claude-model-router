@@ -16,7 +16,7 @@ export type Route = {
   // The classifier failed on a first turn and there was no earlier route to keep: this turn is unrouted and runs
   // on the session's own model and effort. tier/model/effort are placeholders and are never applied.
   sessionModel?: boolean
-  // How the route was reached; the pane shows it and only 'classified' turns can be corrected.
+  // How the route was reached; /model-router history shows it and only 'classified' turns can be corrected.
   how?: TurnHow
   // A pacing steer moved this turn from decide to execute (counted once, unless the warm cache kept it on Opus).
   steered?: boolean
@@ -27,7 +27,7 @@ export type Route = {
 
 export type TurnHow = 'classified' | 'forced' | 'pinned' | 'inherited' | 'kept-tier' | 'warm-skip' | 'session-model'
 
-// One main turn as the pane lists it. The prompt snippet is never in here: it stays in memory for corrections.
+// One main turn as /model-router history lists it. The prompt snippet is never in here: it stays in memory for corrections.
 export type TurnRecord = {
   turnId: string
   at: number

@@ -427,6 +427,19 @@ describe('meter', () => {
     expect(micro(costOf(U(100_001, 1000), 'haiku'))).toBe(micro((100_001 * 0.5 + 1000 * 2.5) / 1e6))
     // The usage breakdown follows the same tier, and Sonnet and Opus have none.
     expect(micro(add(EMPTY, 'claude-haiku-5-5', U(100_001, 0)).cost)).toBe(micro(100_001 * 0.5 / 1e6))
+    // Every kind at the long-prompt rates ($0.50 in, $2.50 out, $0.05 read, $1 write): literal figures, not the table.
+    const long = add(EMPTY, 'claude-haiku-5-5', U(100_001, 1000, 2000, 3000)).byUsage!
+    const dollars = (x: number | undefined) => Math.round((x ?? NaN) * 1e7) / 1e7
+    expect(dollars(long.input?.cost)).toBe(0.0500005)
+    expect(dollars(long.output?.cost)).toBe(0.0025)
+    expect(dollars(long.read?.cost)).toBe(0.0001)
+    expect(dollars(long.write?.cost)).toBe(0.003)
+    // And at the base rates ($0.10, $0.50, $0.01, $0.20) just under: 99,999 prompt tokens.
+    const base = add(EMPTY, 'claude-haiku-5-5', U(90_000, 1000, 5000, 4999)).byUsage!
+    expect(dollars(base.input?.cost)).toBe(0.009)
+    expect(dollars(base.output?.cost)).toBe(0.0005)
+    expect(dollars(base.read?.cost)).toBe(0.00005)
+    expect(dollars(base.write?.cost)).toBe(0.0009998)
     expect(micro(costOf(U(100_001, 0), 'sonnet'))).toBe(micro(100_001 * 2 / 1e6))
     expect(priceOf('opus', 5e6)).toEqual(priceOf('opus', 1))
   })
@@ -434,6 +447,10 @@ describe('meter', () => {
   test('a context-only estimate for Haiku uses the context size the same way', async () => {
     expect(priceOf('haiku', 100_000).write).toBe(0.2)
     expect(priceOf('haiku', 100_001).write).toBe(1)
+    // A Haiku context just over 100k tokens reads at $0.05 a step instead of $0.01, so a checkpoint pays there and not
+    // just under (summary 40k at the base tier: cost 13,000 vs saving 9,000 at 100,000; cost 33,000 vs saving 69,000 above).
+    expect(checkpointPays(100_000, 'haiku')).toBe(false)
+    expect(checkpointPays(100_001, 'haiku')).toBe(true)
   })
 
   // Changed from v0.6: the haiku line used to follow the cost comparison; a 200k context is now never moved down.
@@ -1525,7 +1542,8 @@ describe('phase 1 routing and meter fixes', () => {
       await step($, 't1')
       await $.prompt.submit({ text: `next #${model}` } as never)
       await step($, 't2')
-      const cost = fmtUsd(300_000 * (priceOf(model, 300_000).write + priceOf('opus', 300_000).write) / 1e6)
+      // 300k tokens: (Haiku long-prompt write $1 or Sonnet $4, plus Opus $8) per million, by the official page.
+      const cost = { haiku: '$2.70', sonnet: '$3.60' }[model]
       expect(seen.steps.at(-1)!.model).toContain(model)
       expect(seen.asked).toEqual(['haiku'])
       expect(seen.submits.at(-1)!.context?.[0]).toContain(`warm Opus cache abandoned, estimated round-trip rewrite ${cost}`)
@@ -1813,8 +1831,11 @@ describe('cost exposure and session commands (1.0)', () => {
       seen.usage.push(U(1000, 500, 220_000, 0, `claude-${model}-5-5`))
       await step($, 't1', `claude-${model}-5-5`)
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-      expect(await ui.find({ text: `cold resume ≈${fmtUsd(221_000 * priceOf(model, 221_000).write / 1e6)}` })).toBeDefined()
-      expect(await ui.find({ text: `≈$${(221_000 * priceOf(model, 221_000).read / 1e6).toFixed(3)}/step` })).toBeDefined()
+      // 221k tokens at the official per-million rates (Haiku is over 100k, so its long-prompt write $1 and read $0.05).
+      const expected: Record<string, [string, string]> = { haiku: ['$0.22', '0.011'], sonnet: ['$0.88', '0.022'], opus: ['$1.77', '0.044'], fable: ['$4.42', '0.055'] }
+      const [cold, read] = expected[model]!
+      expect(await ui.find({ text: `cold resume ≈${cold}` })).toBeDefined()
+      expect(await ui.find({ text: `≈$${read}/step` })).toBeDefined()
     })
   }
 
@@ -1860,7 +1881,7 @@ describe('cost exposure and session commands (1.0)', () => {
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
       const cost = fmtUsd(60_000 * PRICES[model].write / 1e6)
       expect(await ui.find({ text: `cold resume ≈${cost} · cache warm ~44m` })).toBeDefined()
-      expect(await ui.find({ text: `≈$${(60_000 * priceOf(model, 60_000).read / 1e6).toFixed(3)}/step` })).toBeDefined()
+      expect(await ui.find({ text: `≈$${(60_000 * PRICES[model].read / 1e6).toFixed(3)}/step` })).toBeDefined()
       await seen.clock.advance(44 * 60_000)
       expect(await ui.find({ text: `cache expired: next prompt rewrites ≈60.0k (≈${cost})` })).toBeDefined()
     })
@@ -3631,7 +3652,8 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     })
 
     test('hint cost includes the cached context read, output and summary rewrite at the observed model prices', async () => {
-      for (const model of ['haiku', 'sonnet', 'opus', 'fable'] as const) {
+      // Haiku has a second price tier above 100k prompt tokens; its boundary is tested with the prices (meter).
+      for (const model of ['sonnet', 'opus', 'fable'] as const) {
         const p = PRICES[model]
         const breakeven = (40_000 * p.read * 15 + 8000 * p.output + 40_000 * p.write) / (14 * p.read)
         expect(checkpointPays(Math.floor(breakeven), model)).toBe(false)
@@ -6484,6 +6506,12 @@ describe('history helpers (1.1.0)', () => {
     expect(svg.startsWith('<svg')).toBe(true)
     expect(svg.match(/fill="#4f8cff"/g)).toHaveLength(2)
     expect(svg.match(/fill="#e0a030"/g)).toHaveLength(2)
+    // Text is 10px, and a label that does not fit its slot is dropped (the bar and the day stay).
+    expect(svg).toContain('font-size="10"')
+    expect(svg).not.toContain('font-size="8"')
+    const narrow = barChartSvg([{ day: '20261030', cost: 745.99, baseline: 885.8 }, { day: '20261031', cost: 2, baseline: 8 }], 40)
+    expect(narrow.match(/>\$/g)).toBeNull()
+    expect(narrow.match(/<rect x="[^"]*" y="[^"]*" width="[^"]*" height="[^"]*" rx="2"/g)).toHaveLength(2)
     expect(chartAlt(days)).toBe('Spend over the last 2 days: $3.00, against $12 for the same work tokens at Opus prices.')
   })
 
@@ -6500,20 +6528,9 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
 
   // The engine's side of toasts and the weekly window.
   function ui($: any, on: any) {
-    const c = { toasts: [] as string[], opened: [] as any[], closed: [] as string[], isOpen: false }
+    const c = { toasts: [] as string[] }
     on('ui.toast', async (_$: unknown, e: { text: string }) => {
       c.toasts.push(e.text)
-      return { value: undefined }
-    })
-    on('ui.panes', async () => ({ value: c.isOpen ? [{ id: 'model-router', title: 'Router', isShown: true, hasFocus: false, isPlaced: true }] : [] }))
-    on('ui.open', async (_$: unknown, e: any) => {
-      c.opened.push(e)
-      c.isOpen = true
-      return { value: { isPlaced: true } }
-    })
-    on('ui.close', async (_$: unknown, e: any) => {
-      c.closed.push(e.id)
-      c.isOpen = false
       return { value: undefined }
     })
     on('session.model', async () => ({ value: 'claude-opus-5-5' }))
@@ -6849,9 +6866,9 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
   })
 
   describe('history', () => {
-    const HIST = (surface: 'terminal' | 'desktop', args = 'history') =>
-      ({ plugin: 'model-router', surface, component: 'CommandOutput', props: { command: 'model-router', args, text: 'x', isErrored: false } }) as never
-    const mountHistory = ($: any, surface: 'terminal' | 'desktop', args?: string) => $.ui.mount(HIST(surface, args))
+    // A history row is drawn from the snapshot its command took, found by the text the command printed.
+    const mountHistory = async ($: any, surface: 'terminal' | 'desktop', args = 'history') =>
+      $.ui.mount({ plugin: 'model-router', surface, component: 'CommandOutput', props: { command: 'model-router', args, text: args === 'history' ? await cmd($, 'history') : 'x', isErrored: false } } as never)
     // The turn a classified lookup ran as: one cold Haiku request.
     async function lookupTurn($: any, seen: Seen, text: string, turnId: string) {
       await $.prompt.submit({ text } as never)
@@ -6960,6 +6977,63 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await hist.unmount()
     })
 
+    // WHY: a row in the transcript is what the model read; later turns and redraws must not change it.
+    test('a history row stays a snapshot: more turns and a redraw change neither its rows nor its button target', async ($, on) => {
+      const seen = world($, on, [LOOKUP, LOOKUP, LOOKUP])
+      ui($, on)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      const old = await mountHistory($, 'terminal')
+      expect(await old.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(1)
+      await seen.clock.advance(5 * 60_000)
+      await $.prompt.submit({ text: 'list the files' } as never)
+      await $.turn.complete(completion('t2'))
+      await seen.clock.advance(5 * 60_000)
+      await $.prompt.submit({ text: 'show the config' } as never)
+      await $.turn.complete(completion('t3'))
+      // A redraw (the pin command asks for one) re-runs the hook for the old row.
+      await cmd($, 'pin opus 1')
+      expect(await old.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(1)
+      expect(await old.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(0)}\\)`) })).toBeDefined()
+      await old.press({ key: 'wrong-decide' })
+      expect((seen.store.corrections as Correction[]).map(c => c.text)).toEqual(['rename the helper'])
+      await old.unmount()
+    })
+
+    test('a row whose text no history printed keeps the engine row, and an old lifetime\'s rows too', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      on('ui.render', { component: 'CommandOutput' }, async ($$: any, e: any) => {
+        const { Text } = $$.ui.resolve(e)
+        return <Text>engine row</Text>
+      })
+      await $.prompt.submit({ text: 'find files' } as never)
+      await $.turn.complete(completion('t1'))
+      const text = await cmd($, 'history')
+      // A new session forgets what the old rows were drawn from.
+      seen.sessionId = 'sess-2'
+      await $.prompt.submit({ text: 'in the new session' } as never)
+      const hist = await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'CommandOutput', props: { command: 'model-router', args: 'history', text, isErrored: false } } as never)
+      expect(await hist.find({ type: 'Text', text: /engine row/ })).toBeDefined()
+      await hist.unmount()
+    })
+
+    test('the buttons target a turn among the rows shown, and none when no shown turn is correctable', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      ui($, on)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      // Ten forced turns push the one classified turn out of the ten shown.
+      for (let i = 2; i <= 11; i++) {
+        await $.prompt.submit({ text: `job ${i} #haiku` } as never)
+        await $.turn.complete(completion(`t${i}`))
+      }
+      const hist = await mountHistory($, 'terminal')
+      expect(await hist.findAll({ type: 'Text', text: /^\d\d:\d\d$/ })).toHaveLength(10)
+      expect(await hist.find({ key: 'wrong-decide' })).toBeUndefined()
+      expect(seen.store.corrections).toBeUndefined()
+      await hist.unmount()
+    })
+
     test('the tree lists the last 10 turns of the 50 kept', async ($, on) => {
       world($, on, LOOKUP)
       for (let i = 1; i <= 52; i++) {
@@ -6974,6 +7048,28 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
 
   describe('band wording (1.1.0)', () => {
     // WHY: the band is the glance view: a pin shows as a marker before the model, and nothing else is added to its rows.
+    // WHY: a pin set after a classified route must not look like that route was pinned.
+    test('a pin set while the route is not pinned shows in front of it, as the narrow layout does', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'find files' } as never)
+      seen.usage.push(U(1000, 500, 20_000, 0, 'claude-haiku-5-5'))
+      await step($, 't1')
+      await cmd($, 'pin opus 3')
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await band.find({ text: /^📌 Opus \(3\) │ Haiku · medium — find$/ })).toBeDefined()
+      expect(await band.find({ text: /^📌 Haiku/ })).toBeUndefined()
+    })
+
+    test('a saving under a cent reads <$0.01, not ≈<$0.01', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'do the thing #sonnet' } as never)
+      seen.usage.push(U(1000, 500, 20_000, 0, 'claude-sonnet-5-5'))
+      await step($, 't1')
+      const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      expect(await band.find({ text: /· <\$0\.01 \(\d+%\) below all-Opus$/ })).toBeDefined()
+      expect(await band.find({ text: /≈</ })).toBeUndefined()
+    })
+
     test('an active pin puts a marker before the model, and the meter says it in plain words', async ($, on) => {
       const seen = world($, on, LOOKUP)
       await cmd($, 'pin sonnet 2')
@@ -6982,7 +7078,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await step($, 't1')
       const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
       expect(await band.find({ text: /^📌 Sonnet · medium — pinned \(2 left\)$/ })).toBeDefined()
-      expect(await band.find({ text: /^turn 21\.5k tok · <\$0\.01 {3}today 21\.5k tok · <\$0\.01 · ≈<\$0\.01 \(50%\) below all-Opus$/ })).toBeDefined()
+      expect(await band.find({ text: /^turn 21\.5k tok · <\$0\.01 {3}today 21\.5k tok · <\$0\.01 · <\$0\.01 \(50%\) below all-Opus$/ })).toBeDefined()
       // Only the enable/disable button.
       expect((await band.findAll({ type: 'Button' } as never))).toHaveLength(1)
     })
@@ -7004,7 +7100,8 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
   })
 
   describe('review fixes (1.1.0)', () => {
-    const HIST = { plugin: 'model-router', surface: 'terminal', component: 'CommandOutput', props: { command: 'model-router', args: 'history', text: 'x', isErrored: false } } as never
+    const mountHist = async ($: any) =>
+      $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'CommandOutput', props: { command: 'model-router', args: 'history', text: await cmd($, 'history'), isErrored: false } } as never)
     const STEER = { options: { weeklyPacing: 'steer' } }
 
     // WHY: the buttons must correct the turn whose time they show, not whichever turn is latest when pressed.
@@ -7018,22 +7115,22 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.prompt.submit({ text: 'think about the design' } as never)
       expect(route(seen, 1)).toContain('assigned to sonnet')
       await $.turn.complete(completion('t2'))
-      let pane = await $.ui.mount(HIST)
+      let hist = await mountHist($)
       // The first turn ran at minute 0 and the steered one at minute 5: the label is the first turn's time.
-      expect(await pane.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(0)}\\)`) })).toBeDefined()
-      expect(await pane.find({ key: 'wrong-decide' })).toBeDefined()
-      await pane.unmount()
+      expect(await hist.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(0)}\\)`) })).toBeDefined()
+      expect(await hist.find({ key: 'wrong-decide' })).toBeDefined()
+      await hist.unmount()
       // A newer correctable turn completes; the next history shows it, and a press corrects exactly that turn.
       await seen.clock.advance(5 * 60_000)
       await $.prompt.submit({ text: 'list the files' } as never)
       await $.turn.complete(completion('t3'))
-      pane = await $.ui.mount(HIST)
-      expect(await pane.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(10 * 60_000)}\\)`) })).toBeDefined()
-      await pane.press({ key: 'wrong-decide' })
+      hist = await mountHist($)
+      expect(await hist.find({ type: 'Text', text: new RegExp(`Should have been: \\(${hhmm(10 * 60_000)}\\)`) })).toBeDefined()
+      await hist.press({ key: 'wrong-decide' })
       const stored = seen.store.corrections as Correction[]
       expect(stored).toHaveLength(1)
       expect(stored[0]!.text).toBe('list the files')
-      await pane.unmount()
+      await hist.unmount()
     })
 
     test('a steer does not leak into later routing: an unsure execute after it is held at decide as without a steer', STEER, async ($, on) => {
@@ -7106,12 +7203,12 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       // A turn with no person prompt continues the route within the cache window.
       await $.turn.start({ text: 'task notification', turnId: 't2' } as never)
       await $.turn.complete(completion('t2'))
-      const pane = await $.ui.mount(HIST)
-      const rows = (await pane.findAll({ type: 'Text', text: /^<?\$\d/ })).map(x => x.text)
+      const hist = await mountHist($)
+      const rows = (await hist.findAll({ type: 'Text', text: /^<?\$\d/ })).map((x: any) => x.text)
       expect(rows).toHaveLength(2)
       expect(rows[0]).toContain('→ sonnet/medium')
       expect(rows[1]).not.toContain('→ sonnet')
-      await pane.unmount()
+      await hist.unmount()
     })
   })
 })

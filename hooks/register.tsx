@@ -137,8 +137,11 @@ let turnCold = false
 let turnBase = { tokens: 0, cost: 0 }
 // An inherited turn's route already carries earlier escalations: its own start at this many trail steps.
 let turnTrailBase = 0
-// The seven days of spend and the session total behind /model-router history, cached by day and turn count.
-let weekCache: { day: string; count: number; series: DayCost[]; session: Tally } | undefined
+// What each /model-router history row was drawn from, by the exact text it printed: a row in the transcript stays what
+// the model read, however many turns come after it. Newest HISTORY_KEPT only.
+type HistorySnapshot = { shown: TurnRecord[]; series: DayCost[]; target?: TurnRecord }
+const histories = new Map<string, HistorySnapshot>()
+const HISTORY_KEPT = 20
 // A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
 const REWRITE_MIN_TOKENS = 100_000
 // A cache read below this on a request with no earlier one in this process means the cache was cold.
@@ -211,6 +214,7 @@ const STR = {
     turnBusy: '无法创建检查点：主会话正在运行。请在轮次之间重试。',
     checkpointBusy: '无法创建检查点：另一个检查点正在运行。',
     checkpointCancelled: '检查点已取消：会话或路由状态已变化。',
+    sessionChanged: '会话已变化，未显示。',
     checkpointCount: (n: number) => `任务检查点：${n}。`,
     reductions: (n: number, chars: number) => `已精简工具输出：${n}；减少字符：${chars}。`,
     omitted: (n: number) => `[已省略 ${n} 行]`,
@@ -324,6 +328,7 @@ const STR = {
     turnBusy: 'Checkpoint refused: a main turn is running. Try again between turns.',
     checkpointBusy: 'Checkpoint refused: a checkpoint is already running.',
     checkpointCancelled: 'Checkpoint cancelled: the conversation or router state changed.',
+    sessionChanged: 'The session changed; nothing shown.',
     checkpointCount: (n: number) => `Task-boundary checkpoints: ${n}.`,
     reductions: (n: number, chars: number) => `Tool outputs reduced: ${n}; characters removed: ${chars}.`,
     omitted: (n: number) => `[${n} lines omitted]`,
@@ -473,6 +478,11 @@ const NO_COUNTS: Counts = {
   correctionsManual: 0,
   correctionsEscalate: 0,
   pacingSteered: 0,
+}
+
+// "≈$3.51", and "<$0.01" without a sign in front of it.
+function approxUsd(n: number): string {
+  return n > 0 && n < 0.01 ? fmtUsd(n) : `≈${fmtUsd(n)}`
 }
 
 function dayKey(ms: number): string {
@@ -719,7 +729,7 @@ function resetSession($: EngineInterface, cancel = true) {
   turnCold = false
   turnBase = { tokens: 0, cost: 0 }
   turnTrailBase = 0
-  weekCache = undefined
+  histories.clear()
   rateLimits = []
   lastSkipped = null
   skippedEpoch = -1
@@ -1147,23 +1157,17 @@ async function writeTurnRecord($: EngineInterface, session: Session, r: Route, t
 }
 
 // The seven days of spend and this session's total in one pass over the store keys.
-async function refreshWeek($: EngineInterface, session: Session, now: number, count: number) {
+async function weekSeries($: EngineInterface, session: Session, now: number): Promise<DayCost[] | undefined> {
   const days = lastDays(now, PACE_DAYS, dayKey)
   const byDay = new Map<string, Tally>()
-  let mine = EMPTY
   for (const key of await $.store.keys()) {
-    const m = /^meter:(\d{8})(?::(.+))?$/.exec(key)
-    if (!m) continue
-    const inWeek = days.includes(m[1]!)
-    const own = m[2] === session.id
-    if (!inWeek && !own) continue
+    const m = /^meter:(\d{8})(?::.+)?$/.exec(key)
+    if (!m || !days.includes(m[1]!)) continue
     const t = (await $.store.get(key)) as Tally | undefined
-    if (!t) continue
-    if (inWeek) byDay.set(m[1]!, merge(byDay.get(m[1]!) ?? EMPTY, t))
-    if (own) mine = merge(mine, t)
+    if (t) byDay.set(m[1]!, merge(byDay.get(m[1]!) ?? EMPTY, t))
   }
-  if (await stillHere($, session) !== 'same') return
-  weekCache = { day: dayKey(now), count, series: days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0 })), session: mine }
+  if (await stillHere($, session) !== 'same') return undefined
+  return days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0 }))
 }
 
 // One turn as a row: the pieces the tree colours and the plain text joins.
@@ -1202,9 +1206,15 @@ function historyText(lang: Lang, list: readonly TurnRecord[], series: readonly D
 async function historyCommand($: EngineInterface, session: Session, lang: Lang): Promise<string> {
   const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
   const now = await $.clock.now()
-  await bookkeeping($, () => refreshWeek($, session, now, list.length), undefined, retryFor(session, 'history week'))
-  if (await stillHere($, session) !== 'same') return STR[lang].checkpointCancelled
-  return historyText(lang, list.slice(-HISTORY_ROWS), weekCache?.series ?? [])
+  const series = await bookkeeping($, () => weekSeries($, session, now), undefined, retryFor(session, 'history week'))
+  if (series === undefined || await stillHere($, session) !== 'same') return STR[lang].sessionChanged
+  const shown = list.slice(-HISTORY_ROWS)
+  const text = historyText(lang, shown, series)
+  // The row the transcript draws for this text comes from here, never from what the session holds by then. The button
+  // target is among the rows shown.
+  histories.set(text, { shown, series, target: [...shown].reverse().find(isCorrectable) })
+  while (histories.size > HISTORY_KEPT) histories.delete(histories.keys().next().value!)
+  return text
 }
 
 async function pinCommand($: EngineInterface, lang: Lang, arg: string, mainRouting: boolean): Promise<string> {
@@ -2433,29 +2443,22 @@ export const register: Register = (on, options) => {
   // /model-router history draws its details inline in the transcript; every other model-router command keeps the
   // engine's own row. A surface that cannot draw the tree shows the command's plain text instead.
   on('ui.render', { component: 'CommandOutput', props: { command: 'model-router' } }, async ($, e, next) => {
-    if (e.props.args.trim() !== 'history' || e.props.isErrored) return next(e)
+    // Drawn from the snapshot the command took, matched by the text it printed; none (an older lifetime, or another
+    // command) leaves the engine's own row.
+    const snap = e.props.args.trim() === 'history' && !e.props.isErrored ? histories.get(e.props.text) : undefined
+    if (!snap) return next(e)
     const session = await useSession($)
     if (!here(session)) return next(e)
-    const now = await $.clock.now()
-    const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
-    // Computed when the command ran or the turns changed since, never on every redraw.
-    if (weekCache === undefined || weekCache.day !== dayKey(now) || weekCache.count !== list.length) {
-      await bookkeeping($, () => refreshWeek($, session, now, list.length), undefined, retryFor(session, 'history week'))
-    }
-    if (await stillHere($, session) !== 'same') return next(e)
-    await ensurePrefs($, session)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     // The terminal's table has no Svg (it would draw a fragment: nothing): it gets a text sparkline instead.
     const Svg = e.surface === 'terminal' ? undefined : (table as unknown as { Svg?: ElementConstructor<SvgProps> }).Svg
-    const shown = list.slice(-HISTORY_ROWS)
-    const series = weekCache?.series ?? []
-    const w = weekTotals(series)
-    const target = learning ? [...list].reverse().find(isCorrectable) : undefined
+    const w = weekTotals(snap.series)
+    const target = learning ? snap.target : undefined
     return (
       <Box flexDirection="column">
-        {shown.length === 0 && <Text dimColor>{str.histNone}</Text>}
-        {shown.map(t => {
+        {snap.shown.length === 0 && <Text dimColor>{str.histNone}</Text>}
+        {snap.shown.map(t => {
           const p = turnParts(t, lang)
           return (
             <Box key={t.turnId} flexDirection="row" gap={1}>
@@ -2471,9 +2474,9 @@ export const register: Register = (on, options) => {
             </Box>
           )
         })}
-        {series.length > 0 && (Svg
-          ? <Svg source={barChartSvg(series)} alt={chartAlt(series)} />
-          : <Text dimColor>{sparkline(series.map(d => d.cost))}</Text>)}
+        {snap.series.length > 0 && (Svg
+          ? <Svg source={barChartSvg(snap.series)} alt={chartAlt(snap.series)} />
+          : <Text dimColor>{sparkline(snap.series.map(d => d.cost))}</Text>)}
         <Text dimColor wrap="truncate-end">{str.histTotal(fmtUsd(w.cost), fmtUsd(w.base))}</Text>
         {target && (
           <Box flexDirection="row" gap={1} alignItems="center">
@@ -2524,12 +2527,13 @@ export const register: Register = (on, options) => {
           (r.reason ? ` — ${r.reason}` : '')
     // A pin shows in front of the route, and without one nothing here changes.
     const pinTag = pin ? `📌 ${LABEL[pin.model]}${pin.left === undefined ? '' : ` (${pin.left})`}` : ''
-    const routeText = pin || r?.how === 'pinned' ? `📌 ${routeBase}` : routeBase
+    // A pinned turn already says so; a pin set since the last route is shown in front of it, as the narrow layout does.
+    const routeText = r?.how === 'pinned' ? `📌 ${routeBase}` : pinTag === '' ? routeBase : `${pinTag} │ ${routeBase}`
     const today = session.today ?? m.today
     const s = saved(today)
     const meterText =
       `${str.turn} ${fmtTokens(m.turn.tokens)} tok · ${fmtUsd(m.turn.cost)}   ` +
-      `${str.today} ${fmtTokens(today.tokens)} tok · ${fmtUsd(today.cost)} · ≈${fmtUsd(Math.abs(s.usd))} (${Math.abs(s.pct)}%) ${s.usd >= 0 ? str.below : str.above}`
+      `${str.today} ${fmtTokens(today.tokens)} tok · ${fmtUsd(today.cost)} · ${approxUsd(Math.abs(s.usd))} (${Math.abs(s.pct)}%) ${s.usd >= 0 ? str.below : str.above}`
 
     // No route, or no room for it: the meter takes the gear's row, so there is no empty route row.
     if (!r || narrow) {

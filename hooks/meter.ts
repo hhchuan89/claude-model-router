@@ -38,9 +38,12 @@ export const CHECKPOINT_COOLDOWN_MS = 30 * 60_000
 export const CHECKPOINT_GROWTH = 1.5
 
 export function checkpointPays(context: number, model: keyof typeof PRICES): boolean {
+  // Summarising reads and answers at the context's tier; the summary is a prompt of its own size, so what it is written
+  // at and what every later step reads it at is the summary's tier. Each later step reads the summary instead of the context.
   const p = priceOf(model, context)
-  const cost = context * p.read + CHECKPOINT_OUTPUT * p.output + CHECKPOINT_SUMMARY * p.write
-  const saving = (context - CHECKPOINT_SUMMARY) * p.read * CHECKPOINT_STEPS
+  const s = priceOf(model, CHECKPOINT_SUMMARY)
+  const cost = context * p.read + CHECKPOINT_OUTPUT * p.output + CHECKPOINT_SUMMARY * s.write
+  const saving = CHECKPOINT_STEPS * (context * p.read - CHECKPOINT_SUMMARY * s.read)
   return saving > cost
 }
 
