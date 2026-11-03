@@ -96,6 +96,14 @@ export function parseReplayArgs(rest: string): { path: string; variants: ReplayV
 }
 
 // Results go next to the input: labelled.json -> labelled.replay.json.
+// The file a replay path names. `$.fs` takes paths as given, so `~` is expanded against the home folder and a relative
+// path is read from the session's folder, as a shell would; an absolute path (`/…`, `C:\…`, `\\server\…`) is kept.
+export function resolveReplayPath(path: string, home: string | undefined, cwd: string): string {
+  if (home && (path === '~' || /^~[\\/]/.test(path))) return `${home.replace(/[\\/]+$/, '')}${path.slice(1)}`
+  if (!cwd || /^(?:[\\/]|[A-Za-z]:[\\/])/.test(path)) return path
+  return `${cwd.replace(/[\\/]+$/, '')}/${path}`
+}
+
 export function replayOutPath(path: string): string {
   return `${path.replace(/\.json$/i, '')}.replay.json`
 }

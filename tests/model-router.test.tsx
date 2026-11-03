@@ -11,7 +11,7 @@ import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
-import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS } from '../hooks/replay'
+import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
 import { isRisky, riskFloor } from '../hooks/risk'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
@@ -8671,6 +8671,14 @@ describe('/model-router replay (1.2.0)', () => {
   }
 
   test('argument parsing: a path with spaces, an optional variant, --repeat 1 to 3, the output beside the input', async () => {
+    // WHY: Muhafiz's run read /private/tmp/~/router-eval/… — `$.fs` does not expand `~`, so a replay of a file in the home
+    // folder failed unless the path was absolute.
+    expect(resolveReplayPath('~/router-eval/in.json', '/Users/m', '/private/tmp')).toBe('/Users/m/router-eval/in.json')
+    expect(resolveReplayPath('~\\eval\\in.json', 'C:\\Users\\h\\', 'C:\\x')).toBe('C:\\Users\\h\\eval\\in.json')
+    expect(resolveReplayPath('in.json', '/Users/m', '/work/')).toBe('/work/in.json')
+    expect(resolveReplayPath('/abs/in.json', '/Users/m', '/work')).toBe('/abs/in.json')
+    expect(resolveReplayPath('C:/abs/in.json', 'C:/Users/h', 'C:/work')).toBe('C:/abs/in.json')
+    expect(resolveReplayPath('~user/in.json', '/Users/m', '/work')).toBe('/work/~user/in.json')
     expect(parseReplayArgs(' /a b/c.json ')).toEqual({ path: '/a b/c.json', variants: ['current', 'legacy'], repeat: 1 })
     expect(parseReplayArgs('/a.json legacy')).toEqual({ path: '/a.json', variants: ['legacy'], repeat: 1 })
     expect(parseReplayArgs('/a.json current')?.variants).toEqual(['current'])
@@ -8752,6 +8760,20 @@ describe('/model-router replay (1.2.0)', () => {
     expect(rows.find(r => r.id === 'q')).toMatchObject({ risk: false, tier: 'lookup' })
     expect(rows.find(r => r.id === 'z')).toMatchObject({ risk: false })
     expect(text).toContain('(1 risky by the code check)')
+  })
+
+  // WHY: a replay of `~/router-eval/in.json` read `<cwd>/~/router-eval/in.json` on macOS, so it had to be run with an
+  // absolute path; `~` must reach the file in the home folder.
+  test('a path starting with ~ is read from the home folder', async ($, on) => {
+    const { fn } = classifierBy(() => T('execute'))
+    const seen = world($, on, fn)
+    on('env.get', () => ({ value: '/home/m' }))
+    // The kit maps a POSIX path to a drive path on Windows, as `put` does for the other replay tests.
+    seen.files['/home/m/router-eval/in.json'] = JSON.stringify(items(1))
+    seen.files['C:\\home\\m\\router-eval\\in.json'] = JSON.stringify(items(1))
+    const text = await cmd($, 'replay ~/router-eval/in.json current')
+    expect(text).toContain('/home/m/router-eval/in.replay.json')
+    expect(seen.files['/home/m/router-eval/in.replay.json'] ?? seen.files['C:\\home\\m\\router-eval\\in.replay.json']).toBeDefined()
   })
 
   test('each row records how long its call took', async ($, on) => {

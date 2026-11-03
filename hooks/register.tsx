@@ -15,7 +15,7 @@ import type { DayCost } from './history'
 import { redact } from './redact'
 import type { Lang } from './route'
 import { isRisky, riskFloor } from './risk'
-import { legacyClassifierSystem, parseReplayArgs, parseReplayFile, replayOutPath, replayRow, replaySummary, REPLAY_CONCURRENCY, REPLAY_PAUSE_MS } from './replay'
+import { legacyClassifierSystem, parseReplayArgs, parseReplayFile, replayOutPath, resolveReplayPath, replayRow, replaySummary, REPLAY_CONCURRENCY, REPLAY_PAUSE_MS } from './replay'
 import type { ReplayContext, ReplayRow } from './replay'
 import {
   applyEscalation,
@@ -1230,8 +1230,19 @@ function pause($: EngineInterface, ms: number): Promise<void> {
 // never to a turn. It runs beside live turns: a turn started during a replay classifies alongside its calls.
 async function runReplay($: EngineInterface, session: Session, lang: Lang, rest: string): Promise<string> {
   const str = STR[lang]
-  const args = parseReplayArgs(rest)
-  if (!args) return str.replayUsage
+  const parsed = parseReplayArgs(rest)
+  if (!parsed) return str.replayUsage
+  // Only a `~` path needs the home folder and only a relative one the session's folder; an absolute path is used as given.
+  let home: string | undefined
+  let cwd = ''
+  try {
+    if (parsed.path.startsWith('~')) home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+    if (!/^(?:~|[\\/]|[A-Za-z]:[\\/])/.test(parsed.path)) cwd = await $.session.cwd()
+  } catch {
+    // Left as given: the read below reports the path it could not open.
+  }
+  const args = { ...parsed, path: resolveReplayPath(parsed.path, home, cwd) }
+  if (await stillHere($, session) !== 'same') return str.replayCancelled
   let text: string
   try {
     text = (await $.fs.read(args.path)) as string
