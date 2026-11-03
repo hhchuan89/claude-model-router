@@ -43,16 +43,11 @@ agreeing AI judges): accuracy 66% → 74–76%, over-routing 28–29% → 13–1
   actions raised from lookup to Sonnet"), only when it changed the route (an unsure lookup goes to Sonnet anyway). It
   does not see a confirmation such as "yes", a prompt typed into a running turn, an inherited route, a subagent clamped
   to a Haiku parent, `#haiku` or a pin; the Haiku assignment text covers those.
-  Detector review fixes before release: sentences are read part by part (at and / then / 然后 / 再 / 之后), so "when CI
-  passes merge it" and "explain the change and push it" count; a negation or 已 / 刚 counts only just before the verb
-  (分别 / 特别 / 区别 / 级别, 刚说的 and 刚才 no longer cancel it), and an English report only by the same verb in the past
-  tense; question words count only in a question (哪 / 哪里 / 几 added), and "could you" no longer makes "could you tell
-  me what git push does?" a request; `re-` before push, merge and deploy; noun uses ("the prod logs", "open PR 431",
-  "git log --merges", "the deploy log", "这个 PR 的评论", "请简短回复") no longer count. New patterns: SQL writes
-  (UPDATE … SET, INSERT INTO, DELETE FROM, ALTER / DROP / TRUNCATE TABLE, EXEC of a procedure), `terraform apply` /
-  `destroy`, `npm publish`, `git clean -f`, `git branch -D`, `docker system prune` / `rm`, `aws s3 rm`, "ship it",
-  "send it", "post it in #channel", "slack him", 推吧, 发版 / 發版, 上传 / 上傳. On the reviewer's 74-message probe it
-  went from 23 to 68 correct.
+  Detector fixes from review: each sentence is read part by part (and / then / 然后 / 再 / 之后); a negation or 已 / 刚
+  counts only directly before the verb (分别, 刚才 no longer cancel it); question words count only in a question; `re-`
+  verbs count; noun uses ("the prod logs", "git log --merges", "这个 PR 的评论") do not. New: SQL writes, `terraform
+  apply` / `destroy`, `npm publish`, `git clean -f`, `git branch -D`, `docker rm` / `prune`, `aws s3 rm`, "ship it",
+  "send it", "post it in #channel", "slack him", 推吧, 发版, 上传.
 - `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`, a maintainer tool not listed in the usage text:
   it runs the real classifier call over a JSON file of up to 500 labelled messages with the 1.2 prompt, the 1.1 prompt
   (kept word for word in `hooks/replay.ts`) or both, each up to 3 times, and writes `<path>.replay.json`. Each row holds

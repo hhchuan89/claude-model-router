@@ -17,7 +17,7 @@ const TO_PEOPLE = String.raw`(?:\b(?:slack|jira|confluence|teams|channel|thread|
 // the ticket" or "send the request" does not count.
 const MSG_START = String.raw`(?:^|\b(?:please|pls|and|then|to|you|now|also|go|just|so)\s+)`
 const ZH_PROD = String.raw`(?:生产环境|生產環境|正式环境|正式環境|线上环境|線上環境|生产库|生產庫|正式库|正式庫|\bprod(?:uction)?\b)`
-const ZH_ACT = String.raw`(?:执行|執行|运行|運行|跑|改|修改|更新|删|刪|清|部署|发布|發布|重启|重啟|写入|寫入|插入|迁移|遷移|回滚|回滾|操作)`
+const ZH_ACT = String.raw`(?:执行|執行|运行|運行|跑|改|修改|更新|删|刪|清(?!楚)|部署|发布|發布|重启|重啟|写入|寫入|插入|迁移|遷移|回滚|回滾|操作)`
 
 const rules: Rule[] = [
   // English verbs in their base form (and -s/-ing, and re-), so "pushed" or "merged" never match. A noun use ("the merge
@@ -53,7 +53,7 @@ const REQUEST = /^(?:please|pls|can you|could you|would you|will you|go ahead)\b
 const TAIL = /[?？]$|[吗嗎呢][?？]?$/
 // A part that asks about something, whatever it ends with. "when" only with a verb after it, so "when CI passes merge
 // it" is an instruction.
-const ASKS = /^(?:what|how|why|where|which|who|whose)\b|^when\s+(?:is|are|was|were|do|does|did|will|would|should|can|could|has|have)\b|^(?:does|did|is|are|was|were|should|shall|do\s+(?:i|you|we|they))\b|^(?:explain|tell me)\b|\b(?:tell me|explain)\s+(?:what|how|why|whether|if|when|where|which)\b|什么|什麼|甚麼|怎么|怎麼|如何|为什么|為什麼|为何|為何|哪(?!怕)|[几幾](?![个個位条條份项項张張])/
+const ASKS = /^(?:what|how|why|where|which|who|whose)\b|^when\s+(?:is|are|was|were|do|does|did|will|would|should|can|could|has|have)\b|^(?:does|did|is|are|was|were|should|shall|do\s+(?:i|you|we|they))\b|^(?:explain|tell me)\b|\b(?:tell me|explain)\s+(?:what|how|why|whether|if|when|where|which)\b|什么|什麼|甚麼|怎么|怎麼|如何|为什么|為什麼|为何|為何|哪(?!怕)|[几幾](?![个個位条條份项項张張乎])/
 // Directly before the word: a negation (at most one word between), or a report of the same thing already done.
 const NEGATED = /\b(?:don't|dont|do not|never|not|without|no need to)\s+(?:[a-z]+\s+)?$|\bstop\s+$|(?:不要|(?<![分特区區级級个個类類识識告性差派])[别別]|先不|不用|勿|无需|無需|不必)\s*(?:再|先|马上|馬上|直接)?\s*$/
 const ALREADY_EN = /\balready\s+(?:[a-z]+\s+)?$/

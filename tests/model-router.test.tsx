@@ -8009,7 +8009,7 @@ describe('risk detector review fixes (1.2.0)', () => {
 
   // WHY: "when CI passes merge it" and "explain the change and push it" are instructions; dropping the clause whole hid them.
   test('each part of a sentence is read on its own, and a question word counts only in a question', async () => {
-    all(true, ['when CI passes merge it', 'tell me the result and then push', 'explain the change and push it', 'could you check and push?', '测完再部署', '先合并再部署', '推送到 develop 然后合并到 main', '合併到 develop 之後部署到 UAT'])
+    all(true, ['when CI passes merge it', 'tell me the result and then push', 'explain the change and push it', 'could you check and push?', '测完再部署', '先合并再部署', '推送到 develop 然后合并到 main', '合併到 develop 之後部署到 UAT', '几乎没改，直接推送', '幾乎沒改直接推送'])
     all(false, ['when does the deploy run', 'explain git rebase vs merge', 'what happens when we redeploy?', 'could you tell me what git push does?', 'can you explain how merge works?', '部署之后的日志在哪'])
   })
 
@@ -8035,7 +8035,7 @@ describe('risk detector review fixes (1.2.0)', () => {
     all(false, [
       'show me the prod logs for the last hour', 'check the prod config value of SITE_URL', 'open PR 431 and list the comments', 'open the PR and summarise it',
       'git log --merges | head', 'show me the merge conflicts', 'read the deploy log', 'look at the pay page component',
-      '查一下线上环境的配置', '生产环境的日志在哪看', '部署文档在哪里', '发布说明在哪', '看一下这个 PR 的评论', '请简短回复', '這個 PR 的評論在哪裡',
+      '查一下线上环境的配置', '生产环境的日志在哪看', '部署文档在哪里', '发布说明在哪', '看一下这个 PR 的评论', '请简短回复', '這個 PR 的評論在哪裡', '我不太清楚生产环境的配置',
       'could you tell me what git push does?',
     ])
     all(true, ['run the migration on prod', 'restart the api in production', '在生产环境执行这个脚本', '把这个配置改到线上环境', 'open a PR to develop', 'create a PR to develop', 'reply on the jira ticket with the result', '回复客户', '在 jira 上评论一下结果'])
