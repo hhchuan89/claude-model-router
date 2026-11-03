@@ -7910,6 +7910,33 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(correctionKeys(data)).toHaveLength(2)
     })
 
+    // WHY: two windows can resume one session id. Both read the same list; with one key per session the second write
+    // dropped the first window's correction.
+    test('two windows on one resumed session both keep their corrections', async ($, on) => {
+      const data: Record<string, unknown> = {}
+      let other = true
+      shared(on, data, key => {
+        const m = /^(corrections:\d{8}:sess-1)(:.+)?$/.exec(key)
+        if (!other || !m) return
+        other = false
+        // The other window runs this same code with its own activation id: its key is this one's with that id (the same
+        // key, when the key carries none).
+        const theirs = m[2] === undefined ? key : `${m[1]}:act-2`
+        data[theirs] = [...readCorrections(data[theirs]), { at: 5_000, text: 'their prompt', routed: 'lookup', right: 'execute', source: 'manual' }]
+      })
+      const seen = world($, on, LOOKUP)
+      await seen.clock.advance(10_000)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('should have been decide')
+      expect(other).toBe(false)
+      const list = (await cmd($, 'corrections')).split('\n')
+      expect(list.slice(1).map(line => /"([^"]+)"/.exec(line)?.[1])).toEqual(['their prompt', 'rename the helper'])
+      expect(correctionKeys(data)).toHaveLength(2)
+      expect(await cmd($, 'corrections clear')).toBe('Corrections cleared.')
+      expect(correctionKeys(data)).toEqual([])
+    })
+
     // WHY: /model-router pacing off in one window has to reach the windows already open, without a store read per hook.
     test('a pacing change made in another window reaches a running session after a minute, not before', async ($, on) => {
       let theirs: unknown
@@ -8174,6 +8201,94 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await step($, 't2')
       band = await openBand($)
       expect(await tokensLine(band)).toBe('Tokens used: this session 151.5k · today 151.5k · last 7 days 151.5k')
+      await band.unmount()
+    })
+  })
+  describe('third review fixes (1.1.0)', () => {
+    const mountBand = ($: any) => $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+    const openBand = async ($: any) => {
+      const band = await mountBand($)
+      if ((await band.find({ text: /^Hide details$/ })) === undefined) await band.press({ key: 'band-details' })
+      return band
+    }
+    const tokensLine = async (band: any) => ((await band.find({ type: 'Text', text: /^Tokens used/ })) as { text: string } | undefined)?.text ?? ''
+    const used = (n: number) => `Tokens used: this session ${fmtTokens(n)} · today ${fmtTokens(n)} · last 7 days ${fmtTokens(n)}`
+
+    // WHY: "this session only" is what the person was told. A process that runs another session afterwards must not keep
+    // steering it on a choice that was never saved.
+    test('a pacing change that could not be saved ends with its session: the next session uses the saved mode', async ($, on) => {
+      on('store.set', { key: 'pacing' }, async () => ({ deny: 'disk full' }))
+      const seen = world($, on, LOOKUP, { store: { pacing: 'off' } })
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: off (override)')
+      expect(await cmd($, 'pacing steer')).toContain('this session only')
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: steer (override)')
+      seen.sessionId = 'sess-2'
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: off (override)')
+    })
+
+    // WHY: with main routing off no routed reply is ever recorded, so a cache keyed on the newest turn record never moved:
+    // Details showed the totals of when it was opened until the day turned. Spend alone refreshes it, at most every 30 s.
+    test('with main routing off, subagent spend reaches the Details totals within 30 seconds', { options: { mainRouting: false } }, async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      ui($, on)
+      const id = await spawnAgent($, { subagentType: 'Explore' })
+      seen.usage.push(U(1000, 500, 0, 150_000, 'claude-haiku-5-5'))
+      await step($, 'sub', 'claude-opus-5-5', id)
+      let band = await openBand($)
+      expect(await tokensLine(band)).toBe(used(151_500))
+      await band.unmount()
+      seen.usage.push(U(1000, 500, 0, 2_000_000, 'claude-haiku-5-5'))
+      await step($, 'sub', 'claude-opus-5-5', id)
+      // Within 30 seconds of the last reading the snapshot stands: no store scan per redraw.
+      band = await openBand($)
+      expect(await tokensLine(band)).toBe(used(151_500))
+      await band.unmount()
+      await seen.clock.advance(31_000)
+      band = await openBand($)
+      expect(await tokensLine(band)).toBe(used(2_153_000))
+      await band.unmount()
+    })
+
+    // WHY: a notification turn after the cache expired is not routed. Without a record of it the classified turn before
+    // looked like the last reply, and a press stored that older prompt and pinned the session.
+    test('a notification reply after the cache expired is listed as not routed, and nothing is asked about the older reply', async ($, on) => {
+      const seen = world($, on, LOOKUP)
+      ui($, on)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      seen.usage.push(U(1000, 200, 0, 1_000_000, 'claude-haiku-5-5'))
+      await step($, 't1')
+      await $.turn.complete(completion('t1'))
+      await seen.clock.advance(CACHE_TTL_MS + 1000)
+      await $.turn.start({ text: '<task-notification>build finished</task-notification>', turnId: 't2' } as never)
+      const theirs = U(1000, 200, 0, 10_000)
+      seen.usage.push(theirs)
+      await step($, 't2')
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'high' })
+      await $.turn.complete(completion('t2'))
+      const band = await openBand($)
+      expect(await band.find({ type: 'Text', text: /Wrong model/ })).toBeUndefined()
+      for (const tier of ['lookup', 'execute', 'decide']) expect(await band.find({ key: `wrong-${tier}` })).toBeUndefined()
+      await band.unmount()
+      // Listed with only its own spend: the turn tally still held the turn before it.
+      const rows = (await cmd($, 'history')).split('\n')
+      expect(rows).toHaveLength(3)
+      expect(rows[1]!.endsWith(`your model  ${fmtUsd(costOf(theirs, 'opus'))} — the router did not choose this turn`)).toBe(true)
+    })
+
+    // WHY: the band names the model the next reply will use. After a pin is replaced that is the new pin's model.
+    test('replacing a pin with another model shows the new model in the band at once', async ($, on) => {
+      world($, on, LOOKUP)
+      ui($, on)
+      expect(await cmd($, 'pin sonnet')).toContain('Sonnet')
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      let band = await mountBand($)
+      expect(await band.find({ text: /^📌 Sonnet · / })).toBeDefined()
+      await band.unmount()
+      expect(await cmd($, 'pin opus')).toContain('Opus')
+      band = await mountBand($)
+      expect(await band.find({ text: /^📌 Opus · / })).toBeDefined()
+      expect(await band.find({ text: /^📌 Sonnet/ })).toBeUndefined()
       await band.unmount()
     })
   })

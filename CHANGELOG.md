@@ -91,14 +91,15 @@ routes and prompts exactly as 1.0.1 does.
   shows `📌` before the model.
 - Routing corrections: `/model-router wrong <tier>` or the band's buttons pin the main conversation to that tier's model
   for the rest of the session (the same pin as `/model-router pin <model>`, undone with `/model-router unpin`) and store
-  the masked prompt snippet (up to 40 per session per day, kept 30 days, 200 characters each); the model escalating itself above the classified tier's
+  the masked prompt snippet (up to 40 per session and window per day, kept 30 days, 200 characters each); the model escalating itself above the classified tier's
   model is stored too but never pins. Corrections are an evaluation dataset for revising the classifier prompt offline
   and are never sent to the classifier: as few-shot examples they lowered accuracy on 102 labelled prompts (69.6% to
   65.7%) and ratcheted routing upward. `/model-router corrections [clear]` lists or deletes them; stats count them.
   Option `learnFromCorrections` (on by default; off: no buttons, nothing recorded or pinned); see Privacy.
 - Weekly pacing: option `weeklyPacing` (`off`, `warn` by default, `steer`) and `/model-router pacing [mode|default]`. `warn`
   adds the pace to the status line only when ahead, and toasts once per weekly window; `steer` also routes an unsure
-  decide to Sonnet while ahead, never against a warm Opus cache, `#model`, a pin or a sure decision. Steer deliberately
+  decide to Sonnet while ahead, never against a warm Opus context of 50,000 tokens or more (a smaller warm one stays on
+  Opus only when the estimate favours staying), `#model`, a pin or a sure decision. Steer deliberately
   overrides the classifier's "an unsure verdict never downgrades" rule, and the model may escalate a steered turn back to
   Opus, which is the safety valve. `/model-router status` shows the mode and figures; stats count steered turns.
 
@@ -114,8 +115,8 @@ routes and prompts exactly as 1.0.1 does.
   and Haiku 5.5 requests with a prompt over 100,000 tokens (input, cache reads and cache writes together) are priced at
   $0.50 / $2.50 / $0.05 / $1. Each request is priced on its own size, in the meter, the baseline, the cold-resume and
   abandoned-cache estimates, checkpoint hints and the warm-cache keep decision. Spend already recorded keeps the old figures.
-- Several open windows: each session stores its corrections under its own daily key (pruned after 30 days) so no window
-  overwrites another's, `corrections clear` runs in the write queue and deletes every key, preferences are read again
+- Several open windows: each session and window stores its corrections under its own daily key (pruned after 30 days)
+  so no window overwrites another's, not even two windows on one resumed session, `corrections clear` runs in the write queue and deletes every key, preferences are read again
   once a minute so `/model-router pacing` in one window reaches the others, and the pace toast checks the store first,
   which narrows the time in which two windows can both toast for one weekly window but does not close it.
 - The band asks `Wrong model for the last reply?` only when the newest reply shown was classified (it used to offer the
@@ -132,6 +133,13 @@ routes and prompts exactly as 1.0.1 does.
 - Details' three token totals come from one reading, so the last 7 days is never below today.
 - No `vs all-Opus` comparison under a cent, and the expiring-cache line gives the full re-read cost instead of calling it
   extra.
+- A pacing change that could not be saved ("this session only") ends with its session; the next session uses the saved
+  mode.
+- Details' token totals and chart follow spend that adds no routed reply (subagents, main routing off), read again at
+  most every 30 seconds, instead of staying as they were until the day turned.
+- Every main reply is listed, also one the router did not choose (a notification after the cache expired, main routing
+  off), so `Wrong model for the last reply?` is never asked about an older reply.
+- Replacing a pin with another model shows the new model in the band at once, not the old one until the next reply.
 
 ## [1.0.1] - 2026-10-31
 

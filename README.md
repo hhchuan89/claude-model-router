@@ -289,8 +289,9 @@ sessions (`pacing default` removes the override, `pacing` alone shows the mode a
 - `warn` (the default): the status line appends `· pace 1.4× ahead`, and one toast says so, at most once per weekly window
   (remembered across sessions).
 - `steer`: `warn`, plus one routing change while ahead, on the main thread only: a decision the classifier was unsure of
-  goes to Sonnet instead of Opus. `#model`, a pin, a sure decision, escalation and subagents are untouched, and a warm
-  large Opus context still stays on Opus, so steering never causes a cache rewrite. Stats count the steered turns.
+  goes to Sonnet instead of Opus. `#model`, a pin, a sure decision, escalation and subagents are untouched. A warm Opus
+  context of 50,000 tokens or more always stays on Opus; a smaller warm one stays only when the estimate says staying is
+  cheaper, so steering can move it to Sonnet, which then writes a cache of its own. Stats count the steered turns.
 
 ## Events log
 
@@ -344,7 +345,7 @@ own effort. `stats` covers routed subagents only.
   the events log are written to local files only.
 - **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store
   masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, as an offline evaluation set.
-  Like the meter, each session keeps its own list per day (`corrections:<day>:<session>`, up to 40 each), deleted after
+  Each session keeps its own list per day and window (`corrections:<day>:<session>:<window>`, up to 40 each), deleted after
   30 days; `/model-router corrections` shows the newest 40 across all of them. They are never sent anywhere, including
   the classifier. Turn `learnFromCorrections` off to stop recording, and run `/model-router corrections clear` to delete
   every list, including the single `corrections` list earlier builds kept (if another window is still writing, it says

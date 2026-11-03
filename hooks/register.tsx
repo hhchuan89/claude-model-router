@@ -147,7 +147,12 @@ let turnBase = { tokens: 0, cost: 0 }
 let turnTrailBase = 0
 // The seven days behind the expanded band and this session's tokens, cached by day and latest turn: no store scan per redraw.
 // All three token figures in Details come from this one snapshot, so "last 7 days" is never below "today".
-let weekCache: { day: string; key: string; series: DayCost[]; sessionTokens: number; todayTokens: number } | undefined
+// Spend recorded without a turn record (subagents, main routing off, a running turn) moves `accounting`: the snapshot is
+// taken again for it at most every DETAILS_REFRESH_MS.
+let weekCache: { day: string; key: string; at: number; accounting: number; series: DayCost[]; sessionTokens: number; todayTokens: number } | undefined
+// Bumped by every spend record() stores.
+let accounting = 0
+const DETAILS_REFRESH_MS = 30_000
 // Whether the band shows its details; a per-person choice, kept in the store (read with the other preferences).
 let bandExpanded = false
 // The turn a correction was just recorded for and the model it pinned: the band thanks the person in place of the buttons.
@@ -326,6 +331,7 @@ const STR = {
     tagForced: '（你指定）',
     tagCorrected: '（已纠正）',
     sessionRow: '你的模型',
+    notRouted: '路由器没有为这一轮选择模型',
     enabled: '启用',
     disabled: '关闭',
     enable: '恢复路由器',
@@ -470,6 +476,7 @@ const STR = {
     tagForced: '(you chose)',
     tagCorrected: '(corrected)',
     sessionRow: 'your model',
+    notRouted: 'the router did not choose this turn',
     enabled: 'enabled',
     disabled: 'disabled',
     enable: 'Resume router',
@@ -603,7 +610,7 @@ const PREFS_FRESH_MS = 60_000
 // Bumped by every local change to a preference, so a read already in flight cannot put back the value it replaced.
 let prefsChanges = 0
 // Preferences changed here whose store write failed: the local value holds ("this session only") and a refresh never
-// puts the stored one back, until a later write of that preference succeeds.
+// puts the stored one back, until a later write of that preference succeeds or the session ends.
 const prefsUnsaved = new Set<'pacing' | 'paceWarned'>()
 
 function prefSaved(key: 'pacing' | 'paceWarned', ok: boolean) {
@@ -856,6 +863,10 @@ function resetSession($: EngineInterface, cancel = true) {
   turnTrailBase = 0
   weekCache = undefined
   thanks = undefined
+  // A preference that could not be saved held for its own session only: the next session reads the stored one.
+  if (prefsUnsaved.has('pacing')) pacingOverride = undefined
+  if (prefsUnsaved.has('paceWarned')) paceWarned = undefined
+  prefsUnsaved.clear()
   rateLimits = []
   lastSkipped = null
   skippedEpoch = -1
@@ -1033,8 +1044,10 @@ function record($: EngineInterface, session: Session, modelId: string, u: Usage,
   })
 }
 
-// Rereads today's figure and shows it, with the turn tally changed by `turn`, while the session is still here.
+// Rereads today's figure and shows it, with the turn tally changed by `turn`, while the session is still here. Spend has
+// landed, so the Details snapshot may refresh (`accounting`).
 async function showSpend($: EngineInterface, session: Session, now: number, turn: (t: Tally) => Tally): Promise<void> {
+  accounting++
   const loaded = await bookkeeping($, async () => {
     const { today } = await totals($, now, true)
     return today
@@ -1337,12 +1350,13 @@ function rememberSnippet(turnId: string, prompt: string) {
 }
 
 // Writes one correction (newest last, capped, a repeated text replaced) and counts it by source. False when the store
-// could not be written; nothing is claimed then. Like the meter, each session writes only its own daily key, so two
-// open windows never overwrite each other's corrections, and the 30-day prune removes old days.
+// could not be written; nothing is claimed then. Each activation writes only its own daily key for the session (as the
+// event logs keep writer-specific batches), so two open windows never overwrite each other's corrections, not even two
+// on one resumed session; the 30-day prune removes old days.
 async function recordCorrection($: EngineInterface, session: Session, c: Correction, counted = true): Promise<boolean> {
   let ok = false
   await serial($, session, 'corrections', async () => {
-    const key = `corrections:${dayKey(c.at)}:${session.id}`
+    const key = `corrections:${dayKey(c.at)}:${session.id}:${activationId}`
     const next = addCorrection(readCorrections(await $.store.get(key)), c)
     if (await stillHere($, session) !== 'same') return
     await $.store.set(key, next)
@@ -1413,12 +1427,15 @@ async function pressWrong($: EngineInterface, session: Session, lang: Lang, righ
   }
 }
 
-// The small per-turn record /model-router history lists, written when a main turn the route governs completes.
-async function writeTurnRecord($: EngineInterface, session: Session, r: Route, turnId: string) {
+// The small per-turn record /model-router history lists, written when a main turn completes. r null: the route did not
+// govern the turn; the record is unrouted, on the session's own model, and cannot be corrected.
+async function writeTurnRecord($: EngineInterface, session: Session, r: Route | null, turnId: string) {
   const m = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), undefined)
   const at = await $.clock.now()
   if (await stillHere($, session) !== 'same') return
-  const rec: TurnRecord = {
+  const tokens = Math.max(0, (m?.turn.tokens ?? 0) - turnBase.tokens)
+  const cost = Math.max(0, (m?.turn.cost ?? 0) - turnBase.cost)
+  const rec: TurnRecord = r === null ? { turnId, at, tier: 'execute', model: 'session', reason: '', trail: [], tokens, cost, cold: turnCold, how: 'unrouted' } : {
     turnId,
     at,
     tier: r.tier,
@@ -1428,8 +1445,8 @@ async function writeTurnRecord($: EngineInterface, session: Session, r: Route, t
     ...(r.keptFrom && r.how !== 'inherited' ? { keptFrom: r.keptFrom } : {}),
     reason: r.reason,
     trail: r.trail.slice(turnTrailBase),
-    tokens: Math.max(0, (m?.turn.tokens ?? 0) - turnBase.tokens),
-    cost: Math.max(0, (m?.turn.cost ?? 0) - turnBase.cost),
+    tokens,
+    cost,
     cold: turnCold,
     // A route without a tag (one an earlier version stored) was not classified by this one: not correctable.
     how: r.how ?? 'inherited',
@@ -1472,7 +1489,7 @@ function turnParts(t: TurnRecord, lang: Lang) {
     t.corrected ? str.tagCorrected : '',
   ].filter(Boolean)
   // A pinned or chosen turn's reason only repeats its marker.
-  const why = t.how === 'pinned' || t.how === 'forced' ? '' : t.reason
+  const why = t.how === 'pinned' || t.how === 'forced' ? '' : t.how === 'unrouted' ? str.notRouted : t.reason
   return {
     time: hhmm(t.at),
     label: t.model === 'session' ? str.sessionRow : `${LABEL[t.model]} · ${t.effort ?? ''}`.replace(/ · $/, ''),
@@ -1542,8 +1559,8 @@ function contextLine(lang: Lang, now: number): string {
 function bandRoute(lang: Lang, r: Route | null, routesMain: boolean): string {
   const str = STR[lang]
   const effortOf = (m: ModelKey) => TIER_ROUTE[TIER_OF[m]].effort
-  // A pin set since the last route is what the next reply will use.
-  if (pin && r?.how !== 'pinned') return `📌 ${LABEL[pin.model]} · ${effortOf(pin.model)} — ${str.pinWaiting(pin.left)}`
+  // A pin set since the last route, or one that replaced the pin the route ran on, is what the next reply will use.
+  if (pin && (r?.how !== 'pinned' || r.model !== pin.model)) return `📌 ${LABEL[pin.model]} · ${effortOf(pin.model)} — ${str.pinWaiting(pin.left)}`
   if (!r) return `⚙ ${routesMain ? str.bandIdle : str.bandSubagents}`
   if (r.sessionModel) return `⚙ ${str.sessionRow} — ${str.unrouted(/\(([^)]*)\)/.exec(r.reason)?.[1] ?? '')}`
   const label = `${LABEL[r.model]} · ${r.effort}`
@@ -2388,24 +2405,37 @@ export const register: Register = (on, options) => {
         await count($, session, c => ({ ...c, turns: { ...c.turns, [r.tier]: c.turns[r.tier] + 1 } }))
         await logEvent($, session, 'main', 'turn route', `${r.model}/${r.effort}`, r.reason)
       }
-    } else if (mainRouting && (await read($, enabled))) {
-      // A turn without a person prompt (a task notification, an agent message, a scheduled prompt) is never
-      // classified. While the previous route's cache is warm it continues that route: left on the session model it
-      // would switch away from, and back to, the model the cache is on. Without a previous route it stays unrouted.
-      const prev = routed(await read($, memberOf(route, { requestId: session.stateId })))
-      const now = await $.clock.now()
-      if (await stillHere($, session) !== 'same') return next(e)
-      if (prev && last && now - last.at <= CACHE_TTL_MS) {
-        const r: Route = { ...prev, turnId: e.turnId, reason: str.inherited, how: 'inherited', steered: undefined }
+    } else {
+      let inherited = false
+      if (mainRouting && (await read($, enabled))) {
+        // A turn without a person prompt (a task notification, an agent message, a scheduled prompt) is never
+        // classified. While the previous route's cache is warm it continues that route: left on the session model it
+        // would switch away from, and back to, the model the cache is on. Without a previous route it stays unrouted.
+        const prev = routed(await read($, memberOf(route, { requestId: session.stateId })))
+        const now = await $.clock.now()
+        if (await stillHere($, session) !== 'same') return next(e)
+        if (prev && last && now - last.at <= CACHE_TTL_MS) {
+          inherited = true
+          const r: Route = { ...prev, turnId: e.turnId, reason: str.inherited, how: 'inherited', steered: undefined }
+          turnSteps = 0
+          turnOutput = 0
+          // No prompt reset the turn tally: this turn's figures are what it adds.
+          const before = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), undefined)
+          if (await stillHere($, session) !== 'same') return next(e)
+          turnBase = { tokens: before?.turn.tokens ?? 0, cost: before?.turn.cost ?? 0 }
+          turnTrailBase = prev.trail.length
+          await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? r : previous)
+          await logEvent($, session, 'main', 'turn inherit', `${r.model}/${r.effort}`, r.reason)
+        }
+      }
+      if (!inherited) {
+        // Unrouted: the turn tally may still hold the previous turn (no person prompt reset it), so this turn's record
+        // counts only what it adds.
         turnSteps = 0
         turnOutput = 0
-        // No prompt reset the turn tally: this turn's figures are what it adds.
         const before = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), undefined)
         if (await stillHere($, session) !== 'same') return next(e)
         turnBase = { tokens: before?.turn.tokens ?? 0, cost: before?.turn.cost ?? 0 }
-        turnTrailBase = prev.trail.length
-        await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? r : previous)
-        await logEvent($, session, 'main', 'turn inherit', `${r.model}/${r.effort}`, r.reason)
       }
     }
     return next(e)
@@ -2753,7 +2783,9 @@ export const register: Register = (on, options) => {
     // Completion still reaches the engine when the compaction path has been cancelled.
     const done = await next(e)
     if (await stillHere($, session) !== 'same') return done
-    if (e.agentId === undefined && runningMain === e.turnId) runningMain = null
+    // A main turn this lifetime saw start: it gets a turn record, routed or not.
+    const ran = e.agentId === undefined && runningMain === e.turnId
+    if (ran) runningMain = null
     // An agent ending can make the last busy count stale before the scheduled re-check.
     if (e.agentId !== undefined && guardPending?.waiting !== undefined) {
       const pending = guardPending
@@ -2764,7 +2796,8 @@ export const register: Register = (on, options) => {
       }
     }
     if (await stillHere($, session) !== 'same' || stale(epoch)) return done
-    const r = await bookkeeping($, () => read($, memberOf(route, { requestId: session.stateId })), null)
+    // undefined: the route could not be read (null: there is none).
+    const r = await bookkeeping<Route | null | undefined>($, () => read($, memberOf(route, { requestId: session.stateId })), undefined)
     if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     if (e.agentId === undefined && r && r.turnId === e.turnId && turnSteps > 0) {
       // A slow average of the turn's shape feeds the warm-cache decision.
@@ -2776,6 +2809,13 @@ export const register: Register = (on, options) => {
     }
     // New with 1.1.0, after everything main did before it: the record of this turn that history lists.
     if (e.agentId === undefined && r && r.turnId === e.turnId) await writeTurnRecord($, session, r, e.turnId)
+    // A main turn the route did not govern (a notification after the cache TTL, main routing off) is listed too, as
+    // unrouted: otherwise an older turn looks like the last reply and its buttons correct the wrong one. Not while the
+    // router is paused: nothing was metered then.
+    else if (ran && r !== undefined && await read($, enabled)) {
+      if (await stillHere($, session) !== 'same' || stale(epoch)) return done
+      await writeTurnRecord($, session, null, e.turnId)
+    }
     if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     const isOn = await read($, enabled)
     if (await stillHere($, session) !== 'same' || stale(epoch) || !isOn) return done
@@ -2850,14 +2890,17 @@ export const register: Register = (on, options) => {
     const m = await bookkeeping($, () => read($, memberOf(meter, { requestId: session.stateId })), { turn: EMPTY, today: session.today ?? EMPTY })
     const expanded = bandExpanded
     const list = expanded ? await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[]) : []
-    // The week behind the chart is read when the details open, the day turns or a turn was recorded, not per redraw.
+    // The week behind the chart is read when the details open, the day turns or a turn was recorded, not per redraw; other
+    // spend recorded since is read at most every DETAILS_REFRESH_MS.
     if (expanded) {
       const key = list.at(-1)?.turnId ?? ''
-      if (weekCache === undefined || weekCache.day !== dayKey(now) || weekCache.key !== key) {
+      const spent = accounting
+      if (weekCache === undefined || weekCache.day !== dayKey(now) || weekCache.key !== key ||
+        (weekCache.accounting !== spent && now - weekCache.at >= DETAILS_REFRESH_MS)) {
         const series = await bookkeeping($, () => weekSeries($, session, now), undefined, retryFor(session, 'band week'))
         const mine = series === undefined ? undefined : await bookkeeping<Tally | undefined>($, () => sessionTally($, session), undefined, retryFor(session, 'band session'))
         if (series !== undefined && mine !== undefined && await stillHere($, session) === 'same') {
-          weekCache = { day: dayKey(now), key, series, sessionTokens: mine.tokens, todayTokens: series.find(d => d.day === dayKey(now))?.tokens ?? 0 }
+          weekCache = { day: dayKey(now), key, at: now, accounting: spent, series, sessionTokens: mine.tokens, todayTokens: series.find(d => d.day === dayKey(now))?.tokens ?? 0 }
         }
       }
     }
