@@ -91,8 +91,8 @@
     },
     "learnFromCorrections": {
       "type": "boolean",
-      "title": "Learn from routing corrections",
-      "description": "On (the default): when you correct a routing (/model-router wrong <tier>, the history buttons, or the model escalating itself to a bigger model than the classifier chose) the masked prompt snippet is stored locally (up to 40) and the newest 8 are sent to Haiku with each classifier call. Off: nothing is recorded or sent; stored corrections stay on disk until /model-router corrections clear.",
+      "title": "Act on and record routing corrections",
+      "description": "On (the default): when you correct a reply's routing (/model-router wrong <tier> or the band's Should have been buttons) the rest of the session is pinned to that tier's model until /model-router unpin, and the masked prompt snippet is stored locally (up to 40), as is one when the model escalates itself to a bigger model than the classifier chose (that never pins). Corrections are an evaluation set for revising the classifier prompt offline; they are never sent to the classifier. Off: no buttons, nothing is recorded and nothing is pinned by corrections; stored corrections stay on disk until /model-router corrections clear.",
       "default": true
     },
     "weeklyPacing": {

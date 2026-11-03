@@ -5,7 +5,7 @@ import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier, TurnH
 import type { LastRequest, Shape, Usage } from './meter'
 import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, saved, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
-import { addCorrection, fewShot, readCorrections, snippetOf } from './learn'
+import { addCorrection, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
@@ -126,9 +126,8 @@ let observedModel: keyof typeof PRICES | undefined
 let sessionModel: keyof typeof PRICES = 'opus'
 // Pin: the main conversation's model for the next `left` person turns (left absent: until unpin or the session ends).
 let pin: { model: ModelKey; left?: number } | null = null
-// Set from the options at register. Off: nothing is recorded and the classifier prompt is the plain one.
+// Set from the options at register. Off: no correction is recorded and none pins the session.
 let learning = true
-let corrections: Correction[] = []
 // The masked snippet of each classified turn's prompt, by turn id, for corrections. Memory only: it never reaches an
 // atom, a log or the UI.
 const snippets = new Map<string, string>()
@@ -150,8 +149,8 @@ let turnTrailBase = 0
 let weekCache: { day: string; key: string; series: DayCost[]; sessionTokens: number } | undefined
 // Whether the band shows its details; a per-person choice, kept in the store (read with the other preferences).
 let bandExpanded = false
-// The turn a correction was just recorded for: the band thanks the person in place of the buttons.
-let thanks: string | undefined
+// The turn a correction was just recorded for and the model it pinned: the band thanks the person in place of the buttons.
+let thanks: { turnId: string; model: ModelKey } | undefined
 // A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
 const REWRITE_MIN_TOKENS = 100_000
 // A cache read below this on a request with no earlier one in this process means the cache was cold.
@@ -259,18 +258,18 @@ const STR = {
     pinRouterOff: ' 路由当前已关闭，开启后才生效。',
     unpinned: '已取消固定。',
     notPinned: '当前没有固定模型。',
-    wrongOff: '从纠正中学习已关闭（learnFromCorrections）。',
+    wrongOff: '纠正已关闭（learnFromCorrections）：没有记录，也没有固定模型。',
     wrongNone: '没有可纠正的已分类轮次（强制、固定、沿用和失败的轮次不经分类）。',
     wrongNoText: '该轮的提示内容已不在内存中，无法记录。',
     wrongFailed: '无法保存纠正。',
-    correctionsClearFailed: '已停止使用纠正记录，但无法删除磁盘上的副本，它可能仍然存在。',
+    correctionsClearFailed: '无法删除磁盘上的纠正记录，它们可能仍然存在。',
     pacingNotSaved: '（无法保存：仅对本会话有效。）',
     wrongSame: (tier: string) => `该轮已被分到 ${tier}，没有记录。`,
-    wrongDone: (at: string, routed: string, right: string) => `已记录：${at} 的轮次，分类为 ${routed}，应为 ${right}。`,
+    wrongDone: (at: string, routed: string, right: string, model: string) => `已记录：${at} 的轮次，分类为 ${routed}，应为 ${right}。本会话余下部分固定使用 ${model}。/model-router unpin 可撤销。`,
     corrections: '路由纠正',
     correctionsNone: '没有纠正记录。',
     correctionsCleared: '已清除纠正记录。',
-    learnedOff: '（学习已关闭）',
+    learnedOff: '（记录已关闭）',
     pacingMode: (mode: string, from: string) => `每周节奏：${mode}（${from}）`,
     pacingOption: '选项',
     pacingOverride: '覆盖',
@@ -311,7 +310,7 @@ const STR = {
     cacheSoon: (min: number, extra: string) => `⏳ 请在 ${min} 分钟内回复以保持对话缓存——之后下一条回复将多花约 ${extra}`,
     cacheGone: (size: string, cost: string) => `⏳ 缓存已过期——下一条回复将重新读取 ${size} 个 token（约 ${cost}）`,
     wrongAsk: '上一条回复的模型不对？应该是：',
-    thanks: '谢谢——路由器会参考这一条',
+    thanks: (model: string) => `谢谢——本会话余下部分固定使用 ${model}。/model-router unpin 可撤销。`,
     footer: '/model-router 查看统计、设置和命令',
     raisedTo: (m: string) => `（升级到 ${m}）`,
     histTotal: (cost: string, base: string) => `近 7 天 ${cost} · 全程 Opus 则为 ${base}`,
@@ -399,18 +398,18 @@ const STR = {
     pinRouterOff: ' The router is off now; the pin applies once it is on.',
     unpinned: 'Unpinned.',
     notPinned: 'No model is pinned.',
-    wrongOff: 'Learning from corrections is off (learnFromCorrections).',
+    wrongOff: 'Corrections are off (learnFromCorrections): nothing was recorded or pinned.',
     wrongNone: 'No classified turn to correct (forced, pinned, inherited and failed-classification turns were not classified).',
     wrongNoText: 'The prompt of that turn is no longer in memory, so nothing was recorded.',
     wrongFailed: 'Could not save the correction.',
-    correctionsClearFailed: 'Corrections are no longer used, but the copy on disk could not be deleted and may remain.',
+    correctionsClearFailed: 'The stored corrections could not be deleted and may remain on disk.',
     pacingNotSaved: '(Could not be saved: this session only.)',
     wrongSame: (tier: string) => `That turn was already routed ${tier}; nothing recorded.`,
-    wrongDone: (at: string, routed: string, right: string) => `Recorded: the ${at} turn was routed ${routed} and should have been ${right}.`,
+    wrongDone: (at: string, routed: string, right: string, model: string) => `Recorded: the ${at} turn was routed ${routed} and should have been ${right}. The rest of this session stays on ${model}. /model-router unpin to undo.`,
     corrections: 'Routing corrections',
     correctionsNone: 'No corrections recorded.',
     correctionsCleared: 'Corrections cleared.',
-    learnedOff: '(learning is off)',
+    learnedOff: '(recording is off)',
     pacingMode: (mode: string, from: string) => `Weekly pacing: ${mode} (${from})`,
     pacingOption: 'option',
     pacingOverride: 'override',
@@ -451,7 +450,7 @@ const STR = {
     cacheSoon: (min: number, extra: string) => `⏳ Reply within ${min} min to keep the conversation cached — after that the next reply costs ≈${extra} more`,
     cacheGone: (size: string, cost: string) => `⏳ The cache expired — your next reply re-reads ${size} tokens (≈${cost})`,
     wrongAsk: 'Wrong model for the last reply? Should have been:',
-    thanks: 'Thanks — the router will use this',
+    thanks: (model: string) => `Thanks — the rest of this session stays on ${model}. /model-router unpin to undo.`,
     footer: '/model-router for stats, settings and commands',
     raisedTo: (m: string) => `(raised to ${m})`,
     histTotal: (cost: string, base: string) => `Last 7 days ${cost} · all-Opus would be ${base}`,
@@ -593,14 +592,12 @@ function ensurePrefs($: EngineInterface, session: Session) {
   return loadPart($, session.prefs, () => loadPrefs($, session))
 }
 
-// The persisted choices: corrections, the pacing override and the window the pace toast last fired for.
+// The persisted choices: the pacing override, the window the pace toast last fired for and the band's details state.
 async function loadPrefs($: EngineInterface, session: Session) {
-  const stored = await $.store.get('corrections')
   const mode = await $.store.get('pacing')
   const warned = await $.store.get('paceWarned')
   const expanded = await $.store.get('bandExpanded')
   if (!here(session)) return
-  corrections = readCorrections(stored)
   pacingOverride = isPaceMode(mode) ? mode : undefined
   paceWarned = typeof warned === 'string' ? warned : undefined
   bandExpanded = expanded === true
@@ -1048,13 +1045,6 @@ function failText(c: { why: string; detail?: string }): string {
   return c.detail ? `${c.why}: ${c.detail}` : c.why
 }
 
-// The few-shot block of earlier corrections; nothing at all (the prompt is the plain one) when learning is off or
-// there are none.
-function learnedBlock(lang: Lang): string {
-  const block = learning ? fewShot(corrections, lang) : ''
-  return block === '' ? '' : `\n\n${block}`
-}
-
 // The risk floor (hooks/risk.ts): an irreversible or outward-facing action never runs on Haiku. Only a lookup is raised,
 // to execute, and the reason says so; every raise is counted. Effort is left to the tier.
 async function floorRisk($: EngineInterface, session: Session, lang: Lang, v: Verdict, text: string): Promise<Verdict> {
@@ -1072,7 +1062,7 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
     if (await stillHere($, session) !== 'same') return { ok: false, why: 'session changed' }
     const r = await $.model.complete({
       model: 'haiku',
-      system: classifierSystem(lang) + learnedBlock(lang),
+      system: classifierSystem(lang),
       prompt: classifierPrompt(previous, context, redact(text).slice(0, 6000)),
       maxTokens: CLASSIFY_MAX_TOKENS,
       effort: 'low',
@@ -1237,7 +1227,6 @@ async function recordCorrection($: EngineInterface, session: Session, c: Correct
     const next = addCorrection(readCorrections(await $.store.get('corrections')), c)
     if (await stillHere($, session) !== 'same') return
     await $.store.set('corrections', next)
-    corrections = next
     ok = true
   })
   if (ok && counted) {
@@ -1261,7 +1250,9 @@ async function correctionTarget($: EngineInterface, session: Session, turnId?: s
   return turnId === undefined ? [...list].reverse().find(isCorrectable) : list.find(t => t.turnId === turnId && isCorrectable(t))
 }
 
-// "/model-router wrong <tier>" and the history buttons. Answers with what was recorded, or why nothing was.
+// "/model-router wrong <tier>" and the history buttons. Answers with what was recorded, or why nothing was. A recorded
+// correction also pins the main conversation to the right tier's model until unpin or the session ends: the person
+// said this work needs it. Corrections are not sent to the classifier; they are kept to revise its prompt offline.
 async function correctTurn($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId?: string): Promise<string> {
   const str = STR[lang]
   if (!learning) return str.wrongOff
@@ -1274,16 +1265,19 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   const at = await $.clock.now()
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   if (!(await recordCorrection($, session, { at, text, routed: rec.tier, right, source: 'manual' }))) return str.wrongFailed
+  if (await stillHere($, session) !== 'same') return str.checkpointCancelled
+  const model = TIER_ROUTE[right].model
+  pin = { model }
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
-  thanks = rec.turnId
+  thanks = { turnId: rec.turnId, model }
   redraw($)
-  return str.wrongDone(hhmm(rec.at), rec.tier, right)
+  return str.wrongDone(hhmm(rec.at), rec.tier, right, LABEL[model]) + ((await read($, enabled)) ? '' : str.pinRouterOff)
 }
 
 async function pressWrong($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId: string) {
   const text = await correctTurn($, session, lang, right, turnId)
   // The band thanks the person itself when it was recorded; only a refusal needs saying.
-  if (thanks === turnId) return
+  if (thanks?.turnId === turnId) return
   try {
     $.ui.toast(text)
   } catch {
@@ -1473,13 +1467,9 @@ async function pacingCommand($: EngineInterface, session: Session, lang: Lang, a
 
 async function correctionsCommand($: EngineInterface, session: Session, lang: Lang, arg: string): Promise<string> {
   const str = STR[lang]
-  // Loaded first: a later load must not bring back what clear emptied.
-  await ensurePrefs($, session)
   if (/^corrections\s+clear$/.test(arg)) {
     let deleted = false
     await bookkeeping($, async () => { await $.store.delete('corrections'); deleted = true }, undefined, retryFor(session, 'corrections write'))
-    // Whatever the disk says, nothing more is sent to the classifier.
-    corrections = []
     return deleted ? str.correctionsCleared : str.correctionsClearFailed
   }
   if (arg !== 'corrections') return str.usage
@@ -1923,7 +1913,8 @@ export const register: Register = (on, options) => {
   const capOn = Number.isFinite(compactAtContext) && compactAtContext >= CAP_MIN_CONTEXT
   const checkpointHints = options.checkpointHints === true
   const shrinkToolOutput = outputLimit(options.shrinkToolOutput)
-  // On (the default): corrections are recorded and sent to the classifier. Off: none are written or sent.
+  // On (the default): corrections are recorded (an evaluation set, never sent to the classifier) and a manual one pins
+  // the session to the right model. Off: none are written and nothing is pinned by them.
   learning = options.learnFromCorrections !== false
   // off | warn (the default) | steer; /model-router pacing overrides it and persists.
   pacingOption = isPaceMode(options.weeklyPacing) ? options.weeklyPacing : 'warn'
@@ -2785,8 +2776,8 @@ export const register: Register = (on, options) => {
               </Box>
             )}
             {series.length > 0 && <Text dimColor wrap="truncate-end">{str.chartTotal(fmtUsd(total.cost), fmtUsd(total.base))}</Text>}
-            {target && thanks === target.turnId && <Text dimColor>{str.thanks}</Text>}
-            {target && thanks !== target.turnId && (
+            {target && thanks?.turnId === target.turnId && <Text dimColor>{str.thanks(LABEL[thanks.model])}</Text>}
+            {target && thanks?.turnId !== target.turnId && (
               <Box flexDirection="row" gap={1} alignItems="center">
                 <Text dimColor>{str.wrongAsk}</Text>
                 {answers.filter(([, tier]) => tier !== target.tier).map(([name, tier]) => (

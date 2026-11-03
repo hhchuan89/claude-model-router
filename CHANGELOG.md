@@ -50,7 +50,7 @@ unexplained root causes and reviews still go to Opus.
 
 ## [1.1.0] - 2026-11-02
 
-1.1.0 redesigns the band, adds a way to pin a model and teach the classifier from your corrections, weekly usage
+1.1.0 redesigns the band, adds a way to pin a model, routing corrections that pin the session, weekly usage
 pacing, and a corrected price table. The band above the prompt is two plain rows; details open with a click. Pin and
 corrections can be switched off or left idle (`learnFromCorrections`, `weeklyPacing`), and with both off the router
 routes and prompts exactly as 1.0.1 does.
@@ -60,7 +60,7 @@ routes and prompts exactly as 1.0.1 does.
 - A plainer band. Two rows under one empty row that sets them off from the conversation (what the router chose and why, and `This reply $0.74 · Today 49.2M tok · $28.00 (−$8.94 vs all-Opus) · Context 106k of
   1M · Week 20% used`, whole parts dropped on a narrow terminal, today's tokens last, the context in warning colour from 80% of the window), a **Details** button that opens the last 5 replies, a conversation line first (size, window, percent, how long the cache stays warm), then `Tokens used: this session … · today … · last 7 days …`, a titled 7-day chart with its total
   (three aligned rows on the terminal: amounts, bars, weekdays, today in bold), and `Wrong model for
-  the last reply? Should have been: [Haiku] [Sonnet] [Opus]` buttons (with learning on), and **Pause router** / **Resume
+  the last reply? Should have been: [Haiku] [Sonnet] [Opus]` buttons (with `learnFromCorrections` on), and **Pause router** / **Resume
   router**. The choice to show details is remembered. A third line appears only when it matters: `⏳ Reply within 12 min to
   keep the conversation cached …` in the last 15 minutes of a large conversation's cache, or `⏳ The cache expired …` after
   it; an unknown cache age says nothing. No flow needs a command.
@@ -68,10 +68,13 @@ routes and prompts exactly as 1.0.1 does.
 - `/model-router pin <haiku|sonnet|opus> [turns]` and `/model-router unpin`: hold the main conversation on a model like a
   `#model` in every message, counted down when the turn starts (`pinned (n left)` counts the turn being started). The band
   shows `📌` before the model.
-- Learning from corrections: `/model-router wrong <tier>`, the band's buttons, or the model escalating itself above the
-  classified tier's model store the masked prompt snippet (up to 40, 200 characters each); the newest 8 are added to the
-  classifier prompt for the main thread and subagents. `/model-router corrections [clear]` lists or deletes them; stats
-  count them. Option `learnFromCorrections` (on by default); see Privacy.
+- Routing corrections: `/model-router wrong <tier>` or the band's buttons pin the main conversation to that tier's model
+  for the rest of the session (the same pin as `/model-router pin <model>`, undone with `/model-router unpin`) and store
+  the masked prompt snippet (up to 40, 200 characters each); the model escalating itself above the classified tier's
+  model is stored too but never pins. Corrections are an evaluation dataset for revising the classifier prompt offline
+  and are never sent to the classifier: as few-shot examples they lowered accuracy on 102 labelled prompts (69.6% to
+  65.7%) and ratcheted routing upward. `/model-router corrections [clear]` lists or deletes them; stats count them.
+  Option `learnFromCorrections` (on by default; off: no buttons, nothing recorded or pinned); see Privacy.
 - Weekly pacing: option `weeklyPacing` (`off`, `warn` by default, `steer`) and `/model-router pacing [mode|default]`. `warn`
   adds the pace to the status line only when ahead, and toasts once per weekly window; `steer` also routes an unsure
   decide to Sonnet while ahead, never against a warm Opus cache, `#model`, a pin or a sure decision. Steer deliberately
