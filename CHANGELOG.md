@@ -41,8 +41,10 @@ agreeing AI judges): accuracy 66% → 74–76%, over-routing 28–29% → 13–1
   on the reason; execute and decide are never changed, and no effort changes. It covers classified main turns, a failed
   classification that keeps a lookup tier, and `general-purpose` subagents. `/model-router stats` counts it ("Risky
   actions raised from lookup to Sonnet"), only when it changed the route (an unsure lookup goes to Sonnet anyway). It
-  does not see a confirmation such as "yes", a prompt typed into a running turn, an inherited route, a subagent clamped
-  to a Haiku parent, `#haiku` or a pin; the Haiku assignment text covers those.
+  does not see a confirmation such as "yes", a prompt typed into a running turn, an inherited route, `#haiku` or a pin;
+  on the main thread the Haiku assignment text covers those (subagents get no assignment text). Under a Haiku parent a
+  `general-purpose` subagent without a model whose task it flags runs on Sonnet, the one exception to "never above the
+  parent"; Sonnet is then that agent's ceiling.
   Detector fixes from review: each sentence is read part by part (and / then / 然后 / 再 / 之后); a negation or 已 / 刚
   counts only directly before the verb (分别, 刚才 no longer cancel it); question words count only in a question; `re-`
   verbs count; noun uses ("the prod logs", "git log --merges", "这个 PR 的评论") do not. New: SQL writes, `terraform
@@ -52,9 +54,12 @@ agreeing AI judges): accuracy 66% → 74–76%, over-routing 28–29% → 13–1
   it runs the real classifier call over a JSON file of up to 500 labelled messages with the 1.2 prompt, the 1.1 prompt
   (kept word for word in `hooks/replay.ts`) or both, each up to 3 times, and writes `<path>.replay.json`. Each row holds
   the run, the tier and `sure` (both prompts parsed the same way), the code risk check of the message and the call's
-  time in ms. At most 4 calls run at once, and after a timeout no new call starts for 3 seconds. A context is trimmed
-  per message as a live one is. It changes no routing state; its Haiku spend is added to the day and the total, never
-  to a turn. It runs beside live turns, so a classification started during a replay can be slower.
+  time in ms. At most 4 calls run at once, and no new call starts until 3 seconds after the latest timeout. A context
+  may be a list of `{ role, text }` messages, handled exactly as a live one; the `[role] text` string form is
+  approximate. A missing, unknown or malformed flag shows the usage and runs nothing. It changes no routing state; each
+  call's Haiku spend is priced on its own and added to the day and the total as it completes, never to a turn, and
+  stays on the originating conversation's ledger if you switch. It runs beside live turns, so a classification started
+  during a replay can be slower.
 
 ### Not shipped
 

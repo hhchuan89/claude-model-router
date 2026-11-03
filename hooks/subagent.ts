@@ -52,7 +52,8 @@ function clamp(target: Family, ceiling: ModelKey): ModelKey {
 }
 
 // model undefined: the spawn goes on as the caller made it (inherit); the reason is still logged.
-export type Decision = { model: ModelKey | undefined; reason: string; fable?: boolean }
+// ceiling: set only by the risk exception in decideSpawn, the agent's own ceiling above its parent's (see startOf).
+export type Decision = { model: ModelKey | undefined; reason: string; fable?: boolean; ceiling?: ModelKey }
 
 type SpawnFacts = Pick<AgentSpawnInput, 'subagentType' | 'model' | 'parentModel' | 'fork' | 'workflow'>
 
@@ -74,7 +75,17 @@ export function needsClassifier(e: SpawnFacts): boolean {
 // a wrong guess on the cheapest model costs a failed run, a wrong guess one tier up costs a few cents.
 // blockFable false: Fable is left alone (a Fable parent's agents inherit it, an agent asking for Fable under a Fable
 // parent keeps it); the parent's tier is still the ceiling, so a lower parent still caps a Fable ask.
-export function decideSpawn(e: SpawnFacts, tier: Tier | null, sure = true, blockFable = true): Decision | undefined {
+// risky: the code risk check (hooks/risk.ts) fired on the task. A risky action never runs on Haiku, so a general-purpose
+// agent the call gave no model, which a Haiku parent would hold on Haiku, runs on Sonnet: the one case an agent runs above
+// its parent. Its ceiling is Sonnet, so neither it nor the ladder can raise it further.
+export function decideSpawn(e: SpawnFacts, tier: Tier | null, sure = true, blockFable = true, risky = false): Decision | undefined {
+  const d = decideByJob(e, tier, sure, blockFable)
+  if (!risky || !needsClassifier(e) || ceilingOf(e.parentModel) !== 'haiku') return d
+  if (d !== undefined && d.model !== undefined && d.model !== 'haiku') return d
+  return { model: 'sonnet', reason: d?.reason ?? '', ceiling: 'sonnet' }
+}
+
+function decideByJob(e: SpawnFacts, tier: Tier | null, sure: boolean, blockFable: boolean): Decision | undefined {
   if (e.fork || e.workflow !== undefined) return undefined
   const ceiling = ceilingOf(e.parentModel)
   const parentIsFable = blockFable && familyOf(e.parentModel) === 'fable'
@@ -132,8 +143,11 @@ export function startOf(
   isPinned: boolean,
   ids: Record<ModelKey, string>,
   callerPinned = false,
+  raisedCeiling?: ModelKey,
 ): AgentTier {
-  const ceiling = ceilingOf(parentModel)
+  // raisedCeiling: the risk exception's (Decision.ceiling); it only ever lifts the parent's.
+  const parent = ceilingOf(parentModel)
+  const ceiling = raisedCeiling !== undefined && RANK[raisedCeiling] > RANK[parent] ? raisedCeiling : parent
   const tier = clamp(familyOf(resolved) ?? ceiling, ceiling)
   return {
     tier,

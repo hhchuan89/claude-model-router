@@ -80,11 +80,16 @@ shortcuts.
    ("the prod logs", "the merge conflicts", "这个 PR 的评论") do not count. When it fires on a sure lookup, the turn runs
    on Sonnet at Sonnet's effort and the reason ends "· risky action: at least Sonnet"; execute and decide are left as
    they are, and an unsure lookup goes to Sonnet anyway. It applies to classified main turns, to a failed
-   classification that keeps a lookup tier, and to `general-purpose` subagents; `/model-router stats` counts it.
+   classification that keeps a lookup tier, and to `general-purpose` subagents the call gives no model;
+   `/model-router stats` counts it. Under a Haiku parent such a subagent with a task the check flags runs on Sonnet
+   whatever the classifier said (the event log reason ends "· risky action: Sonnet, above the Haiku parent"): the one
+   case a subagent runs above its parent's tier (see 5).
    **The floor only sees the message.** It does not cover a confirmation ("yes" to "push it?"), a prompt typed into a
-   running turn, a turn without a person prompt that inherits a route, a subagent clamped to a Haiku parent, a
-   `#haiku` or a Haiku pin, or wording it does not know. For those the backstop is the Haiku assignment text (see 2):
-   any irreversible or outward-facing action needs at least Sonnet, so Haiku escalates before any tool.
+   running turn, a turn without a person prompt that inherits a route, a `#haiku` or a Haiku pin, an `Explore`, named
+   or custom subagent, a subagent the caller pinned to Haiku, or wording it does not know. On the **main thread** the
+   backstop for those is the Haiku assignment text (see 2): any irreversible or outward-facing action needs at least
+   Sonnet, so Haiku escalates before any tool. Subagents get no assignment text, so a subagent the floor misses has no
+   backstop.
    **The classifier is skipped when it could not change the outcome.** If the last main request was Opus, is within the
    cache TTL and had a context of 50,000 tokens or more (see the round-trip guard, 4), the turn stays on Opus whatever
    the tier, so the prompt goes straight to Opus at the decide effort ("warm large context: classifier skipped") with no
@@ -130,11 +135,14 @@ shortcuts.
    kept subject to the parent's tier; `inherit`, unknown ids and Fable keep their existing handling. The agent or the
    automatic ladder can raise effort later. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
    workflow agents. A resumed agent keeps its tracked model, effort and error state without being classified or
-   counted again. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
+   counted again. A subagent never runs above its parent's tier, with one exception: under a Haiku parent, a
+   `general-purpose` subagent without a model whose task the risk floor flags runs on Sonnet (see 1), and Sonnet is then
+   its ceiling. A model the caller names is kept, except that it is
    capped at the parent's tier.
 6. **Subagents can escalate, are escalated, and have a ceiling.** The same `escalate` tool works inside a subagent: it
    may raise its own model or effort from its next step, but on its own never above **Opus at medium** (haiku and
-   sonnet may reach high; xhigh and max are cut down), and never above the parent's tier. A model change starts the new
+   sonnet may reach high; xhigh and max are cut down), and never above the parent's tier (Sonnet for a risky task under a
+   Haiku parent). A model change starts the new
    tier at medium, or at the asked effort if higher, whatever effort the old model had. Effort-only escalation on the
    same model only goes up. The router also escalates a failing subagent by itself, in two stages. After three tool
    errors in a row it first raises the effort one step on the same model (Haiku · medium → Haiku · high), and if three
@@ -463,17 +471,26 @@ claude plugin test .
 **Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`
 (default `both`, once) reads a JSON array of `{ "id", "message", "context", "previous" }` (`previous` is a tier or
 `null`; at most 500 items), sends each message to Haiku exactly as a live classification would (same model, effort,
-limits, masking and 6,000-character cut; `context` written as `[role] text` blocks separated by a blank line, each block
-trimmed like a live one: over 1,200 characters, its first 200 and last 1,000), and writes `<path without .json>.replay.json` with one row per item, variant
+limits, masking and 6,000-character cut), and writes `<path without .json>.replay.json` with one row per item, variant
 and run: `id`, `variant` (`current` is the 1.2 prompt, `legacy` the 1.1 prompt kept in `hooks/replay.ts`), `run`, the
 masked start of the reply, `tier` and `sure` as the classifier gave them (both variants are parsed the same way, so the
 unsure rule can be applied to either), `risk` (what the code's risk floor check says about the message; the tier is
 recorded before the floor), `ms` (how long the call took) and `why` when there was no usable reply. `--repeat` runs
 each variant up to 3 times, to measure run-to-run noise. At most 4 requests run at once, and after a timeout no new
-request starts for 3 seconds. It refuses to start while a turn is running and changes no routing state, count,
-correction or turn record. Its Haiku spend is added to today's and the total figures, never to a turn. It runs beside
+request starts until 3 seconds after the latest timeout. A flag with no value, an unknown flag or a malformed value
+shows the usage text and runs nothing. It refuses to start while a turn is running and changes no routing state,
+count, correction or turn record. Its Haiku spend is added to today's and the total figures as each call completes,
+each call priced on its own, never to a turn; a call that completes after you clear or switch the conversation still
+counts, on the conversation the replay started in. It runs beside
 live turns: a turn you start during a replay works normally, but its classification shares the API with up to 4 replay
 calls and can be slower. It is not listed in the command's usage text.
+
+`context` takes two forms. The exact one is a list of messages, `[{ "role": "user", "text": "…" }, { "role":
+"assistant", "text": "…" }]`: it goes through the same code as a live context (the last two non-empty messages, each
+over 1,200 characters cut to its first 200 and last 1,000), so the prompt is the live one byte for byte. The older
+string form, `[role] text` blocks separated by a blank line, is approximate: it is cut back into messages at every
+blank line followed by `[word] `, so a message that itself holds such a paragraph (a pasted transcript) is split and
+trimmed differently, and every block is kept. An absent `context` is empty.
 
 ## Contributors
 

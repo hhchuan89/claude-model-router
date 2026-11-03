@@ -123,7 +123,7 @@ function world(
   $: any,
   on: any,
   classifier: Reply | Reply[] | ((e: { system?: string; prompt: string }) => Promise<Reply>),
-  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally } = {},
+  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally; usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number } } = {},
 ): Seen {
   const seen: Seen = { sessionId: 'sess-1', clock: mock.clock(on), systems: [], submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {}, statuses: [], store: { ...opts.store } }
   on('store.set', { key: /.*/ }, async (_$: unknown, e: any, next: any) => {
@@ -146,7 +146,7 @@ function world(
     seen.systems.push(e.system ?? '')
     seen.maxTokens.push(e.maxTokens)
     seen.prompts.push(e.prompt)
-    const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+    const usage = opts.usage ?? { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     if (e.model === 'haiku') {
       const reply = typeof classifier === 'function' ? await classifier(e) : Array.isArray(classifier) ? (classifier.shift() ?? null) : classifier
       if (reply !== null && typeof reply === 'object') {
@@ -8393,6 +8393,48 @@ describe('risk floor (1.2.0)', () => {
     expect(seen.agents).toEqual(['haiku', 'sonnet'])
     expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
   })
+
+  // WHY: the owner's policy is that a risky action never runs on Haiku; a Haiku parent used to clamp the floor back to
+  // Haiku, and a subagent gets no assignment text, so nothing else stopped it. Safety wins over the parent ceiling here.
+  test('a Haiku parent spawning push the release branch runs the subagent on Sonnet, and its steps stay on Sonnet', async ($, on) => {
+    const seen = world($, on, T('lookup'))
+    const id = await spawnAgent($, { prompt: 'push the release branch', parentModel: 'claude-haiku-5-5' })
+    expect(seen.agents).toEqual(['sonnet'])
+    await step($, 't1', 'claude-haiku-5-5', id)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', agentId: id, effort: 'medium' })
+    expect(seen.statuses.some(t => t?.includes('risky action: Sonnet, above the Haiku parent'))).toBe(true)
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
+  })
+
+  test('under a Haiku parent a task the risk check does not flag still runs on Haiku', async ($, on) => {
+    const seen = world($, on, T('lookup'))
+    await spawnAgent($, { prompt: 'grep for TODO', parentModel: 'claude-haiku-5-5' })
+    expect(seen.agents).toEqual(['haiku'])
+  })
+
+  test('the Haiku parent exception covers every verdict of an unpinned general-purpose agent, and nothing else', async () => {
+    const hp = { parentModel: 'claude-haiku-5-5' }
+    for (const [tier, sure] of [['lookup', true], ['lookup', false], ['execute', true], ['decide', true], [null, true]] as const) {
+      expect([tier, sure, decideSpawn(spawnInput(hp), tier, sure, true, true)]).toEqual([tier, sure, expect.objectContaining({ model: 'sonnet', ceiling: 'sonnet' })])
+    }
+    expect(decideSpawn(spawnInput(hp), 'execute', true, true, false)).toEqual({ model: 'haiku', reason: 'execute work' })
+    expect(decideSpawn(spawnInput({ ...hp, model: 'haiku' }), 'execute', true, true, true)).toBeUndefined()
+    expect(decideSpawn(spawnInput({ ...hp, subagentType: 'Explore' }), null, true, true, true)).toEqual({ model: 'haiku', reason: 'Explore: lookup' })
+    expect(decideSpawn(spawnInput({ ...hp, fork: true }), 'execute', true, true, true)).toBeUndefined()
+    expect(decideSpawn(spawnInput(), 'execute', true, true, true)).toEqual({ model: 'sonnet', reason: 'execute work' })
+    expect(decideSpawn(spawnInput({ parentModel: 'claude-sonnet-5-5' }), 'decide', true, true, true)).toEqual({ model: undefined, reason: 'decision work, inherits' })
+  })
+
+  // WHY: the exception is the only one; escalation and the ladder keep a ceiling, which is now the Sonnet it was given.
+  test('a subagent raised above its Haiku parent can raise effort but never its model', async () => {
+    const s = startOf('claude-sonnet-5-5', 'claude-haiku-5-5', true, IDS_BY_KEY, false, 'sonnet')
+    expect(s).toMatchObject({ tier: 'sonnet', ceiling: 'sonnet', model: 'claude-sonnet-5-5', effort: 'medium' })
+    expect(escalateAgent(s, { model: 'opus' }, IDS_BY_KEY)).toBeUndefined()
+    expect(escalateAgent(s, { model: 'opus' }, IDS_BY_KEY, 'main')).toBeUndefined()
+    expect(escalateAgent(s, { model: 'opus', effort: 'high' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+    expect(startOf('claude-sonnet-5-5', 'claude-haiku-5-5', true, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', ceiling: 'haiku' })
+    expect(startOf('claude-opus-5-5', 'claude-opus-5-5', true, IDS_BY_KEY, false, 'sonnet').ceiling).toBe('opus')
+  })
 })
 
 describe('classifier prompt and reply (1.2.0)', () => {
@@ -8815,5 +8857,127 @@ describe('/model-router replay (1.2.0)', () => {
     await cmd($, `replay ${IN} current`)
     expect(calls.requests[0]!.prompt).toBe(classifierPrompt(null, '', 'hello'))
     expect(readOut(seen)[0].id).toBe('0')
+  })
+
+  // WHY: Haiku is priced higher only for one request over 100,000 tokens; 200 short calls priced as one sum cost 5x too much.
+  test('200 calls of 1000 input tokens are priced one by one at the short prompt rate', async ($, on) => {
+    const { calls, fn } = classifierBy(() => T('execute'))
+    const seen = world($, on, fn, { usage: { input_tokens: 1000, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+    put(seen, JSON.stringify(items(200)))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(200)
+    const day = seen.store[`meter:${storeDay(0)}:sess-1`] as Tally
+    expect(day.tokens).toBe(202000)
+    // 200 x (1000 x 0.1 + 10 x 0.5) / 1e6 = 0.021; priced as one 200,000-token request it would be 0.105.
+    const nanoUsd = (usd: number) => Math.round(usd * 1e9)
+    expect(nanoUsd(day.cost)).toBe(21_000_000)
+    expect(nanoUsd(day.byRole!.classifier!.cost)).toBe(21_000_000)
+    expect(nanoUsd(seen.tally!.cost)).toBe(21_000_000)
+  })
+
+  // WHY: the calls were paid for; a clear or a switch mid-replay must not wipe them from the day and the total.
+  test('a conversation switch mid-replay keeps every finished call on the originating session ledger and shows nothing', async ($, on) => {
+    const waiting: (() => void)[] = []
+    const { calls, fn } = classifierBy(async (_s, prompt) => {
+      if (!prompt.includes('message 0') && !prompt.includes('message 1')) await new Promise<void>(resolve => waiting.push(resolve))
+      return T('execute')
+    })
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(6)))
+    const run = cmd($, `replay ${IN} current`)
+    for (let i = 0; i < 40 && waiting.length < 4; i++) await macrotask()
+    expect(waiting).toHaveLength(4)
+    const key = `meter:${storeDay(0)}:sess-1`
+    expect((seen.store[key] as Tally).tokens).toBe(4)
+    const statusesBefore = seen.statuses.length
+    const tallyBefore = seen.tally
+    seen.sessionId = 'sess-2'
+    for (const release of waiting.splice(0)) release()
+    expect(await run).toBe('Replay cancelled: the conversation changed.')
+    expect(calls.n).toBe(6)
+    expect((seen.store[key] as Tally).tokens).toBe(12)
+    expect((seen.store[key] as Tally).byRole!.classifier!.tokens).toBe(12)
+    expect(Object.keys(seen.store).filter(k => k.endsWith(':sess-2'))).toEqual([])
+    expect(seen.statuses).toHaveLength(statusesBefore)
+    expect(seen.tally).toBe(tallyBefore)
+    expect(outFile(seen)).toBeUndefined()
+  })
+
+  // WHY: a string context is cut back into messages at "\n\n[role] ", so a message holding such a paragraph was split and
+  // trimmed differently from live; the structured form goes through the live helper itself.
+  test('a structured context with an embedded role label is byte for byte the live prompt, and the string form is not', async ($, on) => {
+    const embedded = `${'a'.repeat(300)}\n\n[user] ${'b'.repeat(1300)}`
+    const messages = [{ role: 'user' as const, text: 'dropped: only the last two count' }, { role: 'user' as const, text: 'paste this' }, { role: 'assistant' as const, text: embedded }]
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn, { messages })
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    const live = seen.prompts[0]!
+    put(seen, JSON.stringify([
+      { id: 's', message: 'find every TODO', context: messages, previous: null },
+      { id: 't', message: 'find every TODO', context: `[user] paste this\n\n[assistant] ${embedded}`, previous: null },
+    ]))
+    await cmd($, `replay ${IN} current`)
+    const replayed = calls.requests.slice(1).map(r => r.prompt)
+    expect(replayed).toHaveLength(2)
+    expect(replayed.filter(p => p === live)).toHaveLength(1)
+    expect(readOut(seen).map(r => r.id).sort()).toEqual(['s', 't'])
+  })
+
+  test('a context that is neither a string nor a list of role and text is refused, and nothing is asked', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    for (const context of [[{ role: 'user' }], [{ text: 'x' }], 7, { role: 'user', text: 'x' }]) {
+      put(seen, JSON.stringify([{ message: 'x', context }]))
+      expect(await cmd($, `replay ${IN}`)).toContain('item 0 has a context that is neither a string nor a list of { role, text }')
+    }
+    expect(calls.n).toBe(0)
+  })
+
+  // WHY: the pause protects a struggling API; a second timeout inside it must restart the 3 seconds, not end early.
+  test('a second timeout 2.9 seconds after the first holds new requests until 3 seconds after the second', async ($, on) => {
+    let open: (() => void) | undefined
+    const { calls, fn } = classifierBy(async (_s, prompt) => {
+      if (prompt.includes('message 0')) return null
+      if (prompt.includes('message 1')) {
+        await new Promise<void>(resolve => { open = resolve })
+        return null
+      }
+      return T('execute')
+    })
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(6)))
+    const run = cmd($, `replay ${IN} current`)
+    const drain = async () => { for (let i = 0; i < 5; i++) { await macrotask(); await seen.clock.advance(0) } }
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(2900)
+    open!()
+    await drain()
+    await seen.clock.advance(100)
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(2899)
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(1)
+    await drain()
+    await run
+    expect(calls.n).toBe(6)
+  })
+
+  // WHY: a flag the parser skipped used to launch the default replay: up to 1,000 paid calls and an overwritten output.
+  test('a flag with no value, an unknown flag or a malformed value shows the usage and makes no call', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    const bad = ['--repeat', '--bogus', '--bogus 1', '--repeat 3 --bogus', '--bogus --repeat 2', '--repeat=3', '--repeat 2x', '--repeat 2 legacy', '--']
+    for (const flags of bad) {
+      expect([flags, parseReplayArgs(`/a.json ${flags}`)]).toEqual([flags, null])
+      expect([flags, await cmd($, `replay ${IN} ${flags}`)]).toEqual([flags, expect.stringContaining('Usage: /model-router replay')])
+    }
+    expect(calls.n).toBe(0)
+    expect(outFile(seen)).toBeUndefined()
+    expect(parseReplayArgs('/a.json legacy --repeat 2')).toEqual({ path: '/a.json', variants: ['legacy'], repeat: 2 })
   })
 })

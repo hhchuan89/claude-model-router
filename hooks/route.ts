@@ -157,6 +157,7 @@ export function withSuffixOf(id: string, current: string): string {
 
 const SONNET_RISK = `An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus, but care: confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled.`
 // The backstop for what the code risk floor cannot see, such as a "yes" to "push it?": Haiku never carries one out.
+// Main thread only: this text goes beside a person's prompt, and subagents never get it.
 const HAIKU_RISK = `Any irreversible or outward-facing action (a push, merge, PR, deploy, delete, a message to people, or a change to production data) needs at least sonnet, even when the user asked for it or has just approved it: call mcp__model-router__escalate with model sonnet FIRST, before any tool. Once on sonnet it does not need opus if what to do is settled; confirm what it will affect and follow the project's confirmation rules.`
 
 export function assignmentContext(r: Route): string {

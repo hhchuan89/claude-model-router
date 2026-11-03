@@ -42,7 +42,10 @@ export const REPLAY_PAUSE_MS = 3000
 const RAW_CHARS = 400
 
 export type ReplayVariant = 'current' | 'legacy'
-export type ReplayItem = { id: string; message: string; context: string; previous: Tier | null }
+// A context is either the messages themselves ({ role, text }, handled exactly as live context) or, approximately, the
+// "[role] text" string a live context reads as.
+export type ReplayContext = string | { role: string; text: string }[]
+export type ReplayItem = { id: string; message: string; context: ReplayContext; previous: Tier | null }
 // run: which repeat (1 to n). risk: what the code's risk detector says about the item's message (the classifier's tier is
 // recorded as it came back, before the risk floor). ms: how long the call took, timeouts included.
 export type ReplayRow = {
@@ -59,18 +62,28 @@ export type ReplayRow = {
 }
 
 // "--name value" flags after the leading words; the value runs to the next flag, so a path may hold spaces.
-export function parseFlags(rest: string): { head: string; flags: Record<string, string> } {
-  const at = rest.search(/(?:^|\s)--\w+(?:\s|$)/)
+// null: a flag with no value, or anything else starting with "--" (such as --repeat=3) that is not "--name value".
+export function parseFlags(rest: string): { head: string; flags: Record<string, string> } | null {
+  const at = rest.search(/(?:^|\s)--/)
   if (at === -1) return { head: rest.trim(), flags: {} }
   const flags: Record<string, string> = {}
-  for (const m of rest.slice(at).matchAll(/--(\w+)\s+(.+?)(?=\s+--\w+(?:\s|$)|$)/g)) flags[m[1]!] = m[2]!.trim()
+  const tail = rest.slice(at)
+  const starts = [...tail.matchAll(/(?:^|\s)--/g)].map(m => m.index! + m[0].length - 2)
+  for (const [n, start] of starts.entries()) {
+    const m = /^--(\w+)\s+([\s\S]*)$/.exec(tail.slice(start, starts[n + 1]).trim())
+    if (!m || m[2]!.trim() === '') return null
+    flags[m[1]!] = m[2]!.trim()
+  }
   return { head: rest.slice(0, at).trim(), flags }
 }
 
 // The arguments after "replay": a path (it may hold spaces), an optional variant after it, and --repeat <1-3>.
-// null: no path, an unknown flag, or a repeat that is not a whole number from 1 to 3.
+// null: no path, an unknown or malformed flag (with or without a value), or a repeat that is not a whole number from
+// 1 to 3. A null runs nothing: the caller shows the usage text.
 export function parseReplayArgs(rest: string): { path: string; variants: ReplayVariant[]; repeat: number } | null {
-  const { head, flags } = parseFlags(rest)
+  const parsed = parseFlags(rest)
+  if (!parsed) return null
+  const { head, flags } = parsed
   const m = /^(.*?)(?:\s+(current|legacy|both))?$/.exec(head)
   const path = m?.[1]?.trim() ?? ''
   if (path === '') return null
@@ -87,7 +100,21 @@ export function replayOutPath(path: string): string {
   return `${path.replace(/\.json$/i, '')}.replay.json`
 }
 
-// A file of up to 500 items { id, message, context, previous }; anything else is refused with the reason.
+function contextFrom(x: unknown): ReplayContext | undefined {
+  if (x === undefined || x === null) return ''
+  if (typeof x === 'string') return x
+  if (!Array.isArray(x)) return undefined
+  const messages: { role: string; text: string }[] = []
+  for (const m of x) {
+    const o = m as Record<string, unknown> | null
+    if (typeof o !== 'object' || o === null || typeof o.role !== 'string' || typeof o.text !== 'string') return undefined
+    messages.push({ role: o.role, text: o.text })
+  }
+  return messages
+}
+
+// A file of up to 500 items { id, message, context, previous }; anything else is refused with the reason. context is a
+// string, an array of { role, text } messages, or absent.
 export function parseReplayFile(text: string): { ok: true; items: ReplayItem[] } | { ok: false; why: string } {
   let data: unknown
   try { data = JSON.parse(text) } catch { return { ok: false, why: 'not valid JSON' } }
@@ -98,10 +125,12 @@ export function parseReplayFile(text: string): { ok: true; items: ReplayItem[] }
     const o = x as Record<string, unknown> | null
     if (typeof o !== 'object' || o === null || typeof o.message !== 'string') return { ok: false, why: `item ${i} has no message` }
     const previous = o.previous === 'lookup' || o.previous === 'execute' || o.previous === 'decide' ? o.previous : null
+    const context = contextFrom(o.context)
+    if (context === undefined) return { ok: false, why: `item ${i} has a context that is neither a string nor a list of { role, text }` }
     items.push({
       id: typeof o.id === 'string' || typeof o.id === 'number' ? String(o.id) : String(i),
       message: o.message,
-      context: typeof o.context === 'string' ? o.context : '',
+      context,
       previous,
     })
   }

@@ -16,7 +16,7 @@ import { redact } from './redact'
 import type { Lang } from './route'
 import { isRisky, riskFloor } from './risk'
 import { legacyClassifierSystem, parseReplayArgs, parseReplayFile, replayOutPath, replayRow, replaySummary, REPLAY_CONCURRENCY, REPLAY_PAUSE_MS } from './replay'
-import type { ReplayRow } from './replay'
+import type { ReplayContext, ReplayRow } from './replay'
 import {
   applyEscalation,
   assignmentContext,
@@ -208,6 +208,7 @@ const STR = {
   zh: {
     keptTier: (why: string) => `分类失败（${why}）：沿用上一档位`,
     riskFloor: ' · 风险操作：至少用 Sonnet',
+    riskAboveParent: ' · 风险操作：用 Sonnet，高于 Haiku 父级',
     replayBusy: '无法回放：主会话正在运行。请在轮次之间重试。',
     replayRunning: '无法回放：另一个回放正在运行。',
     replayUsage: '用法：/model-router replay <文件路径> [current|legacy|both] [--repeat <1-3>]',
@@ -351,6 +352,7 @@ const STR = {
   en: {
     keptTier: (why: string) => `classifier failed (${why}): kept previous tier`,
     riskFloor: ' · risky action: at least Sonnet',
+    riskAboveParent: ' · risky action: Sonnet, above the Haiku parent',
     replayBusy: 'Replay refused: a main turn is running. Try again between turns.',
     replayRunning: 'Replay refused: another replay is running.',
     replayUsage: 'Usage: /model-router replay <path> [current|legacy|both] [--repeat <1-3>]',
@@ -1019,8 +1021,7 @@ function count($: EngineInterface, session: Session, change: (c: Counts) => Coun
 
 // Every model call this session pays for, the router's own included, goes on the turn, the day and the total.
 // switched: a main-thread step that changed model family within the cache TTL (see baselineOf).
-// onTurn false (a replay, which runs beside live turns): the day and the total only, never the turn tally.
-function record($: EngineInterface, session: Session, modelId: string, u: Usage, switched = false, overhead = false, role: SpendRole = 'main', onTurn = true): Promise<void> {
+function record($: EngineInterface, session: Session, modelId: string, u: Usage, switched = false, overhead = false, role: SpendRole = 'main'): Promise<void> {
   return serial($, session, 'meter', async () => {
     const now = await $.clock.now()
     await prune($, now)
@@ -1028,22 +1029,40 @@ function record($: EngineInterface, session: Session, modelId: string, u: Usage,
     const previous = ((await $.store.get(key)) as Tally | undefined) ?? EMPTY
     if (await stillHere($, session) !== 'same') return
     await $.store.set(key, add(previous, modelId, u, switched, overhead, role))
-    const loaded = await bookkeeping($, async () => {
-      const { today } = await totals($, now, true)
-      return today
-    }, undefined, session.daily.retry)
-    if (await stillHere($, session) !== 'same') return
-    if (loaded !== undefined) {
-      session.today = loaded
-      session.daily.done = true
-    }
-    const today = session.today ?? EMPTY
-    await update($, memberOf(meter, { requestId: session.stateId }), m => {
-      if (!here(session)) return m
-      const turn = (m ?? { turn: EMPTY }).turn
-      return { turn: onTurn ? add(turn, modelId, u, switched, overhead, role) : turn, today }
-    })
+    await showSpend($, session, now, turn => add(turn, modelId, u, switched, overhead, role))
   })
+}
+
+// Rereads today's figure and shows it, with the turn tally changed by `turn`, while the session is still here.
+async function showSpend($: EngineInterface, session: Session, now: number, turn: (t: Tally) => Tally): Promise<void> {
+  const loaded = await bookkeeping($, async () => {
+    const { today } = await totals($, now, true)
+    return today
+  }, undefined, session.daily.retry)
+  if (await stillHere($, session) !== 'same') return
+  if (loaded !== undefined) {
+    session.today = loaded
+    session.daily.done = true
+  }
+  const today = session.today ?? EMPTY
+  await update($, memberOf(meter, { requestId: session.stateId }), m => {
+    if (!here(session)) return m
+    return { turn: turn((m ?? { turn: EMPTY }).turn), today }
+  })
+}
+
+// One replay call's spend, on the day and the total of the session the replay started in, never on a turn. Each call is
+// priced on its own: Haiku's long-prompt rate is per request, so a sum priced as one request would cost about 5x too much.
+// Unlike serial, this write does not check that the session is still here: the call was paid for, so it stays on the
+// originating session's ledger after a clear or a switch. It still queues on `writes`, so it never races a live write
+// in this process. Nothing else (routing, counts, the band) is touched here.
+function recordReplay($: EngineInterface, session: Session, u: Usage): Promise<void> {
+  writes = writes.then(() => bookkeeping($, async () => {
+    const key = `meter:${dayKey(await $.clock.now())}:${session.id}`
+    const previous = ((await $.store.get(key)) as Tally | undefined) ?? EMPTY
+    await $.store.set(key, add(previous, 'claude-haiku-5-5', u, false, true, 'classifier'))
+  }, undefined, retryFor(session, 'replay meter'))).catch(err => storeFailure($, err))
+  return writes
 }
 
 function recordDetail($: EngineInterface, session: Session, change: (t: Tally, now: number) => Tally): Promise<void> {
@@ -1097,13 +1116,22 @@ function contextMessage(text: string): string {
   return masked.length > 1200 ? `${masked.slice(0, 200)}\n…\n${masked.slice(-1000)}` : masked
 }
 
-async function recentContext($: EngineInterface): Promise<string> {
-  const rows = (await $.session.messages()).filter(m => m.text.trim() !== '').slice(-2)
+// The classifier's context from a list of messages: the last two that are not empty, each trimmed by contextMessage.
+// Live classification and a structured replay context both go through here, so the two are the same byte for byte.
+function contextOf(messages: readonly { role: string; text: string }[]): string {
+  const rows = messages.filter(m => m.text.trim() !== '').slice(-2)
   return rows.map(m => `[${m.role}] ${contextMessage(m.text)}`).join('\n\n')
 }
 
-// A replay item's context, written as recentContext writes it ("[role] text" blocks), trimmed per message the same way.
-function replayContext(context: string): string {
+async function recentContext($: EngineInterface): Promise<string> {
+  return contextOf(await $.session.messages())
+}
+
+// A replay item's context. Structured ({ role, text } messages) goes through contextOf exactly as live context does. A
+// string is approximate: it is cut back into messages at a blank line followed by "[role] ", so a message that itself
+// holds such a paragraph is split and its parts trimmed on their own, and every block is kept (no last-two cut).
+function replayContext(context: ReplayContext): string {
+  if (typeof context !== 'string') return contextOf(context)
   return context
     .split(/\n\n(?=\[\w+\] )/)
     .map(block => {
@@ -1184,9 +1212,9 @@ function pause($: EngineInterface, ms: number): Promise<void> {
 // /model-router replay <path> [current|legacy|both] [--repeat <1-3>]: the maintainer's instrument for measuring the
 // classifier prompt. It runs the real classifier call over a labelled file, each variant repeat times, and writes what came
 // back with the code's risk check and each call's time. At most REPLAY_CONCURRENCY calls are in flight; after a timeout no
-// new call starts for REPLAY_PAUSE_MS. It changes no routing state, count, correction or turn record; the spend of all
-// its calls is added to the day and the total once, as classifier cost, at the end, and never to a turn. It runs beside
-// live turns: a turn started during a replay classifies alongside its calls.
+// new call starts until REPLAY_PAUSE_MS after the latest one. It changes no routing state, count, correction or turn
+// record; each call's spend is added to the day and the total as it completes (recordReplay), as classifier cost, and
+// never to a turn. It runs beside live turns: a turn started during a replay classifies alongside its calls.
 async function runReplay($: EngineInterface, session: Session, lang: Lang, rest: string): Promise<string> {
   const str = STR[lang]
   const args = parseReplayArgs(rest)
@@ -1203,13 +1231,18 @@ async function runReplay($: EngineInterface, session: Session, lang: Lang, rest:
   const risky = file.items.map(item => isRisky(redact(item.message).slice(0, 6000)))
   const jobs = file.items.flatMap((item, n) => args.variants.flatMap(variant => Array.from({ length: args.repeat }, (_, i) => ({ item, risk: risky[n]!, variant, run: i + 1 }))))
   const rows: (ReplayRow | undefined)[] = new Array(jobs.length)
-  const spent: Usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  let ledger: Promise<void> = Promise.resolve()
   let next = 0
   let cancelled = false
-  let held: Promise<void> | null = null
+  // No new call starts before this time; every timeout moves it to at least 3 seconds after itself.
+  let holdUntil = 0
   const worker = async () => {
     while (!cancelled && next < jobs.length) {
-      if (held) await held
+      const now = await $.clock.now()
+      if (now < holdUntil) {
+        await pause($, holdUntil - now)
+        continue
+      }
       if (cancelled || next >= jobs.length) return
       const i = next++
       const { item, risk, variant, run } = jobs[i]!
@@ -1217,12 +1250,14 @@ async function runReplay($: EngineInterface, session: Session, lang: Lang, rest:
       const prompt = classifierPrompt(item.previous, replayContext(item.context), redact(item.message).slice(0, 6000))
       const started = await $.clock.now()
       const r = await replayCall($, system, prompt)
-      const ms = (await $.clock.now()) - started
+      const ended = await $.clock.now()
+      const ms = ended - started
+      // Recorded before the session check: a call that finished after a switch was still paid for.
+      if (r.usage) ledger = recordReplay($, session, r.usage)
       if (await stillHere($, session) !== 'same') { cancelled = true; return }
-      if (r.usage) for (const k of Object.keys(spent) as (keyof Usage)[]) spent[k] += r.usage[k] ?? 0
       if (!r.ok) {
         rows[i] = replayRow(item.id, variant, run, risk, ms, { ok: false, raw: '', why: r.why })
-        if (r.why === 'timeout' && !held) held = pause($, REPLAY_PAUSE_MS).then(() => { held = null })
+        if (r.why === 'timeout') holdUntil = Math.max(holdUntil, ended + REPLAY_PAUSE_MS)
         continue
       }
       const d = parseDecision(r.raw)
@@ -1232,8 +1267,10 @@ async function runReplay($: EngineInterface, session: Session, lang: Lang, rest:
     }
   }
   await Promise.all(Array.from({ length: Math.min(REPLAY_CONCURRENCY, jobs.length) }, worker))
-  await record($, session, 'claude-haiku-5-5', spent, false, true, 'classifier', false)
+  await ledger
   if (cancelled || await stillHere($, session) !== 'same') return str.replayCancelled
+  // Today's figure once at the end, not per call (that rereads every day key); the turn tally is left as it is.
+  await serial($, session, 'meter', async () => showSpend($, session, await $.clock.now(), turn => turn))
   const done = rows.filter((r): r is ReplayRow => r !== undefined)
   const out = replayOutPath(args.path)
   try {
@@ -2650,7 +2687,8 @@ export const register: Register = (on, options) => {
   })
 
   // A subagent the call gives no model gets one by its job: search on Haiku, work on Sonnet, judgment
-  // inherits the parent. Never above the parent, never Fable; forks and workflow agents are left alone.
+  // inherits the parent. Never above the parent (except a risky task under a Haiku parent, which runs on Sonnet; see
+  // decideSpawn), never Fable; forks and workflow agents are left alone.
   on('agent.spawn', async ($, e, next) => {
     const session = await useSession($)
     if (!here(session)) return next(e)
@@ -2671,7 +2709,9 @@ export const register: Register = (on, options) => {
     const failureText = verdict && !verdict.ok ? failText(verdict) : undefined
     const ok = verdict?.ok ? verdict.verdict : null
     if (await stillHere($, session) !== 'same') return next(e)
-    const d = decideSpawn(e, ok?.tier ?? null, ok?.sure ?? true, blockFable)
+    // The code risk check on the task itself: under a Haiku parent it is what lets a risky task run on Sonnet.
+    const risky = needsClassifier(e) && isRisky(redact(e.prompt).slice(0, 6000))
+    const d = decideSpawn(e, ok?.tier ?? null, ok?.sure ?? true, blockFable, risky)
     const ran = await next(d?.model === undefined ? e : { ...e, model: d.model })
     if (await stillHere($, session) !== 'same') return ran
     try {
@@ -2687,13 +2727,14 @@ export const register: Register = (on, options) => {
           }))
         }
         if (await stillHere($, session) !== 'same') return ran
-        const started = startOf(ran.model, e.parentModel, model !== undefined, ids, model === undefined && isCallerPin(e.model))
+        const started = startOf(ran.model, e.parentModel, model !== undefined, ids, model === undefined && isCallerPin(e.model), d?.ceiling)
         // An effort the caller set explicitly is kept, router pin or not; the hard cap (high) still applies per step.
         const explicit = askedEffort.get(e.tool_use_id)
         const s = explicit === undefined ? started : { ...started, effort: capSent(explicit) as Effort }
         agents.set(ran.agentId, s)
         // A failed classification keeps today's fallback (sonnet) and says why.
-        const why = failureText !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failureText})`) : d?.reason
+        const said = failureText !== undefined && d?.reason ? d.reason.replace('classifier failed', `classifier failed (${failureText})`) : d?.reason
+        const why = d?.ceiling !== undefined ? `${said ?? ''}${STR[lang].riskAboveParent}`.trim() : said
         await logEvent($, session, ran.agentId, `${e.subagentType} start`, describeTier(s), why ?? 'as asked')
       }
     } catch {
