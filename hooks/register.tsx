@@ -5,7 +5,7 @@ import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier, TurnH
 import type { LastRequest, Shape, Usage } from './meter'
 import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, saved, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
-import { addCorrection, readCorrections, snippetOf } from './learn'
+import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
@@ -566,36 +566,72 @@ function redraw($: EngineInterface) {
   }
 }
 
-// Read at session start and by the first thing that needs them, not on every hook. A failed read is retried later
-// with the other loads' backoff, and defaults stand until it succeeds.
-function ensurePrefs($: EngineInterface, session: Session) {
-  return loadPart($, session.prefs, () => loadPrefs($, session))
+// Read at session start and by the first thing that needs them, then again once the last good read is over a minute
+// old, so a change made in another window reaches this one; never one store read per hook or render. A failed read is
+// retried later with the other loads' backoff, and the last values (or the defaults) stand until it succeeds.
+const PREFS_FRESH_MS = 60_000
+// Bumped by every local change to a preference, so a read already in flight cannot put back the value it replaced.
+let prefsChanges = 0
+
+async function ensurePrefs($: EngineInterface, session: Session) {
+  const part = session.prefs
+  if (part.done && !part.pending) {
+    const now = await $.clock.now()
+    if (!here(session) || now - (part.at ?? -Infinity) <= PREFS_FRESH_MS) return
+    part.done = false
+  }
+  return loadPart($, part, () => loadPrefs($, session))
 }
 
 // The persisted choices: the pacing override, the window the pace toast last fired for and the band's details state.
 async function loadPrefs($: EngineInterface, session: Session) {
+  const changes = prefsChanges
+  const at = await $.clock.now()
   const mode = await $.store.get('pacing')
   const warned = await $.store.get('paceWarned')
   const expanded = await $.store.get('bandExpanded')
   if (!here(session)) return
+  session.prefs.at = at
+  // A local change landed while this read ran: it is newer than what was read.
+  if (changes !== prefsChanges) return
   pacingOverride = isPaceMode(mode) ? mode : undefined
   paceWarned = typeof warned === 'string' ? warned : undefined
   bandExpanded = expanded === true
 }
 
-// One toast when weekly use first runs ahead of an even pace in a window, remembered across sessions.
+// The window a pace check is reading the store for, so a second check in this process does not toast alongside it.
+let paceChecking: string | undefined
+
+// One toast when weekly use first runs ahead of an even pace in a window, remembered across sessions and windows: the
+// store is read again first, because another open window may have toasted for this one since the last read.
 async function paceNotice($: EngineInterface, session: Session, now: number) {
   if (pacingMode() === 'off') return
   const w = weeklyLimit()
   const p = paceOf(w, now)
-  if (p.state !== 'ahead' || !w?.resetsAt || sameWindow(paceWarned, w.resetsAt)) return
-  paceWarned = w.resetsAt
+  if (p.state !== 'ahead' || !w?.resetsAt || sameWindow(paceWarned, w.resetsAt) || paceChecking === w.resetsAt) return
+  const resetsAt = w.resetsAt
+  paceChecking = resetsAt
+  let stored: unknown
+  try {
+    // A failed read toasts: one toast too many beats none.
+    stored = await bookkeeping($, () => $.store.get('paceWarned'), undefined, retryFor(session, 'pace read'))
+  } finally {
+    if (paceChecking === resetsAt) paceChecking = undefined
+  }
+  if (await stillHere($, session) !== 'same') return
+  if (typeof stored === 'string' && sameWindow(stored, resetsAt)) {
+    paceWarned = stored
+    return
+  }
+  if (sameWindow(paceWarned, resetsAt) || pacingMode() === 'off') return
+  paceWarned = resetsAt
+  prefsChanges++
   try {
     $.ui.toast(STR[uiLang].paceToast(String(w.percentUsed), fmtPace(p), pacingMode() === 'steer'))
   } catch {
     // A missing toast surface must not affect the status line.
   }
-  await bookkeeping($, () => $.store.set('paceWarned', w.resetsAt!), undefined, retryFor(session, 'pace write'))
+  await bookkeeping($, () => $.store.set('paceWarned', resetsAt), undefined, retryFor(session, 'pace write'))
 }
 
 function pendingText(lang: Lang, now: number): string {
@@ -671,7 +707,7 @@ function cancelCompact($: EngineInterface) {
 
 // A hook and every callback it starts keep the originating session, including across /clear and resume.
 // The id alone is not enough: an ended session can be resumed again in this process.
-type Load = { done: boolean; pending?: Promise<void>; retry: Backoff }
+type Load = { done: boolean; pending?: Promise<void>; retry: Backoff; at?: number }
 type Session = { id: string; stateId: string; ended: boolean; history: Load; daily: Load; prefs: Load; retries: Map<string, Backoff>; today?: Tally }
 let activeSession: Session | undefined
 // Host state survives hot reload; a new module must never select an earlier activation's members.
@@ -853,7 +889,7 @@ async function prune($: EngineInterface, now: number) {
   if (prunedDay !== day) await bookkeeping($, async () => {
     const oldest = oldestDay(now)
     for (const key of await $.store.keys()) {
-      const day = /^(?:meter|counts):(\d{8}):/.exec(key)?.[1]
+      const day = /^(?:meter|counts|corrections):(\d{8}):/.exec(key)?.[1]
       if (day !== undefined && day < oldest) await $.store.delete(key)
     }
     prunedDay = day
@@ -1110,13 +1146,15 @@ function rememberSnippet(turnId: string, prompt: string) {
 }
 
 // Writes one correction (newest last, capped, a repeated text replaced) and counts it by source. False when the store
-// could not be written; nothing is claimed then.
+// could not be written; nothing is claimed then. Like the meter, each session writes only its own daily key, so two
+// open windows never overwrite each other's corrections, and the 30-day prune removes old days.
 async function recordCorrection($: EngineInterface, session: Session, c: Correction, counted = true): Promise<boolean> {
   let ok = false
   await serial($, session, 'corrections', async () => {
-    const next = addCorrection(readCorrections(await $.store.get('corrections')), c)
+    const key = `corrections:${dayKey(c.at)}:${session.id}`
+    const next = addCorrection(readCorrections(await $.store.get(key)), c)
     if (await stillHere($, session) !== 'same') return
-    await $.store.set('corrections', next)
+    await $.store.set(key, next)
     ok = true
   })
   if (ok && counted) {
@@ -1267,6 +1305,7 @@ async function historyCommand($: EngineInterface, session: Session, lang: Lang):
 // The band's Details button: the choice is remembered across sessions.
 async function toggleDetails($: EngineInterface, session: Session) {
   bandExpanded = !bandExpanded
+  prefsChanges++
   weekCache = undefined
   redraw($)
   await bookkeeping($, () => $.store.set('bandExpanded', bandExpanded), undefined, retryFor(session, 'band write'))
@@ -1345,6 +1384,7 @@ async function pacingCommand($: EngineInterface, session: Session, lang: Lang, a
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   // Takes effect at once; the store write is what makes it last across sessions.
   pacingOverride = value === 'default' ? undefined : value as PaceMode
+  prefsChanges++
   let saved = false
   await bookkeeping($, async () => { await (value === 'default' ? $.store.delete('pacing') : $.store.set('pacing', value)); saved = true }, undefined, retryFor(session, 'pacing write'))
   const now = await $.clock.now()
@@ -1355,15 +1395,34 @@ async function pacingCommand($: EngineInterface, session: Session, lang: Lang, a
   return (value === 'default' ? str.pacingDefault(pacingMode()) : str.pacingSet(value)) + (saved ? '' : ` ${str.pacingNotSaved}`)
 }
 
+// The legacy shared key and every session's daily keys.
+const isCorrectionsKey = (key: string) => key === 'corrections' || /^corrections:\d{8}:/.test(key)
+
+// Every stored correction, merged across sessions and the legacy key: oldest first, the newest MAX_CORRECTIONS.
+async function allCorrections($: EngineInterface): Promise<Correction[]> {
+  const all: Correction[] = []
+  for (const key of await $.store.keys()) {
+    if (isCorrectionsKey(key)) all.push(...readCorrections(await $.store.get(key)))
+  }
+  return all.sort((a, b) => a.at - b.at).slice(-MAX_CORRECTIONS)
+}
+
 async function correctionsCommand($: EngineInterface, session: Session, lang: Lang, arg: string): Promise<string> {
   const str = STR[lang]
   if (/^corrections\s+clear$/.test(arg)) {
+    // In the corrections write queue: a correction already being written lands first and is deleted with the rest,
+    // rather than writing the old list back after the clear. Cleared is claimed only when every key is gone.
     let deleted = false
-    await bookkeeping($, async () => { await $.store.delete('corrections'); deleted = true }, undefined, retryFor(session, 'corrections write'))
+    await serial($, session, 'corrections', async () => {
+      for (const key of await $.store.keys()) {
+        if (isCorrectionsKey(key)) await $.store.delete(key)
+      }
+      deleted = true
+    })
     return deleted ? str.correctionsCleared : str.correctionsClearFailed
   }
   if (arg !== 'corrections') return str.usage
-  const list = readCorrections(await bookkeeping($, () => $.store.get('corrections'), undefined, retryFor(session, 'corrections read')))
+  const list = await bookkeeping($, () => allCorrections($), [] as Correction[], retryFor(session, 'corrections read'))
   const off = learning ? '' : ` ${str.learnedOff}`
   if (list.length === 0) return `${str.correctionsNone}${off}`
   return [`${str.corrections}${off}:`,

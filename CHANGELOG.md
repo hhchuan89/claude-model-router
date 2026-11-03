@@ -48,6 +48,10 @@ routes and prompts exactly as 1.0.1 does.
   and Haiku 5.5 requests with a prompt over 100,000 tokens (input, cache reads and cache writes together) are priced at
   $0.50 / $2.50 / $0.05 / $1. Each request is priced on its own size, in the meter, the baseline, the cold-resume and
   abandoned-cache estimates, checkpoint hints and the warm-cache keep decision. Spend already recorded keeps the old figures.
+- Several open windows: each session stores its corrections under its own daily key (pruned after 30 days) so no window
+  overwrites another's, `corrections clear` runs in the write queue and deletes every key, preferences are read again
+  once a minute so `/model-router pacing` in one window reaches the others, and the pace toast checks the store first so
+  two windows do not both toast for one weekly window.
 
 ## [1.0.1] - 2026-10-31
 
