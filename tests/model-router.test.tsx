@@ -238,6 +238,13 @@ function world(
   return seen
 }
 
+// Every stored correction, from the legacy key and each session's daily keys, oldest first; undefined when none is stored.
+function storedCorrections(seen: Seen): Correction[] | undefined {
+  const keys = Object.keys(seen.store).filter(k => k === 'corrections' || /^corrections:\d{8}:/.test(k))
+  if (keys.length === 0) return undefined
+  return keys.flatMap(k => seen.store[k] as Correction[]).sort((a, b) => a.at - b.at)
+}
+
 async function step($: any, turnId: string, model = 'claude-opus-5-5[1m]', agentId?: string, effort = 'high') {
   const s = $.turn.step({ turnId, index: 0, model, effort, messageCount: 3, agentId } as never)
   for await (const _ of s) {
@@ -6701,7 +6708,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.prompt.submit({ text: `rename the helper  key sk-ant-api03-${'z'.repeat(30)}` } as never)
       await $.turn.complete(completion('t1'))
       expect(await cmd($, 'wrong decide')).toContain('was routed lookup and should have been decide')
-      const stored = seen.store.corrections as Correction[]
+      const stored = storedCorrections(seen)!
       expect(stored).toHaveLength(1)
       expect(stored[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
       expect(stored[0]!.text).toContain('rename the helper')
@@ -6763,7 +6770,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.turn.complete(completion('t3'))
       expect(await cmd($, 'wrong lookup')).toContain('already routed lookup')
       expect(await cmd($, 'wrong')).toContain('Usage:')
-      expect(seen.store.corrections).toBeUndefined()
+      expect(storedCorrections(seen)).toBeUndefined()
     })
 
     test('wrong says learning is off and records nothing', { options: { learnFromCorrections: false } }, async ($, on) => {
@@ -6771,7 +6778,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.prompt.submit({ text: 'find files' } as never)
       await $.turn.complete(completion('t1'))
       expect(await cmd($, 'wrong decide')).toContain('learnFromCorrections')
-      expect(seen.store.corrections).toBeUndefined()
+      expect(storedCorrections(seen)).toBeUndefined()
       // Nothing is pinned either: the next turn is classified as usual.
       await $.prompt.submit({ text: 'find more files' } as never)
       expect(seen.asked).toEqual(['haiku', 'haiku'])
@@ -6782,10 +6789,10 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       const seen = world($, on, LOOKUP)
       await $.prompt.submit({ text: 'look at the auth flow' } as never)
       await $.tool.call({ tool: 'mcp__model-router__escalate', effort: 'high', reason: 'harder' } as never)
-      expect(seen.store.corrections).toBeUndefined()
+      expect(storedCorrections(seen)).toBeUndefined()
       await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'needs code' } as never)
       await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'a design call' } as never)
-      const stored = seen.store.corrections as Correction[]
+      const stored = storedCorrections(seen)!
       expect(stored).toHaveLength(1)
       // The highest model reached is what the entry says, still one entry and one count.
       expect(stored[0]).toMatchObject({ routed: 'lookup', right: 'decide', source: 'escalate' })
@@ -6798,7 +6805,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.prompt.submit({ text: 'look at the auth flow' } as never)
       await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'a design call' } as never)
       await $.turn.complete(completion('t1'))
-      expect(seen.store.corrections as Correction[]).toHaveLength(1)
+      expect(storedCorrections(seen)!).toHaveLength(1)
       const band = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
       expect(await band.find({ text: /📌/ })).toBeUndefined()
       await band.unmount()
@@ -6813,21 +6820,21 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       const seen = world($, on, LOOKUP)
       await $.prompt.submit({ text: 'quick look #haiku' } as never)
       await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)
-      expect(seen.store.corrections).toBeUndefined()
+      expect(storedCorrections(seen)).toBeUndefined()
     })
 
     test('an escalation with learning off writes nothing', { options: { learnFromCorrections: false } }, async ($, on) => {
       const seen = world($, on, LOOKUP)
       await $.prompt.submit({ text: 'look at the auth flow' } as never)
       await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)
-      expect(seen.store.corrections).toBeUndefined()
+      expect(storedCorrections(seen)).toBeUndefined()
     })
 
     test('corrections lists them and clear deletes the key', async ($, on) => {
       const seen = world($, on, LOOKUP, { store: seeded('rename the helper') })
       expect(await cmd($, 'corrections')).toMatch(/1\. "rename the helper" lookup → decide · manual · \d{4}-\d{2}-\d{2}/)
       expect(await cmd($, 'corrections clear')).toBe('Corrections cleared.')
-      expect(seen.store.corrections).toBeUndefined()
+      expect(storedCorrections(seen)).toBeUndefined()
       expect(await cmd($, 'corrections')).toBe('No corrections recorded.')
     })
   })
@@ -7642,7 +7649,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         expect(await band.find({ type: 'Text', text: /^Wrong model for the last reply\? Should have been:$/ })).toBeDefined()
         expect((await band.findAll({ type: 'Button' } as never)).map((b: any) => b.text)).toEqual(['Hide details', 'Pause router', 'Sonnet', 'Opus'])
         await pressLabel(band, 'Sonnet')
-        expect((seen.store.corrections as Correction[]).at(-1)).toMatchObject({ routed: 'lookup', right: 'execute', source: 'manual' })
+        expect(storedCorrections(seen)!.at(-1)).toMatchObject({ routed: 'lookup', right: 'execute', source: 'manual' })
         await band.unmount()
       })
 
@@ -7650,7 +7657,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
         const seen = world($, on, LOOKUP)
         const band = await classifiedLookup($)
         await pressLabel(band, 'Opus')
-        expect((seen.store.corrections as Correction[]).at(-1)).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
+        expect(storedCorrections(seen)!.at(-1)).toMatchObject({ routed: 'lookup', right: 'decide', source: 'manual' })
         expect(await band.find({ type: 'Text', text: /^Thanks — the rest of this session stays on Opus\. \/model-router unpin to undo\.$/ })).toBeDefined()
         expect(await band.find({ text: /📌 Opus.*pinned until you unpin/ })).toBeDefined()
         expect(await band.find({ key: 'wrong-decide' })).toBeUndefined()
@@ -7690,7 +7697,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'a design call' } as never)
       await $.turn.complete(completion('t1'))
       expect(await cmd($, 'wrong decide')).toContain('No classified turn')
-      expect(seen.store.corrections).toBeUndefined()
+      expect(storedCorrections(seen)).toBeUndefined()
     })
   })
 
@@ -7721,7 +7728,7 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await $.turn.complete(completion('t3'))
       band = await openBand($)
       await band.press({ key: 'wrong-decide' })
-      const stored = seen.store.corrections as Correction[]
+      const stored = storedCorrections(seen)!
       expect(stored).toHaveLength(1)
       expect(stored[0]!.text).toBe('list the files')
       await band.unmount()
@@ -7797,6 +7804,133 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(await band.findAll({ type: 'Text', text: /raised to Sonnet/ })).toHaveLength(1)
       expect(await band.findAll({ type: 'Text', text: /kept on/ })).toHaveLength(0)
       await band.unmount()
+    })
+  })
+
+  // Every open window shares one store; serial() orders writes only inside one process.
+  describe('store shared between open windows (1.1.0 review)', () => {
+    // A store the test owns. afterRead runs after a get has read its value and before it answers: another process (or
+    // a held write) acting between this process's read and its write.
+    function shared(on: any, data: Record<string, unknown>, afterRead?: (key: string) => Promise<void> | void) {
+      on('store.get', {}, async (_$: unknown, e: { key: string }) => {
+        const value = data[e.key]
+        await afterRead?.(e.key)
+        return { value }
+      })
+      on('store.set', {}, async (_$: unknown, e: { key: string; value: unknown }) => {
+        data[e.key] = e.value
+        return { value: undefined }
+      })
+      on('store.keys', {}, async () => ({ value: Object.keys(data) }))
+      on('store.delete', {}, async (_$: unknown, e: { key: string }) => {
+        delete data[e.key]
+        return { value: undefined }
+      })
+    }
+    const correctionKeys = (data: Record<string, unknown>) => Object.keys(data).filter(k => k.startsWith('corrections'))
+    const tick = () => new Promise(resolve => (globalThis as any).setTimeout(resolve, 20))
+
+    // WHY: "Corrections cleared" is a privacy claim. A correction already being written read the list before the clear;
+    // if the clear runs outside the write queue, that write puts the old list back after the person was told it is gone.
+    test('a clear issued while a correction is being written leaves nothing from before the clear', async ($, on) => {
+      const data: Record<string, unknown> = {}
+      let holding = false
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      let reached!: () => void
+      const atGate = new Promise<void>(resolve => { reached = resolve })
+      shared(on, data, async key => {
+        if (!holding || !key.startsWith('corrections')) return
+        holding = false
+        reached()
+        await gate
+      })
+      world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('should have been decide')
+      expect(await cmd($, 'unpin')).toBe('Unpinned.')
+      await $.prompt.submit({ text: 'find the config file' } as never)
+      await $.turn.complete(completion('t2'))
+      holding = true
+      const writing = cmd($, 'wrong execute')
+      await atGate
+      const clearing = cmd($, 'corrections clear')
+      // A clear outside the write queue finishes here, while the write still holds the old list.
+      await tick()
+      release()
+      expect(await writing).toContain('should have been execute')
+      expect(await clearing).toBe('Corrections cleared.')
+      expect(correctionKeys(data)).toEqual([])
+      expect(await cmd($, 'corrections')).toBe('No corrections recorded.')
+    })
+
+    // WHY: two windows each read-modify-writing one shared key lose whichever wrote first. Each session writes only its
+    // own key, the listing merges them, and clear has to find every one of them.
+    test('two sessions recording at once both keep their corrections, the listing merges them in time order, and clear removes every key', async ($, on) => {
+      const data: Record<string, unknown> = { corrections: [{ at: 1, text: 'an old correction', routed: 'lookup', right: 'decide', source: 'manual' }] }
+      let other = true
+      shared(on, data, key => {
+        if (!other || !key.startsWith('corrections')) return
+        other = false
+        // The other window records its own correction between this one's read and its write, through the same code:
+        // the key it writes is this one's with its own session id (the same key, when the key is shared).
+        const theirs = key.replace('sess-1', 'sess-2')
+        data[theirs] = [...readCorrections(data[theirs]), { at: 5_000, text: 'their prompt', routed: 'lookup', right: 'execute', source: 'manual' }]
+      })
+      const seen = world($, on, LOOKUP)
+      await seen.clock.advance(10_000)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('should have been decide')
+      expect(other).toBe(false)
+      const list = (await cmd($, 'corrections')).split('\n')
+      expect(list.slice(1).map(line => /"([^"]+)"/.exec(line)?.[1])).toEqual(['an old correction', 'their prompt', 'rename the helper'])
+      expect(correctionKeys(data).length).toBeGreaterThanOrEqual(3)
+      expect(await cmd($, 'corrections clear')).toBe('Corrections cleared.')
+      expect(correctionKeys(data)).toEqual([])
+    })
+
+    test('per-session correction keys go with the 30-day prune; the legacy key stays until clear', async ($, on) => {
+      const old = { at: 1, text: 'from long ago', routed: 'lookup', right: 'decide', source: 'manual' }
+      const data: Record<string, unknown> = { corrections: [old], 'corrections:19700101:sess-9': [old] }
+      shared(on, data)
+      const seen = world($, on, LOOKUP)
+      await seen.clock.advance(40 * DAY)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong decide')).toContain('should have been decide')
+      expect(data['corrections:19700101:sess-9']).toBeUndefined()
+      expect(data.corrections).toEqual([old])
+      expect(correctionKeys(data)).toHaveLength(2)
+    })
+
+    // WHY: /model-router pacing off in one window has to reach the windows already open, without a store read per hook.
+    test('a pacing change made in another window reaches a running session after a minute, not before', async ($, on) => {
+      let theirs: unknown
+      on('store.get', { key: 'pacing' }, async (_$: unknown, e: any, next: any) => theirs !== undefined ? { value: theirs } : next(e))
+      const seen = world($, on, LOOKUP)
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: warn (option)')
+      theirs = 'off'
+      await seen.clock.advance(59_000)
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: warn (option)')
+      await seen.clock.advance(2_000)
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: off (override)')
+    })
+
+    // WHY: two open windows must not both toast for the same weekly window.
+    test('a weekly window another window already toasted for does not toast here', async ($, on) => {
+      let theirs: unknown
+      on('store.get', { key: 'paceWarned' }, async (_$: unknown, e: any, next: any) => theirs !== undefined ? { value: theirs } : next(e))
+      const seen = world($, on, LOOKUP)
+      const c = ui($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      expect(await cmd($, 'pacing')).toContain('Weekly pacing: warn (option)')
+      // The mock clock starts at 0, so `weekly` puts the reset 3.5 days in: the other window warned about this one.
+      theirs = new Date(3.5 * DAY).toISOString()
+      await weekly($, seen, 80)
+      expect(seen.statuses.at(-1)).toContain('pace 1.6× ahead')
+      expect(c.toasts).toEqual([])
     })
   })
 })

@@ -316,10 +316,12 @@ own effort. `stats` covers routed subagents only.
 - **Nothing else is collected.** No telemetry and no analytics. The router makes no network call of its own: the only
   traffic is the Anthropic API calls Claude Code makes, now including the router's Haiku calls. The meter totals and
   the events log are written to local files only.
-- **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store up to 40
+- **Corrections (on by default).** `/model-router wrong`, the band's buttons and a model-raising escalation store
   masked, whitespace-collapsed 200-character prompt snippets locally in the plugin store, as an offline evaluation set.
-  They are never sent anywhere, including the classifier. Turn `learnFromCorrections` off to stop recording, and run
-  `/model-router corrections clear` to delete what is stored. The band and history keep no prompt text.
+  Like the meter, each session keeps its own list per day (`corrections:<day>:<session>`, up to 40 each), deleted after
+  30 days; `/model-router corrections` shows the newest 40 across all of them. They are never sent anywhere, including
+  the classifier. Turn `learnFromCorrections` off to stop recording, and run `/model-router corrections clear` to delete
+  every list, including the single `corrections` list earlier builds kept. The band and history keep no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
   also sends a one-word probe to check the model exists. With `reviewModel` empty, none of this happens.
