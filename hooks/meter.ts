@@ -158,7 +158,7 @@ export function fmtUsd(n: number): string {
   return `$${n.toFixed(2)}`
 }
 
-const RANK: Record<ModelKey, number> = { haiku: 0, sonnet: 1, opus: 2 }
+export const RANK: Record<ModelKey, number> = { haiku: 0, sonnet: 1, opus: 2 }
 
 export type LastRequest = { model: ModelKey; at: number; context: number }
 export type Shape = { steps: number; output: number }

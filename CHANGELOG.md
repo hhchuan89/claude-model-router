@@ -86,7 +86,7 @@ routes and prompts exactly as 1.0.1 does.
   shows `📌` before the model.
 - Routing corrections: `/model-router wrong <tier>` or the band's buttons pin the main conversation to that tier's model
   for the rest of the session (the same pin as `/model-router pin <model>`, undone with `/model-router unpin`) and store
-  the masked prompt snippet (up to 40, 200 characters each); the model escalating itself above the classified tier's
+  the masked prompt snippet (up to 40 per session per day, kept 30 days, 200 characters each); the model escalating itself above the classified tier's
   model is stored too but never pins. Corrections are an evaluation dataset for revising the classifier prompt offline
   and are never sent to the classifier: as few-shot examples they lowered accuracy on 102 labelled prompts (69.6% to
   65.7%) and ratcheted routing upward. `/model-router corrections [clear]` lists or deletes them; stats count them.
@@ -111,8 +111,22 @@ routes and prompts exactly as 1.0.1 does.
   abandoned-cache estimates, checkpoint hints and the warm-cache keep decision. Spend already recorded keeps the old figures.
 - Several open windows: each session stores its corrections under its own daily key (pruned after 30 days) so no window
   overwrites another's, `corrections clear` runs in the write queue and deletes every key, preferences are read again
-  once a minute so `/model-router pacing` in one window reaches the others, and the pace toast checks the store first so
-  two windows do not both toast for one weekly window.
+  once a minute so `/model-router pacing` in one window reaches the others, and the pace toast checks the store first,
+  which narrows the time in which two windows can both toast for one weekly window but does not close it.
+- The band asks `Wrong model for the last reply?` only when the newest reply shown was classified (it used to offer the
+  buttons for an older turn), and leaves out the model the reply actually ran on, not the classified tier's.
+- A pacing override or pace-toast record that could not be saved is no longer put back by the minute refresh.
+- Details stays open or closed as this window left it; only a new session takes the saved choice.
+- `corrections clear` lists the keys again after deleting and says when another window kept writing, instead of
+  claiming everything was cleared.
+- The band's thank-you line goes when its pin is removed or replaced.
+- A correction made while the router is paused says the pin applies once it is on.
+- A correction to a smaller model on a conversation of 100k tokens or more says what the switch re-reads.
+- `/model-router history` with an unreadable store lists the replies and says the total is unavailable, not that the
+  session changed.
+- Details' three token totals come from one reading, so the last 7 days is never below today.
+- No `vs all-Opus` comparison under a cent, and the expiring-cache line gives the full re-read cost instead of calling it
+  extra.
 
 ## [1.0.1] - 2026-10-31
 
