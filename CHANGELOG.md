@@ -22,6 +22,11 @@ unexplained root causes and reviews still go to Opus.
 - The assignment text for Haiku and Sonnet no longer says that anything irreversible must be decided on Opus. It says
   that a settled irreversible or outward-facing action needs care instead (confirm what it will affect, follow the
   project's confirmation rules) and escalation only when what to do is not settled. The Opus text is unchanged.
+- An unsure lookup now goes to execute even when the previous turn was a lookup (before, only a first turn was raised).
+
+Measured (replay of 250 labelled messages, 144 of them not used to write the prompt, 2 runs each, scored against two
+agreeing AI judges): accuracy 66% → 74–76%, over-routing 28–29% → 13–18%, cost proxy −9 to −11%, but under-routing
+5% → 9–10% (mostly decisions phrased as instructions with a question in them). Exact McNemar p = 0.002–0.024.
 
 ### Added
 
