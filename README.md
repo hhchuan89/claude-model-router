@@ -66,16 +66,24 @@ shortcuts.
    `unparseable` reply is logged with its first 120 characters (single line, masked) so the cause can be read in the
    events log; a reply cut off after the tier still parses, as an unsure verdict. In earlier versions a failure ran on Sonnet, and 24% of those turns later escalated to Opus (6% of classified turns did).
    `#haiku`, `#sonnet` or `#opus` in a message pins the model.
-   **A risky action never runs on Haiku (the risk floor).** A tier measures how much judgement the work needs, not how
-   dangerous it is. Plain code (no model call) checks the masked message for an instruction to push, merge, deploy,
-   release, delete, drop a table, force, touch production, open, merge or decline a PR, cherry-pick onto a shared
-   branch, message people (Slack, Jira, email, a reply or comment) or move money, in English and in Simplified and
-   Traditional Chinese (推送 / 合并 / 合併 / 部署 / 上线 / 上線 / 删除 / 刪除 / 发送 / 發送 / 回复 / 回覆 / 付款 …). A
-   question about such a word ("what does git push do?"), a report that it is done ("merged", "已经推送了") and a
-   negation ("don't push yet") do not count. When it fires on a lookup, the turn runs on Sonnet at Sonnet's effort and
-   the reason ends "· risky action: at least Sonnet"; execute and decide are left as they are. It applies to classified
-   main turns, to a failed classification that keeps a lookup tier, and to `general-purpose` subagents;
-   `/model-router stats` counts it. A `#model` or a pin still wins.
+   **A risky instruction does not start on Haiku (the risk floor).** A tier measures how much judgement the work needs,
+   not how dangerous it is. Plain code (no model call) checks the masked message for an instruction to push, merge,
+   deploy, release, delete, drop or alter a table, write to a database (UPDATE … SET, INSERT INTO, DELETE FROM, EXEC of
+   a procedure), force, act on production, open, merge or decline a PR, cherry-pick onto a shared branch, run
+   `terraform apply` / `destroy`, `npm publish`, `git clean -f`, `git branch -D`, `docker rm` / `prune` or `aws s3 rm`,
+   ship or send something, message people (Slack, Jira, email, a `#channel`, a reply or comment) or move money, in
+   English and in Simplified and Traditional Chinese (推送 / 合并 / 合併 / 部署 / 上线 / 上線 / 发版 / 上传 / 删除 /
+   刪除 / 发送 / 發送 / 付款 …). It reads each sentence part by part (at and / then / 然后 / 再 / 之后), so "explain the
+   change and push it" counts. A question about such a word ("what does git push do?", "部署文档在哪里"), a report that
+   it is done ("merged", "已经推送了"), a negation just before the verb ("don't push yet", "不要推送") and a noun use
+   ("the prod logs", "the merge conflicts", "这个 PR 的评论") do not count. When it fires on a sure lookup, the turn runs
+   on Sonnet at Sonnet's effort and the reason ends "· risky action: at least Sonnet"; execute and decide are left as
+   they are, and an unsure lookup goes to Sonnet anyway. It applies to classified main turns, to a failed
+   classification that keeps a lookup tier, and to `general-purpose` subagents; `/model-router stats` counts it.
+   **The floor only sees the message.** It does not cover a confirmation ("yes" to "push it?"), a prompt typed into a
+   running turn, a turn without a person prompt that inherits a route, a subagent clamped to a Haiku parent, a
+   `#haiku` or a Haiku pin, or wording it does not know. For those the backstop is the Haiku assignment text (see 2):
+   any irreversible or outward-facing action needs at least Sonnet, so Haiku escalates before any tool.
    **The classifier is skipped when it could not change the outcome.** If the last main request was Opus, is within the
    cache TTL and had a context of 50,000 tokens or more (see the round-trip guard, 4), the turn stays on Opus whatever
    the tier, so the prompt goes straight to Opus at the decide effort ("warm large context: classifier skipped") with no
@@ -84,7 +92,10 @@ shortcuts.
    *before* doing any work. Decisions (design, trade-offs, plans, unexplained root causes, reviews) belong on Opus. An
    irreversible or outward-facing action you asked for and already settled (a push, merge, PR, deploy or a message whose
    content is given) does not need Opus; the assignment asks for care instead: confirm what it will affect, follow the
-   project's confirmation rules, and escalate only if what to do is not settled. If the task does not fit, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
+   project's confirmation rules, and escalate only if what to do is not settled. Haiku's assignment says more: any
+   irreversible or outward-facing action (a push, merge, PR, deploy, delete, a message to people, production data)
+   needs at least Sonnet, even when you asked for it or just approved it, so Haiku calls `escalate` to Sonnet before any
+   tool. If the task does not fit, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
    effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. A move to a higher model lands at that
    tier's effort in the table (Sonnet medium, Opus medium) unless a higher effort is asked. Escalation only goes up within a turn.
    Effort-only escalation (same model, more effort) exists for the main thread and for subagents alike (a subagent's own effort is capped, see 6).
@@ -444,15 +455,17 @@ claude plugin test .
 **Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`
 (default `both`, once) reads a JSON array of `{ "id", "message", "context", "previous" }` (`previous` is a tier or
 `null`; at most 500 items), sends each message to Haiku exactly as a live classification would (same model, effort,
-limits, masking and 6,000-character cut), and writes `<path without .json>.replay.json` with one row per item, variant
+limits, masking and 6,000-character cut; `context` written as `[role] text` blocks separated by a blank line, each block
+trimmed like a live one: over 1,200 characters, its first 200 and last 1,000), and writes `<path without .json>.replay.json` with one row per item, variant
 and run: `id`, `variant` (`current` is the 1.2 prompt, `legacy` the 1.1 prompt kept in `hooks/replay.ts`), `run`, the
 masked start of the reply, `tier` and `sure` as the classifier gave them (both variants are parsed the same way, so the
 unsure rule can be applied to either), `risk` (what the code's risk floor check says about the message; the tier is
 recorded before the floor), `ms` (how long the call took) and `why` when there was no usable reply. `--repeat` runs
-each variant up to 3 times, to measure run-to-run noise. The corrections block is not used, so the base prompt is what
-is measured. At most 4 requests run at once, and after a timeout no new request starts for 3 seconds. It refuses while
-a turn is running and changes no routing state, count, correction or band: only the Haiku spend is added to the meter.
-It is not listed in the command's usage text.
+each variant up to 3 times, to measure run-to-run noise. At most 4 requests run at once, and after a timeout no new
+request starts for 3 seconds. It refuses to start while a turn is running and changes no routing state, count,
+correction or turn record. Its Haiku spend is added to today's and the total figures, never to a turn. It runs beside
+live turns: a turn you start during a replay works normally, but its classification shares the API with up to 4 replay
+calls and can be slower. It is not listed in the command's usage text.
 
 ## Contributors
 

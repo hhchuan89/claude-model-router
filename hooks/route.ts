@@ -155,12 +155,16 @@ export function withSuffixOf(id: string, current: string): string {
   return id.endsWith(suffix) ? id : `${id}${suffix}`
 }
 
+const SONNET_RISK = `An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus, but care: confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled.`
+// The backstop for what the code risk floor cannot see, such as a "yes" to "push it?": Haiku never carries one out.
+const HAIKU_RISK = `Any irreversible or outward-facing action (a push, merge, PR, deploy, delete, a message to people, or a change to production data) needs at least sonnet, even when the user asked for it or has just approved it: call mcp__model-router__escalate with model sonnet FIRST, before any tool. Once on sonnet it does not need opus if what to do is settled; confirm what it will affect and follow the project's confirmation rules.`
+
 export function assignmentContext(r: Route): string {
   const head = `[model-router] This turn is assigned to ${r.model} at ${r.effort} effort (tier: ${r.tier}${r.reason ? ` — ${r.reason}` : ''}).`
   const opus =
     r.model === 'opus'
       ? `You are on opus at ${r.effort} effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed. If it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work. Once the plan is settled, if carrying it out spans several files or many steps, delegate it to a general-purpose subagent without a model (the router puts settled work on sonnet) with the plan, the paths and the checks to run, then verify the result yourself; make small changes directly.`
-      : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews) must be made on opus. If the task needs one, is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus, but care: confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled. If it fits, just start.`
+      : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews) must be made on opus. If the task needs one, is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. ${r.model === 'haiku' ? HAIKU_RISK : SONNET_RISK} If it fits, just start.`
   return `${head}\n${opus}\nEscalation only goes up within a turn; never call it to go down.`
 }
 

@@ -7,7 +7,7 @@ All notable changes to this project are documented here. The format follows
 
 1.2.0 changes what an irreversible or outward-facing request costs. **Policy change:** an action you asked for and
 already settled (a push, merge, PR, deploy or a message whose content is given) is now execute work on Sonnet, not a
-decision for Opus; risk only guarantees that such an action never runs on Haiku. Design, trade-offs, plans,
+decision for Opus; risk only keeps such an action off Haiku. Design, trade-offs, plans,
 unexplained root causes and reviews still go to Opus.
 
 ### Changed
@@ -19,9 +19,12 @@ unexplained root causes and reviews still go to Opus.
   asks for something new, and a message that is only an image or an attachment. The separate "implement it / add it to
   the PR" rule is gone (the execute definition covers it). The reply is still `{"tier","sure","reason"}`, with
   "when unsure, pick the higher tier" and the `sure` rule; the model is not asked about risk.
-- The assignment text for Haiku and Sonnet no longer says that anything irreversible must be decided on Opus. It says
-  that a settled irreversible or outward-facing action needs care instead (confirm what it will affect, follow the
-  project's confirmation rules) and escalation only when what to do is not settled. The Opus text is unchanged.
+- The assignment text for Haiku and Sonnet no longer says that anything irreversible must be decided on Opus. Sonnet's
+  says that a settled irreversible or outward-facing action needs care instead (confirm what it will affect, follow the
+  project's confirmation rules) and escalation only when what to do is not settled. Haiku's says that any irreversible
+  or outward-facing action (a push, merge, PR, deploy, delete, a message to people, production data) needs at least
+  Sonnet, even when the user asked for it or just approved it, so Haiku escalates to Sonnet before any tool: the backstop
+  for what the code risk floor cannot see, such as a "yes" to "push it?". The Opus text is unchanged.
 - An unsure lookup now goes to execute even when the previous turn was a lookup (before, only a first turn was raised).
 
 Measured (replay of 250 labelled messages, 144 of them not used to write the prompt, 2 runs each, scored against two
@@ -33,17 +36,30 @@ agreeing AI judges): accuracy 66% → 74–76%, over-routing 28–29% → 13–1
 - Risk floor, in code: a multilingual keyword check (English, Simplified and Traditional Chinese) over the masked
   message finds instructions to push, merge, deploy, release, delete, drop a table, force, touch production, open, merge
   or decline a PR, cherry-pick onto a shared branch, message people (Slack, Jira, email, a reply or comment) or move
-  money. Questions about these words, reports that they are done, and negations do not count. A lookup it fires on
-  becomes execute (Sonnet at Sonnet's effort), with "· risky action: at least Sonnet" (or "· 风险操作：至少用 Sonnet")
+  money. Questions about these words, reports that they are done, and negations do not count. A sure lookup it fires
+  on becomes execute (Sonnet at Sonnet's effort), with "· risky action: at least Sonnet" (or "· 风险操作：至少用 Sonnet")
   on the reason; execute and decide are never changed, and no effort changes. It covers classified main turns, a failed
   classification that keeps a lookup tier, and `general-purpose` subagents. `/model-router stats` counts it ("Risky
-  actions raised from lookup to Sonnet").
+  actions raised from lookup to Sonnet"), only when it changed the route (an unsure lookup goes to Sonnet anyway). It
+  does not see a confirmation such as "yes", a prompt typed into a running turn, an inherited route, a subagent clamped
+  to a Haiku parent, `#haiku` or a pin; the Haiku assignment text covers those.
+  Detector review fixes before release: sentences are read part by part (at and / then / 然后 / 再 / 之后), so "when CI
+  passes merge it" and "explain the change and push it" count; a negation or 已 / 刚 counts only just before the verb
+  (分别 / 特别 / 区别 / 级别, 刚说的 and 刚才 no longer cancel it), and an English report only by the same verb in the past
+  tense; question words count only in a question (哪 / 哪里 / 几 added), and "could you" no longer makes "could you tell
+  me what git push does?" a request; `re-` before push, merge and deploy; noun uses ("the prod logs", "open PR 431",
+  "git log --merges", "the deploy log", "这个 PR 的评论", "请简短回复") no longer count. New patterns: SQL writes
+  (UPDATE … SET, INSERT INTO, DELETE FROM, ALTER / DROP / TRUNCATE TABLE, EXEC of a procedure), `terraform apply` /
+  `destroy`, `npm publish`, `git clean -f`, `git branch -D`, `docker system prune` / `rm`, `aws s3 rm`, "ship it",
+  "send it", "post it in #channel", "slack him", 推吧, 发版 / 發版, 上传 / 上傳. On the reviewer's 74-message probe it
+  went from 23 to 68 correct.
 - `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`, a maintainer tool not listed in the usage text:
   it runs the real classifier call over a JSON file of up to 500 labelled messages with the 1.2 prompt, the 1.1 prompt
   (kept word for word in `hooks/replay.ts`) or both, each up to 3 times, and writes `<path>.replay.json`. Each row holds
   the run, the tier and `sure` (both prompts parsed the same way), the code risk check of the message and the call's
-  time in ms. At most 4 calls run at once, and after a timeout no new call starts for 3 seconds. It changes no routing
-  state; only its Haiku spend is added to the meter.
+  time in ms. At most 4 calls run at once, and after a timeout no new call starts for 3 seconds. A context is trimmed
+  per message as a live one is. It changes no routing state; its Haiku spend is added to the day and the total, never
+  to a turn. It runs beside live turns, so a classification started during a replay can be slower.
 
 ### Not shipped
 
@@ -51,7 +67,7 @@ agreeing AI judges): accuracy 66% → 74–76%, over-routing 28–29% → 13–1
   bars, a model-scored risk guard, corrections chosen by similarity, and `/model-router tune` with stored calibration
   records. A replay on 102 labelled prompts showed none of it beating the 1.1.0 classifier: the probabilities were not
   calibrated, the examples lowered accuracy and the guard added nothing. It was removed before release; corrections
-  stay as in 1.1.0 (up to 40 stored, the newest 8 sent).
+  stay as in 1.1.0 (up to 40 stored, never sent to the classifier).
 
 ## [1.1.0] - 2026-11-02
 

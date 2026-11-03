@@ -7984,8 +7984,107 @@ describe('risk detector (1.2.0)', () => {
   })
 })
 
+describe('risk detector review fixes (1.2.0)', () => {
+  const all = (want: boolean, list: string[]) => {
+    for (const t of list) expect([t, isRisky(t)]).toEqual([t, want])
+  }
+
+  // WHY: 别 inside 分别 / 特别 / 区别 / 级别 is not "do not"; reading it as one let a plain instruction to push run on Haiku.
+  test('a word that only contains 别 does not negate the verb after it', async () => {
+    all(true, ['分别推送到 develop 和 staging', '分别部署到 UAT 和 STG', '特别部署到 UAT', '区别对待，分别合并', '級別高的先部署'])
+    all(false, ['别推送', '別部署', '别再部署了', '不要再推送'])
+  })
+
+  // WHY: a negation or a report qualifies the verb right after it; reaching further back cancelled a different verb.
+  test('a negation or a done marker counts only directly before the verb it qualifies', async () => {
+    all(true, ['不用确认直接推送', '不用確認，直接推送到 staging', '按刚说的推送', '照刚才的部署', '照剛才的部署', 'stop the server and deploy', "don't ask just push"])
+    all(false, ["don't push yet", 'do not merge it', 'never force push', 'stop deploying', '不要推送', '不要直接推送', '先不合并', '已经推送了', '刚部署', '剛部署完了'])
+  })
+
+  // WHY: an earlier past-tense word reports another action; only the same verb in the past tense reports this one.
+  test('an english report cancels only the same verb in the past tense', async () => {
+    all(true, ['the fix I pushed looks good so merge it', 'now that the PR is merged push develop to staging', 'I deployed it to UAT so now merge the PR'])
+    all(false, ['merged', 'I pushed it already', 'I already merge it yesterday', 'the PR was merged yesterday', 'it is already deployed to prod'])
+  })
+
+  // WHY: "when CI passes merge it" and "explain the change and push it" are instructions; dropping the clause whole hid them.
+  test('each part of a sentence is read on its own, and a question word counts only in a question', async () => {
+    all(true, ['when CI passes merge it', 'tell me the result and then push', 'explain the change and push it', 'could you check and push?', '测完再部署', '先合并再部署', '推送到 develop 然后合并到 main', '合併到 develop 之後部署到 UAT'])
+    all(false, ['when does the deploy run', 'explain git rebase vs merge', 'what happens when we redeploy?', 'could you tell me what git push does?', 'can you explain how merge works?', '部署之后的日志在哪'])
+  })
+
+  test('re- before deploy, push and merge counts', async () => {
+    all(true, ['redeploy the payment service', 're-deploy to UAT', 'repush the tag', 'remerge develop into the branch'])
+  })
+
+  // WHY: these write to a database, an account or a registry and cannot be undone from the session.
+  test('SQL writes, infrastructure and publishing commands, and ship or send it are risky', async () => {
+    all(true, [
+      'run UPDATE Users SET IsActive = 0 WHERE Id = 5 on UAT', 'INSERT INTO Workflows VALUES (1)', 'DELETE FROM Users WHERE Id = 5', 'ALTER TABLE Payments ADD Col INT',
+      'TRUNCATE TABLE Logs', 'DROP TABLE Temp', 'EXEC dbo.Workflows_UpdateWorkflowStatusID 5, 22', 'exec sp_CreateUser', 'EXEC Workflows_UpdateWorkflowStatusID 5',
+      'run terraform apply', 'terraform destroy the uat stack', 'npm publish', 'pnpm publish --access public', 'git clean -fdx', 'git branch -D feature/x',
+      'docker system prune -a', 'docker rm -f api', 'docker volume prune', 'aws s3 rm s3://bucket/key',
+      'ship it', 'looks good, send it', 'post it in #dev-alerts', 'slack him the link',
+      '推吧', '发版吧', '發版吧', '上传到 S3', '上傳到 S3',
+    ])
+    all(false, ['execute the plan', 'docker exec -it api sh', 'docker ps', 'update the readme', 'insert a row in the test fixture', 'what does terraform apply do?', 'how do I npm publish a scoped package?', 'send the request with axios', 'git branch --list'])
+  })
+
+  // WHY: a lookup that mentions prod, a PR, a merge or a deploy is still a lookup; flooring it costs a Sonnet turn.
+  test('noun uses and lookups about prod, PRs, merges, deploys, comments and replies are not risky', async () => {
+    all(false, [
+      'show me the prod logs for the last hour', 'check the prod config value of SITE_URL', 'open PR 431 and list the comments', 'open the PR and summarise it',
+      'git log --merges | head', 'show me the merge conflicts', 'read the deploy log', 'look at the pay page component',
+      '查一下线上环境的配置', '生产环境的日志在哪看', '部署文档在哪里', '发布说明在哪', '看一下这个 PR 的评论', '请简短回复', '這個 PR 的評論在哪裡',
+      'could you tell me what git push does?',
+    ])
+    all(true, ['run the migration on prod', 'restart the api in production', '在生产环境执行这个脚本', '把这个配置改到线上环境', 'open a PR to develop', 'create a PR to develop', 'reply on the jira ticket with the result', '回复客户', '在 jira 上评论一下结果'])
+  })
+
+  // WHY: real messages mix a lookup, a report and an instruction in one go; the instruction must still be found.
+  test('realistic multi-clause messages in English, Simplified and Traditional Chinese', async () => {
+    all(true, [
+      'Thanks, the tests pass now. Bump the version, update the changelog and then push it to origin.',
+      'Looks good to me. When the pipeline is green, merge the PR into develop.',
+      'Run UPDATE Payments SET Status = 2 WHERE Id = 9 on UAT, then tell me the row count.',
+      '先跑一下测试，没问题的话推送到 develop 再开个 PR。',
+      '测试都过了，分别部署到 UAT 和 STG，然后在 Slack 通知大家。',
+      '測試都通過了，合併到 develop 之後部署到 UAT。',
+      '不用確認，直接推送到 staging。',
+    ])
+    all(false, [
+      'Can you explain why the build failed and then fix it?',
+      'I already merged the PR yesterday, so just check the pipeline status.',
+      'What happens to the open sessions when we redeploy?',
+      'Read the deploy log and tell me which step failed.',
+      '这个 PR 的评论我看过了，帮我总结一下要改的地方。',
+      '生产环境的日志在哪里看？顺便告诉我部署文档在哪。',
+      '之前已经推送了，现在只需要确认 CI 状态。',
+      '這個分支已經合併了嗎？',
+      '請幫我看一下線上環境的設定，不要改任何東西。',
+    ])
+  })
+})
+
 describe('risk floor (1.2.0)', () => {
   const route = (seen: Seen, i = 0) => seen.submits[i]!.context?.[0] ?? ''
+
+  // WHY: settleTier already raises an unsure lookup; counting that as a floor inflates the stats figure.
+  test('an unsure risky lookup goes to Sonnet by the unsure rule and is not counted as a floor', async ($, on) => {
+    const seen = world($, on, T('lookup', false, 'git'))
+    await $.prompt.submit({ text: 'push the branch to origin' } as never)
+    expect(route(seen)).toContain('assigned to sonnet')
+    expect(route(seen)).toContain('(unsure: not on lookup)')
+    expect(route(seen)).not.toContain('risky action')
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
+  })
+
+  test('an unsure risky subagent lookup runs on Sonnet and is not counted as a floor', async ($, on) => {
+    const seen = world($, on, T('lookup', false))
+    await spawnAgent($, { prompt: 'push the release branch to origin' })
+    expect(seen.agents).toEqual(['sonnet'])
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
+  })
 
   test('the floor raises a risky lookup to execute and never moves any other tier', async () => {
     expect(riskFloor('lookup', true)).toBe('execute')
@@ -8102,9 +8201,22 @@ describe('assignment text for policy (b) (1.2.0)', () => {
       expect(t).not.toContain('anything irreversible')
       expect(t).toContain('Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews) must be made on opus')
       expect(t).toContain('call mcp__model-router__escalate FIRST')
-      expect(t).toContain('An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus')
-      expect(t).toContain("confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled")
     }
+    const sonnet = assignmentContext(routeFor('execute', 'x'))
+    expect(sonnet).toContain('An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus')
+    expect(sonnet).toContain("confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled")
+    expect(sonnet).not.toContain('needs at least sonnet')
+  })
+
+  // WHY: the code floor cannot see an approval: after "git status" on Haiku, a "yes" to "push?" keeps the lookup tier.
+  // The Haiku text is the backstop, so it must send every irreversible or outward-facing action to Sonnet first.
+  test('the haiku text sends any irreversible or outward-facing action to sonnet before any tool, even an approved one', async () => {
+    const t = assignmentContext(routeFor('lookup', 'x'))
+    expect(t).toContain('Any irreversible or outward-facing action (a push, merge, PR, deploy, delete, a message to people, or a change to production data) needs at least sonnet')
+    expect(t).toContain('even when the user asked for it or has just approved it')
+    expect(t).toContain('call mcp__model-router__escalate with model sonnet FIRST, before any tool')
+    // Not the Sonnet sentence: "escalate only if what to do is not settled" would tell Haiku to carry out a settled push.
+    expect(t).not.toContain('escalate only if what to do is not settled')
   })
 
   test('the opus text is unchanged', async () => {
@@ -8362,6 +8474,57 @@ describe('/model-router replay (1.2.0)', () => {
     await $.prompt.submit({ text: 'and the tests?' } as never)
     expect(seen.submits.at(-1)!.context?.[0]).toContain('assigned to opus')
     expect(seen.submits.at(-1)!.context?.[0]).toContain('(unsure: not downgrading)')
+  })
+
+  // WHY: a turn can start while a replay is still running; its band and history must show its own cost, not the replay.
+  test('a turn started during a replay does not carry the replay spend, in its tally or its history record', async ($, on) => {
+    const waiting: (() => void)[] = []
+    let open = false
+    const { calls, fn } = classifierBy(async (system, prompt) => {
+      if (prompt.includes('live work')) return T('execute')
+      if (!open) await new Promise<void>(resolve => waiting.push(resolve))
+      return bothShapes(system)
+    })
+    const seen = world($, on, fn)
+    const box: { turn?: Tally; records?: { value: { turnId: string; tokens: number }[] } } = {}
+    on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+      box.turn = e.value.turn
+      return next(e)
+    })
+    on('state.set', { plugin: 'model-router', key: 'turns' }, async (_$: unknown, e: any, next: any) => {
+      box.records = e.value
+      return next(e)
+    })
+    put(seen, JSON.stringify(items(4)))
+    const run = cmd($, `replay ${IN} current`)
+    for (let i = 0; i < 40 && waiting.length < 4; i++) await macrotask()
+    expect(waiting).toHaveLength(4)
+    await $.prompt.submit({ text: 'live work' } as never)
+    expect(seen.submits.at(-1)!.context?.[0]).toContain('assigned to sonnet')
+    const todayBefore = seen.tally!.tokens
+    open = true
+    for (const release of waiting.splice(0)) release()
+    await run
+    expect(calls.n).toBe(5)
+    // The live classifier call is 2 tokens; the four replay calls (8 tokens) go to the day only.
+    expect(seen.tally!.tokens - todayBefore).toBe(8)
+    expect(box.turn!.tokens).toBe(2)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    expect(box.records!.value.find(r => r.turnId === 't1')!.tokens).toBe(2)
+  })
+
+  // WHY: the replay measures the live call; a context the live call would trim must be trimmed the same way.
+  test('a long context is trimmed per message exactly as a live classification trims it', async ($, on) => {
+    const long = `${'a'.repeat(300)}MIDDLE${'b'.repeat(1500)}`
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn, { messages: [{ role: 'user', text: long }, { role: 'assistant', text: `short\n\nwith a blank line ${'c'.repeat(1300)}END` }] })
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    const live = seen.prompts[0]!
+    expect(live).not.toContain('MIDDLE')
+    put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: `[user] ${long}\n\n[assistant] short\n\nwith a blank line ${'c'.repeat(1300)}END`, previous: null }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[1]!.prompt).toBe(live)
   })
 
   test('it refuses while a turn is running, and asks the model nothing', async ($, on) => {
