@@ -26,6 +26,8 @@ export type Route = {
 }
 
 export type TurnHow = 'classified' | 'forced' | 'pinned' | 'inherited' | 'kept-tier' | 'warm-skip' | 'session-model'
+  // A main turn the route did not govern (a notification after the cache TTL, main routing off): a turn record only.
+  | 'unrouted'
 
 // One main turn as /model-router history lists it. The prompt snippet is never in here: it stays in memory for corrections.
 export type TurnRecord = {
