@@ -3,7 +3,7 @@ import type { ElementConstructor, EngineInterface, Register, SessionRateLimit, S
 
 import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier, TurnHow, TurnRecord } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, RANK, saved, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
@@ -141,11 +141,13 @@ let turnBase = { tokens: 0, cost: 0 }
 // An inherited turn's route already carries earlier escalations: its own start at this many trail steps.
 let turnTrailBase = 0
 // The seven days behind the expanded band and this session's tokens, cached by day and latest turn: no store scan per redraw.
-let weekCache: { day: string; key: string; series: DayCost[]; sessionTokens: number } | undefined
+// All three token figures in Details come from this one snapshot, so "last 7 days" is never below "today".
+let weekCache: { day: string; key: string; series: DayCost[]; sessionTokens: number; todayTokens: number } | undefined
 // Whether the band shows its details; a per-person choice, kept in the store (read with the other preferences).
 let bandExpanded = false
 // The turn a correction was just recorded for and the model it pinned: the band thanks the person in place of the buttons.
-let thanks: { turnId: string; model: ModelKey } | undefined
+// `note` is the switching cost the confirmation gave, if any. Cleared whenever the pin ends or another pin replaces it.
+let thanks: { turnId: string; model: ModelKey; note: string } | undefined
 // A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
 const REWRITE_MIN_TOKENS = 100_000
 // A cache read below this on a request with no earlier one in this process means the cache was cold.
@@ -252,6 +254,7 @@ const STR = {
     wrongNoText: '该轮的提示内容已不在内存中，无法记录。',
     wrongFailed: '无法保存纠正。',
     correctionsClearFailed: '无法删除磁盘上的纠正记录，它们可能仍然存在。',
+    correctionsClearPartial: '未能删除全部纠正记录：另一个窗口可能仍在写入。请稍后再运行 /model-router corrections clear。',
     pacingNotSaved: '（无法保存：仅对本会话有效。）',
     wrongSame: (tier: string) => `该轮已被分到 ${tier}，没有记录。`,
     wrongDone: (at: string, routed: string, right: string, model: string) => `已记录：${at} 的轮次，分类为 ${routed}，应为 ${right}。本会话余下部分固定使用 ${model}。/model-router unpin 可撤销。`,
@@ -296,13 +299,15 @@ const STR = {
     chartTitle: (n: number) => `每日花费，近 ${n} 天（API 价格）`,
     chartTotal: (cost: string, base: string) => `合计 ${cost} · 全程 Opus 则为 ${base}`,
     comma: '，',
-    cacheSoon: (min: number, extra: string) => `⏳ 请在 ${min} 分钟内回复以保持对话缓存——之后下一条回复将多花约 ${extra}`,
+    cacheSoon: (min: number, extra: string) => `⏳ 请在 ${min} 分钟内回复以保持对话缓存——之后下一条回复将重新读取它，约 ${extra}`,
     cacheGone: (size: string, cost: string) => `⏳ 缓存已过期——下一条回复将重新读取 ${size} 个 token（约 ${cost}）`,
     wrongAsk: '上一条回复的模型不对？应该是：',
     thanks: (model: string) => `谢谢——本会话余下部分固定使用 ${model}。/model-router unpin 可撤销。`,
+    switchCost: (cost: string, model: string) => ` 切换后，下一条回复会在 ${model} 上重新读取整个对话，约 ${cost}。`,
     footer: '/model-router 查看统计、设置和命令',
     raisedTo: (m: string) => `（升级到 ${m}）`,
     histTotal: (cost: string, base: string) => `近 7 天 ${cost} · 全程 Opus 则为 ${base}`,
+    histUnavailable: '近 7 天：无法读取存储，合计无读数',
     tagCold: '（缓存已过期）',
     tagKept: (m: string) => `（保持 ${m}）`,
     tagPinned: '（已固定）',
@@ -386,6 +391,7 @@ const STR = {
     wrongNoText: 'The prompt of that turn is no longer in memory, so nothing was recorded.',
     wrongFailed: 'Could not save the correction.',
     correctionsClearFailed: 'The stored corrections could not be deleted and may remain on disk.',
+    correctionsClearPartial: 'Not every correction could be removed: another window may still be writing them. Run /model-router corrections clear again later.',
     pacingNotSaved: '(Could not be saved: this session only.)',
     wrongSame: (tier: string) => `That turn was already routed ${tier}; nothing recorded.`,
     wrongDone: (at: string, routed: string, right: string, model: string) => `Recorded: the ${at} turn was routed ${routed} and should have been ${right}. The rest of this session stays on ${model}. /model-router unpin to undo.`,
@@ -430,13 +436,15 @@ const STR = {
     chartTitle: (n: number) => `Spend per day, last ${n} days (API prices)`,
     chartTotal: (cost: string, base: string) => `Total ${cost} · all-Opus would be ${base}`,
     comma: ', ',
-    cacheSoon: (min: number, extra: string) => `⏳ Reply within ${min} min to keep the conversation cached — after that the next reply costs ≈${extra} more`,
+    cacheSoon: (min: number, extra: string) => `⏳ Reply within ${min} min to keep the conversation cached — after that the next reply re-reads it for ≈${extra}`,
     cacheGone: (size: string, cost: string) => `⏳ The cache expired — your next reply re-reads ${size} tokens (≈${cost})`,
     wrongAsk: 'Wrong model for the last reply? Should have been:',
     thanks: (model: string) => `Thanks — the rest of this session stays on ${model}. /model-router unpin to undo.`,
+    switchCost: (cost: string, model: string) => ` Switching re-reads the whole conversation at about ${cost} on ${model}.`,
     footer: '/model-router for stats, settings and commands',
     raisedTo: (m: string) => `(raised to ${m})`,
     histTotal: (cost: string, base: string) => `Last 7 days ${cost} · all-Opus would be ${base}`,
+    histUnavailable: 'Last 7 days: total unavailable (the store could not be read)',
     tagCold: '(cache expired)',
     tagKept: (m: string) => `(kept on ${m})`,
     tagPinned: '(pinned)',
@@ -572,31 +580,42 @@ function redraw($: EngineInterface) {
 const PREFS_FRESH_MS = 60_000
 // Bumped by every local change to a preference, so a read already in flight cannot put back the value it replaced.
 let prefsChanges = 0
+// Preferences changed here whose store write failed: the local value holds ("this session only") and a refresh never
+// puts the stored one back, until a later write of that preference succeeds.
+const prefsUnsaved = new Set<'pacing' | 'paceWarned'>()
 
-async function ensurePrefs($: EngineInterface, session: Session) {
+function prefSaved(key: 'pacing' | 'paceWarned', ok: boolean) {
+  if (ok) prefsUnsaved.delete(key)
+  else prefsUnsaved.add(key)
+}
+
+async function ensurePrefs($: EngineInterface, session: Session, now?: number) {
   const part = session.prefs
   if (part.done && !part.pending) {
-    const now = await $.clock.now()
-    if (!here(session) || now - (part.at ?? -Infinity) <= PREFS_FRESH_MS) return
+    const at = now ?? await $.clock.now()
+    if (!here(session) || at - (part.at ?? -Infinity) <= PREFS_FRESH_MS) return
     part.done = false
   }
   return loadPart($, part, () => loadPrefs($, session))
 }
 
 // The persisted choices: the pacing override, the window the pace toast last fired for and the band's details state.
+// The details state is read on a session's first load only: a running window keeps its own open or closed band, and a
+// new session starts with the last choice saved.
 async function loadPrefs($: EngineInterface, session: Session) {
   const changes = prefsChanges
   const at = await $.clock.now()
   const mode = await $.store.get('pacing')
   const warned = await $.store.get('paceWarned')
-  const expanded = await $.store.get('bandExpanded')
+  const first = session.prefs.at === undefined
+  const expanded = first ? await $.store.get('bandExpanded') : undefined
   if (!here(session)) return
   session.prefs.at = at
   // A local change landed while this read ran: it is newer than what was read.
   if (changes !== prefsChanges) return
-  pacingOverride = isPaceMode(mode) ? mode : undefined
-  paceWarned = typeof warned === 'string' ? warned : undefined
-  bandExpanded = expanded === true
+  if (!prefsUnsaved.has('pacing')) pacingOverride = isPaceMode(mode) ? mode : undefined
+  if (!prefsUnsaved.has('paceWarned')) paceWarned = typeof warned === 'string' ? warned : undefined
+  if (first) bandExpanded = expanded === true
 }
 
 // The window a pace check is reading the store for, so a second check in this process does not toast alongside it.
@@ -631,7 +650,9 @@ async function paceNotice($: EngineInterface, session: Session, now: number) {
   } catch {
     // A missing toast surface must not affect the status line.
   }
-  await bookkeeping($, () => $.store.set('paceWarned', resetsAt), undefined, retryFor(session, 'pace write'))
+  let ok = false
+  await bookkeeping($, async () => { await $.store.set('paceWarned', resetsAt); ok = true }, undefined, retryFor(session, 'pace write'))
+  prefSaved('paceWarned', ok)
 }
 
 function pendingText(lang: Lang, now: number): string {
@@ -1196,10 +1217,19 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   const model = TIER_ROUTE[right].model
   pin = { model }
+  const note = switchNote(lang, model)
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
-  thanks = { turnId: rec.turnId, model }
+  thanks = { turnId: rec.turnId, model, note }
   redraw($)
-  return str.wrongDone(hhmm(rec.at), rec.tier, right, LABEL[model])
+  return str.wrongDone(hhmm(rec.at), rec.tier, right, LABEL[model]) + note + ((await read($, enabled)) ? '' : str.pinRouterOff)
+}
+
+// A correction that pins a smaller model than the conversation is on makes the next reply re-read the whole conversation
+// on that model: from 100k tokens up, the confirmation says what that costs. It informs; it never blocks the pin.
+function switchNote(lang: Lang, to: ModelKey): string {
+  const { tokens, model: from } = contextReading()
+  if (tokens === undefined || tokens < REWRITE_MIN_TOKENS || !(from === 'fable' || RANK[to] < RANK[from])) return ''
+  return STR[lang].switchCost(fmtUsd(tokens * priceOf(to, tokens).write / 1e6), LABEL[to])
 }
 
 async function pressWrong($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId: string) {
@@ -1249,7 +1279,10 @@ async function weekSeries($: EngineInterface, session: Session, now: number): Pr
     const t = (await $.store.get(key)) as Tally | undefined
     if (t) byDay.set(m[1]!, merge(byDay.get(m[1]!) ?? EMPTY, t))
   }
-  if (await stillHere($, session) !== 'same') return undefined
+  const identity = await stillHere($, session)
+  // An unavailable id backs off like a failed read, so an open band does not rescan the store on every redraw.
+  if (identity === 'unavailable') throw new Error('session id unavailable')
+  if (identity !== 'same') return undefined
   return days.map(day => ({ day, cost: byDay.get(day)?.cost ?? 0, baseline: byDay.get(day)?.baseline ?? 0, tokens: byDay.get(day)?.tokens ?? 0 }))
 }
 
@@ -1284,21 +1317,23 @@ function weekTotals(series: readonly DayCost[]): { cost: number; base: number } 
 }
 
 // /model-router history: the same plain rows as the expanded band, as text, with the week's total.
-function historyText(lang: Lang, list: readonly TurnRecord[], series: readonly DayCost[]): string {
+function historyText(lang: Lang, list: readonly TurnRecord[], series: readonly DayCost[] | undefined): string {
   const str = STR[lang]
   const rows = list.map(t => {
     const p = turnParts(t, lang)
     return `${p.time}  ${p.label}  ${p.cost}${p.markers ? ` ${p.markers}` : ''}${p.why ? ` — ${shorten(p.why, 40)}` : ''}`
   })
-  const w = weekTotals(series)
-  return [...(rows.length > 0 ? rows : [str.histNone]), str.histTotal(fmtUsd(w.cost), fmtUsd(w.base))].join('\n')
+  // The week could not be read from the store: the rows still stand, and the total says so.
+  const w = series === undefined ? undefined : weekTotals(series)
+  const total = w === undefined ? str.histUnavailable : str.histTotal(fmtUsd(w.cost), fmtUsd(w.base))
+  return [...(rows.length > 0 ? rows : [str.histNone]), total].join('\n')
 }
 
 async function historyCommand($: EngineInterface, session: Session, lang: Lang): Promise<string> {
   const list = await bookkeeping($, () => read($, memberOf(turns, { requestId: session.stateId })), [] as TurnRecord[])
   const now = await $.clock.now()
   const series = await bookkeeping($, () => weekSeries($, session, now), undefined, retryFor(session, 'history week'))
-  if (series === undefined || await stillHere($, session) !== 'same') return STR[lang].sessionChanged
+  if (await stillHere($, session) !== 'same') return STR[lang].sessionChanged
   return historyText(lang, list.slice(-HISTORY_ROWS), series)
 }
 
@@ -1353,6 +1388,7 @@ async function pinCommand($: EngineInterface, lang: Lang, arg: string, mainRouti
   if (arg === 'unpin') {
     if (!pin) return str.notPinned
     pin = null
+    thanks = undefined
     redraw($)
     return str.unpinned
   }
@@ -1362,6 +1398,7 @@ async function pinCommand($: EngineInterface, lang: Lang, arg: string, mainRouti
   if (!m || left === 0) return str.usage
   const model = m[1]!.toLowerCase() as ModelKey
   pin = left === undefined ? { model } : { model, left }
+  thanks = undefined
   redraw($)
   return str.pinSet(LABEL[model], left) + ((await read($, enabled)) ? '' : str.pinRouterOff)
 }
@@ -1387,6 +1424,7 @@ async function pacingCommand($: EngineInterface, session: Session, lang: Lang, a
   prefsChanges++
   let saved = false
   await bookkeeping($, async () => { await (value === 'default' ? $.store.delete('pacing') : $.store.set('pacing', value)); saved = true }, undefined, retryFor(session, 'pacing write'))
+  prefSaved('pacing', saved)
   const now = await $.clock.now()
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   publishStatus($)
@@ -1410,16 +1448,19 @@ async function allCorrections($: EngineInterface): Promise<Correction[]> {
 async function correctionsCommand($: EngineInterface, session: Session, lang: Lang, arg: string): Promise<string> {
   const str = STR[lang]
   if (/^corrections\s+clear$/.test(arg)) {
-    // In the corrections write queue: a correction already being written lands first and is deleted with the rest,
-    // rather than writing the old list back after the clear. Cleared is claimed only when every key is gone.
-    let deleted = false
+    // In the corrections write queue: a correction already being written in this process lands first and is deleted
+    // with the rest, rather than writing the old list back after the clear. Another open window can still write
+    // between the listing and the deletes, so the keys are listed again: what reappeared is deleted once more, and
+    // cleared is claimed only when a last listing finds none.
+    let outcome = 'failed' as 'cleared' | 'partial' | 'failed'
     await serial($, session, 'corrections', async () => {
-      for (const key of await $.store.keys()) {
-        if (isCorrectionsKey(key)) await $.store.delete(key)
+      const left = async () => (await $.store.keys()).filter(isCorrectionsKey)
+      for (let pass = 0; pass < 2; pass++) {
+        for (const key of await left()) await $.store.delete(key)
       }
-      deleted = true
+      outcome = (await left()).length === 0 ? 'cleared' : 'partial'
     })
-    return deleted ? str.correctionsCleared : str.correctionsClearFailed
+    return outcome === 'cleared' ? str.correctionsCleared : outcome === 'partial' ? str.correctionsClearPartial : str.correctionsClearFailed
   }
   if (arg !== 'corrections') return str.usage
   const list = await bookkeeping($, () => allCorrections($), [] as Correction[], retryFor(session, 'corrections read'))
@@ -2152,6 +2193,7 @@ export const register: Register = (on, options) => {
       // A pin counts down when its turn starts, not when the prompt is submitted: a dropped prompt keeps it whole.
       if (r.how === 'pinned' && pin) {
         pin = pin.left === undefined ? pin : pin.left > 1 ? { ...pin, left: pin.left - 1 } : null
+        if (!pin) thanks = undefined
         redraw($)
       }
       if (r.how === 'classified') rememberSnippet(e.turnId, pendingPrompt)
@@ -2599,10 +2641,10 @@ export const register: Register = (on, options) => {
     const below = await next(e)
     if (await stillHere($, session) !== 'same') return below
     if (e.props.hasSurvey) return below
-    await ensurePrefs($, session)
+    const now = await $.clock.now()
+    await ensurePrefs($, session, now)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
-    const now = await $.clock.now()
     if (await stillHere($, session) !== 'same') return below
 
     if (!(await read($, enabled))) {
@@ -2629,7 +2671,9 @@ export const register: Register = (on, options) => {
       if (weekCache === undefined || weekCache.day !== dayKey(now) || weekCache.key !== key) {
         const series = await bookkeeping($, () => weekSeries($, session, now), undefined, retryFor(session, 'band week'))
         const mine = series === undefined ? undefined : await bookkeeping<Tally | undefined>($, () => sessionTally($, session), undefined, retryFor(session, 'band session'))
-        if (series !== undefined && mine !== undefined && await stillHere($, session) === 'same') weekCache = { day: dayKey(now), key, series, sessionTokens: mine.tokens }
+        if (series !== undefined && mine !== undefined && await stillHere($, session) === 'same') {
+          weekCache = { day: dayKey(now), key, series, sessionTokens: mine.tokens, todayTokens: series.find(d => d.day === dayKey(now))?.tokens ?? 0 }
+        }
       }
     }
     if (await stillHere($, session) !== 'same') return below
@@ -2643,7 +2687,8 @@ export const register: Register = (on, options) => {
     const tokens = contextReading().tokens
     const warnAt = Math.min(contextWindow ? contextWindow * 0.8 : Infinity, capOn ? compactAtContext : Infinity)
     const contextPart = tokens === undefined ? undefined : { text: str.contextPart(compactTokens(tokens), contextWindow ? compactTokens(contextWindow) : undefined), warn: tokens >= warnAt }
-    const cmp = Math.abs(diff) > 0 ? `${lang === 'zh' ? '' : ' '}${(diff >= 0 ? str.cmpLess : str.cmpMore)(fmtUsd(Math.abs(diff)))}` : ''
+    // A difference under a cent is not worth a comparison.
+    const cmp = Math.abs(diff) >= 0.01 ? `${lang === 'zh' ? '' : ' '}${(diff >= 0 ? str.cmpLess : str.cmpMore)(fmtUsd(Math.abs(diff)))}` : ''
     type Seg = { text: string; warn?: boolean }
     const row = (withCmp: boolean, withWeek: boolean, withContext: boolean, withTokens: boolean): Seg[] => [
       { text: `${str.thisReply} ${plainUsd(lang, m.turn.cost)}` },
@@ -2665,9 +2710,14 @@ export const register: Register = (on, options) => {
     const series = weekCache?.series ?? []
     const chart = Svg === undefined && series.length > 0 ? textChart(series, e.props.bodyColumns - 2, lang) : undefined
     const total = weekTotals(chart?.days ?? series)
-    const tokensLine = weekCache === undefined ? '' : str.tokensUsed(fmtTokens(weekCache.sessionTokens), fmtTokens(today.tokens), fmtTokens(series.reduce((sum, d) => sum + d.tokens, 0)))
-    const target = learning ? [...shown].reverse().find(isCorrectable) : undefined
-    const answers: [string, Tier][] = [['Haiku', 'lookup'], ['Sonnet', 'execute'], ['Opus', 'decide']]
+    const tokensLine = weekCache === undefined ? '' : str.tokensUsed(fmtTokens(weekCache.sessionTokens), fmtTokens(weekCache.todayTokens), fmtTokens(series.reduce((sum, d) => sum + d.tokens, 0)))
+    // The question is about the last reply: asked only when the newest turn shown is one a correction can apply to.
+    const newest = shown.at(-1)
+    const target = learning && newest !== undefined && isCorrectable(newest) ? newest : undefined
+    // Each button names a model and corrects to that model's tier. Hidden: the model the reply ran on (a kept cache or an
+    // escalation can differ from the tier's), and the classified tier's own, which a correction refuses as unchanged.
+    const answers = ([['Haiku', 'lookup'], ['Sonnet', 'execute'], ['Opus', 'decide']] as [string, Tier][])
+      .filter(([, tier]) => target !== undefined && tier !== target.tier && TIER_ROUTE[tier].model !== target.model)
 
     return (
       <Box flexDirection="column" marginTop={1}>
@@ -2680,7 +2730,7 @@ export const register: Register = (on, options) => {
           <Button key="router-disable" label={str.disable} onPress={() => setEnabled($, session, false)} />
         </Box>
         <Box paddingLeft={2}>
-          <Text dimColor wrap="truncate-end">{costSegs.map(sg => sg.warn ? <Text color="warning">{sg.text}</Text> : sg.text)}</Text>
+          <Text dimColor wrap="truncate-end">{costSegs.map((sg, i) => sg.warn ? <Text key={`cost-${i}`} color="warning">{sg.text}</Text> : sg.text)}</Text>
         </Box>
         {expanded && (
           <Box flexDirection="column" paddingLeft={2}>
@@ -2710,15 +2760,15 @@ export const register: Register = (on, options) => {
             {chart && (
               <Box flexDirection="row">
                 <Text dimColor>{'  '}</Text>
-                {chart.labels.map((label, i) => i === chart.today ? <Text weight="bold" color="claude">{label}</Text> : <Text dimColor>{label}</Text>)}
+                {chart.labels.map((label, i) => i === chart.today ? <Text key={`day-${i}`} weight="bold" color="claude">{label}</Text> : <Text key={`day-${i}`} dimColor>{label}</Text>)}
               </Box>
             )}
             {series.length > 0 && <Text dimColor wrap="truncate-end">{str.chartTotal(fmtUsd(total.cost), fmtUsd(total.base))}</Text>}
-            {target && thanks?.turnId === target.turnId && <Text dimColor>{str.thanks(LABEL[thanks.model])}</Text>}
+            {target && thanks?.turnId === target.turnId && <Text dimColor>{str.thanks(LABEL[thanks.model]) + thanks.note}</Text>}
             {target && thanks?.turnId !== target.turnId && (
               <Box flexDirection="row" gap={1} alignItems="center">
                 <Text dimColor>{str.wrongAsk}</Text>
-                {answers.filter(([, tier]) => tier !== target.tier).map(([name, tier]) => (
+                {answers.map(([name, tier]) => (
                   <Button key={`wrong-${tier}`} label={name} onPress={() => pressWrong($, session, lang, tier, target.turnId)} />
                 ))}
               </Box>

@@ -92,7 +92,7 @@
     "learnFromCorrections": {
       "type": "boolean",
       "title": "Act on and record routing corrections",
-      "description": "On (the default): when you correct a reply's routing (/model-router wrong <tier> or the band's Should have been buttons) the rest of the session is pinned to that tier's model until /model-router unpin, and the masked prompt snippet is stored locally (up to 40), as is one when the model escalates itself to a bigger model than the classifier chose (that never pins). Corrections are an evaluation set for revising the classifier prompt offline; they are never sent to the classifier. Off: no buttons, nothing is recorded and nothing is pinned by corrections; stored corrections stay on disk until /model-router corrections clear.",
+      "description": "On (the default): when you correct a reply's routing (/model-router wrong <tier> or the band's Should have been buttons) the rest of the session is pinned to that tier's model until /model-router unpin, and the masked prompt snippet is stored locally (up to 40 per session per day, kept 30 days), as is one when the model escalates itself to a bigger model than the classifier chose (that never pins). Corrections are an evaluation set for revising the classifier prompt offline; they are never sent to the classifier. Off: no buttons, nothing is recorded and nothing is pinned by corrections; stored corrections stay on disk until /model-router corrections clear.",
       "default": true
     },
     "weeklyPacing": {

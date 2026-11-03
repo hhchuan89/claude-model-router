@@ -31,7 +31,7 @@ charges), how big the conversation is (and the model's window, when the engine g
 the window, or from `compactAtContext` if that is nearer), and the week's usage from the engine's rate-limit window
 (`, ahead of pace` is added only when you are ahead and pacing is not off). On a narrow terminal whole parts are dropped:
 the comparison first, then the week, then the context, and today's tokens only when nothing else is left. Only when it matters a third line appears above them: with a conversation of 100k tokens or more
-(`compactMinContext`), `⏳ Reply within 12 min to keep the conversation cached — after that the next reply costs ≈$2.38 more`
+(`compactMinContext`), `⏳ Reply within 12 min to keep the conversation cached — after that the next reply re-reads it for ≈$2.38`
 in the last 15 minutes of the cache, and `⏳ The cache expired — your next reply re-reads 298k tokens (≈$2.38)` after it.
 Nothing is shown when the cache's age is unknown (after a reload).
 
@@ -42,7 +42,8 @@ model, cost, a short reason and markers such as `(pinned)`, `(you chose)`, `(rai
 `(corrected)`), a titled 7-day spend chart with `Total $777.22 · all-Opus would be $928.25` (on the terminal three aligned
 rows: dollar amounts, bars scaled to the week's biggest day, weekdays, with today in bold; four-character columns or the
 last four days on a narrow terminal; on desktop an SVG with an amount over each bar) and, with `learnFromCorrections` on, `Wrong model for the last reply? Should have been:
-[Haiku] [Sonnet] [Opus]`. Your choice (open or closed) is remembered. **Pause router** (or `/model-router off`) leaves
+[Haiku] [Sonnet] [Opus]`, asked only when the newest reply shown is one the classifier sorted, and without the model
+that reply ran on. Your choice (open or closed) is saved for new sessions; a window that is already open keeps its own. **Pause router** (or `/model-router off`) leaves
 every request on your own model; the band then says so and offers **Resume router**. No flow needs a command: they are
 shortcuts.
 
@@ -226,7 +227,10 @@ the message wins for its turn. Pinning needs `mainRouting`.
 The classifier is not always right. When it sorted a reply wrongly, say so: `/model-router wrong <tier>` (or the
 band's `Should have been:` buttons) pins the main conversation to that tier's model for the rest of the session, exactly
 like `/model-router pin <model>` (📌 in the band, until `/model-router unpin` or the session ends), and answers e.g.
-`Thanks — the rest of this session stays on Sonnet. /model-router unpin to undo.` It also records the turn's masked
+`Thanks — the rest of this session stays on Sonnet. /model-router unpin to undo.` When the model is smaller than the one
+the conversation is on and the conversation is 100k tokens or more, it adds what the next reply re-reads on it (for
+example `Switching re-reads the whole conversation at about $0.22 on Haiku.`); while the router is paused it says the pin
+applies once it is on. It also records the turn's masked
 prompt snippet with the tier it should have had. The model escalating itself to a bigger **model** than the classified
 tier's is recorded too (an effort-only raise does not count), but never pins. Only turns the classifier actually sorted
 can be corrected, not forced, pinned, inherited or failed-classification turns.
@@ -235,7 +239,10 @@ Corrections are **not** sent to the classifier: its system prompt is always the 
 and for subagents. (Earlier 1.1.0 builds added them as few-shot examples; on 102 labelled prompts that lowered accuracy
 from 69.6% to 65.7%, and since escalation corrections only ever say "should have been higher", it ratcheted routing
 upward over time.) The stored corrections are an evaluation dataset for revising the classifier prompt offline.
-`/model-router corrections` lists them, `/model-router corrections clear` deletes them, and stats count them. With
+`/model-router corrections` lists them, `/model-router corrections clear` deletes them, and stats count them. Another
+open window can write a correction while a clear runs: the clear lists the keys again and deletes what reappeared, and
+says `Corrections cleared.` only when a last listing finds none; otherwise it says not every correction could be
+removed. With
 `learnFromCorrections` off there are no buttons, `wrong` says it is off, and nothing is recorded or pinned by
 corrections.
 
@@ -308,7 +315,8 @@ own effort. `stats` covers routed subagents only.
   Like the meter, each session keeps its own list per day (`corrections:<day>:<session>`, up to 40 each), deleted after
   30 days; `/model-router corrections` shows the newest 40 across all of them. They are never sent anywhere, including
   the classifier. Turn `learnFromCorrections` off to stop recording, and run `/model-router corrections clear` to delete
-  every list, including the single `corrections` list earlier builds kept. The band and history keep no prompt text.
+  every list, including the single `corrections` list earlier builds kept (if another window is still writing, it says
+  that some could not be removed; run it again once that window is done). The band and history keep no prompt text.
 - **Optional reviewer (off by default).** If you set `reviewModel`, each Opus decision is sent to that model after the
   turn: your request (first 6,000 characters) and the last 12,000 characters of Opus's answer, not masked. Once a day it
   also sends a one-word probe to check the model exists. With `reviewModel` empty, none of this happens.
