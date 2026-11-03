@@ -34,6 +34,10 @@ describe('route rules', () => {
     expect(settleTier({ tier: 'execute', reason: 'r', sure: false }, 'decide')).toEqual({ tier: 'decide', reason: 'r (unsure: not downgrading)' })
     expect(settleTier({ tier: 'decide', reason: 'r', sure: false }, 'lookup').tier).toBe('decide')
     expect(settleTier({ tier: 'lookup', reason: 'r', sure: false }, null).tier).toBe('execute')
+    // WHY: round 2 replay — unsure lookups were the under-routes ("check UAT", "is this right?"); a lookup turn before
+    // says nothing about this one, so an unsure lookup goes to execute even after a lookup turn.
+    expect(settleTier({ tier: 'lookup', reason: 'r', sure: false }, 'lookup')).toEqual({ tier: 'execute', reason: 'r (unsure: not on lookup)' })
+    expect(settleTier({ tier: 'lookup', reason: 'r', sure: true }, 'lookup').tier).toBe('lookup')
   })
 
   // Seen in the band on 2026-10-26: "…scope of repo changes u (unsure: not downgrading)", a word sliced in half.

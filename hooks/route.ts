@@ -98,16 +98,15 @@ export function parseDecision(text: string): { tier: Tier; reason: string; sure:
 
 const TIER_RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }
 
-// Low confidence never downgrades: after a higher-tier turn the previous tier stays, and a first turn
-// never starts on lookup. A wrong guess upward costs cents; a wrong guess downward costs a failed turn.
+// Low confidence never downgrades: after a higher-tier turn the previous tier stays, and an unsure lookup never runs on
+// Haiku, whatever came before (subagents follow the same rule). A wrong guess upward costs cents; a wrong guess
+// downward costs a failed turn.
 export function settleTier(d: { tier: Tier; reason: string; sure: boolean }, previous: Tier | null): { tier: Tier; reason: string } {
   if (d.sure) return { tier: d.tier, reason: d.reason }
-  if (previous !== null) {
-    return TIER_RANK[previous] > TIER_RANK[d.tier]
-      ? { tier: previous, reason: `${d.reason} (unsure: not downgrading)` }
-      : { tier: d.tier, reason: d.reason }
+  if (previous !== null && TIER_RANK[previous] > TIER_RANK[d.tier]) {
+    return { tier: previous, reason: `${d.reason} (unsure: not downgrading)` }
   }
-  return d.tier === 'lookup' ? { tier: 'execute', reason: `${d.reason} (unsure: not starting on lookup)` } : { tier: d.tier, reason: d.reason }
+  return d.tier === 'lookup' ? { tier: 'execute', reason: `${d.reason} (unsure: not on lookup)` } : { tier: d.tier, reason: d.reason }
 }
 
 // "#opus", "#sonnet" or "#haiku" in a message pins that turn's model.
