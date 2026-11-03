@@ -652,6 +652,7 @@ async function paceNotice($: EngineInterface, session: Session, now: number) {
   }
   let ok = false
   await bookkeeping($, async () => { await $.store.set('paceWarned', resetsAt); ok = true }, undefined, retryFor(session, 'pace write'))
+  if (await stillHere($, session) !== 'same') return
   prefSaved('paceWarned', ok)
 }
 
@@ -1424,9 +1425,9 @@ async function pacingCommand($: EngineInterface, session: Session, lang: Lang, a
   prefsChanges++
   let saved = false
   await bookkeeping($, async () => { await (value === 'default' ? $.store.delete('pacing') : $.store.set('pacing', value)); saved = true }, undefined, retryFor(session, 'pacing write'))
-  prefSaved('pacing', saved)
   const now = await $.clock.now()
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
+  prefSaved('pacing', saved)
   publishStatus($)
   redraw($)
   await paceNotice($, session, now)
