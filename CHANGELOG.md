@@ -3,6 +3,78 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-11-02
+
+1.1.0 redesigns the band, adds a way to pin a model, routing corrections that pin the session, weekly usage
+pacing, and a corrected price table. The band above the prompt is two plain rows; details open with a click. Pin and
+corrections can be switched off or left idle (`learnFromCorrections`, `weeklyPacing`), and with both off the router
+routes and prompts exactly as 1.0.1 does.
+
+### Added
+
+- A plainer band. Two rows under one empty row that sets them off from the conversation (what the router chose and why, and `This reply $0.74 · Today 49.2M tok · $28.00 (−$8.94 vs all-Opus) · Context 106k of
+  1M · Week 20% used`, whole parts dropped on a narrow terminal, today's tokens last, the context in warning colour from 80% of the window), a **Details** button that opens the last 5 replies, a conversation line first (size, window, percent, how long the cache stays warm), then `Tokens used: this session … · today … · last 7 days …`, a titled 7-day chart with its total
+  (three aligned rows on the terminal: amounts, bars, weekdays, today in bold), and `Wrong model for
+  the last reply? Should have been: [Haiku] [Sonnet] [Opus]` buttons (with `learnFromCorrections` on), and **Pause router** / **Resume
+  router**. The choice to show details is remembered. A third line appears only when it matters: `⏳ Reply within 12 min to
+  keep the conversation cached …` in the last 15 minutes of a large conversation's cache, or `⏳ The cache expired …` after
+  it; an unknown cache age says nothing. No flow needs a command.
+- `/model-router history`: the same replies and the week's total as about 11 lines of plain text.
+- `/model-router pin <haiku|sonnet|opus> [turns]` and `/model-router unpin`: hold the main conversation on a model like a
+  `#model` in every message, counted down when the turn starts (`pinned (n left)` counts the turn being started). The band
+  shows `📌` before the model.
+- Routing corrections: `/model-router wrong <tier>` or the band's buttons pin the main conversation to that tier's model
+  for the rest of the session (the same pin as `/model-router pin <model>`, undone with `/model-router unpin`) and store
+  the masked prompt snippet (up to 40 per session and window per day, kept 30 days, 200 characters each); the model escalating itself above the classified tier's
+  model is stored too but never pins. Corrections are an evaluation dataset for revising the classifier prompt offline
+  and are never sent to the classifier: as few-shot examples they lowered accuracy on 102 labelled prompts (69.6% to
+  65.7%) and ratcheted routing upward. `/model-router corrections [clear]` lists or deletes them; stats count them.
+  Option `learnFromCorrections` (on by default; off: no buttons, nothing recorded or pinned); see Privacy.
+- Weekly pacing: option `weeklyPacing` (`off`, `warn` by default, `steer`) and `/model-router pacing [mode|default]`. `warn`
+  adds the pace to the status line only when ahead, and toasts once per weekly window; `steer` also routes an unsure
+  decide to Sonnet while ahead, never against a warm Opus context of 50,000 tokens or more (a smaller warm one stays on
+  Opus only when the estimate favours staying), `#model`, a pin or a sure decision. Steer deliberately
+  overrides the classifier's "an unsure verdict never downgrades" rule, and the model may escalate a steered turn back to
+  Opus, which is the safety valve. `/model-router status` shows the mode and figures; stats count steered turns.
+
+### Changed
+
+- The band no longer shows the context size, cold-resume cost, step cost or cache deadline; those words are also gone from
+  `/model-router context` and `status` (now "Conversation size", "Cache expires", "Compact before").
+- The command hint and usage line list the new subcommands (the old ones come first, unchanged).
+
+### Fixed
+
+- Prices follow the official pricing page (checked 2026-11-02): Sonnet 5.5 cache reads are $0.10 per million, not $0.20,
+  and Haiku 5.5 requests with a prompt over 100,000 tokens (input, cache reads and cache writes together) are priced at
+  $0.50 / $2.50 / $0.05 / $1. Each request is priced on its own size, in the meter, the baseline, the cold-resume and
+  abandoned-cache estimates, checkpoint hints and the warm-cache keep decision. Spend already recorded keeps the old figures.
+- Several open windows: each session and window stores its corrections under its own daily key (pruned after 30 days)
+  so no window overwrites another's, not even two windows on one resumed session, `corrections clear` runs in the write queue and deletes every key, preferences are read again
+  once a minute so `/model-router pacing` in one window reaches the others, and the pace toast checks the store first,
+  which narrows the time in which two windows can both toast for one weekly window but does not close it.
+- The band asks `Wrong model for the last reply?` only when the newest reply shown was classified (it used to offer the
+  buttons for an older turn), and leaves out the model the reply actually ran on, not the classified tier's.
+- A pacing override or pace-toast record that could not be saved is no longer put back by the minute refresh.
+- Details stays open or closed as this window left it; only a new session takes the saved choice.
+- `corrections clear` lists the keys again after deleting and says when another window kept writing, instead of
+  claiming everything was cleared.
+- The band's thank-you line goes when its pin is removed or replaced.
+- A correction made while the router is paused says the pin applies once it is on.
+- A correction to a smaller model on a conversation of 100k tokens or more says what the switch re-reads.
+- `/model-router history` with an unreadable store lists the replies and says the total is unavailable, not that the
+  session changed.
+- Details' three token totals come from one reading, so the last 7 days is never below today.
+- No `vs all-Opus` comparison under a cent, and the expiring-cache line gives the full re-read cost instead of calling it
+  extra.
+- A pacing change that could not be saved ("this session only") ends with its session; the next session uses the saved
+  mode.
+- Details' token totals and chart follow spend that adds no routed reply (subagents, main routing off), read again at
+  most every 30 seconds, instead of staying as they were until the day turned.
+- Every main reply is listed, also one the router did not choose (a notification after the cache expired, main routing
+  off), so `Wrong model for the last reply?` is never asked about an older reply.
+- Replacing a pin with another model shows the new model in the band at once, not the old one until the next reply.
+
 ## [1.0.1] - 2026-10-31
 
 ### Fixed
