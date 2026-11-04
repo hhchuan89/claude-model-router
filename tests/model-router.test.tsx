@@ -2714,7 +2714,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       compactWorld($, on)
       const start = $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
       // Wait until session.start's own lookup is the one held at the gate.
-      while (lookups === 0) await new Promise(resolve => globalThis.setTimeout(resolve, 1))
+      while (lookups === 0) await new Promise(resolve => (globalThis as any).setTimeout(resolve, 1))
       // The band renders while session.start is still waiting on its identity lookup.
       await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
       // The race really happened: the render looked the session up while session.start's lookup was still held.
