@@ -55,7 +55,8 @@ shortcuts.
 | execute | Sonnet · medium | Work whose "what" is settled in the message or visible context: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan, including an instructed push, merge, PR, deploy or a message whose content is settled |
 | decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs |
 
-1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
+1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with your previous request and the
+   final answer to it as context (see "What the classifier receives").
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
    picks the higher tier. A message that asks for your opinion, or whether something is right, safe or should be done
    ("is this right?", "should it be 60s?", "你覺得呢？"), is decide even when it is short or also gives an instruction, while a question about a
@@ -337,8 +338,13 @@ own effort. `stats` covers routed subagents only.
 
 - **Where classification runs.** On Claude Haiku, through the same Anthropic account Claude Code already uses: no third
   party, no proxy, no extra key.
-- **What the classifier receives.** The new message, capped at 6,000 characters, plus the last two non-empty messages of
-  the conversation (each trimmed to its first 200 and last 1,000 characters when longer than 1,200). All three are
+- **What the classifier receives.** The new message, capped at 6,000 characters, plus at most two earlier messages:
+  your last request before this one and the last assistant message after it (that turn's final answer). Empty
+  messages and local slash commands (rows starting with `<command-name>`, `<local-command-caveat>`,
+  `<local-command-stdout>` or `<local-command-stderr>`) are skipped, and so is a copy of the new message at the end of
+  the conversation. The assistant's narration between tool calls is not sent, only the last assistant message of that
+  turn. With no earlier request, the last two remaining messages are sent; with no answer yet, the request alone. Each
+  is trimmed to its first 200 and last 1,000 characters when longer than 1,200. All three are
   masked by `hooks/redact.ts` before they are sent (context messages before trimming): private-key blocks, Anthropic and OpenAI-style keys, GitHub, Slack and
   Telegram tokens, AWS and Google API keys, JSON web tokens, `Bearer` tokens, 64-character hex strings, and values
   assigned to names containing `api_key`, `secret`, `token`, `password` or `pwd`. This is pattern matching and will not
@@ -494,8 +500,9 @@ live turns: a turn you start during a replay works normally, but its classificat
 calls and can be slower. It is not listed in the command's usage text.
 
 `context` takes two forms. The exact one is a list of messages, `[{ "role": "user", "text": "…" }, { "role":
-"assistant", "text": "…" }]`: it goes through the same code as a live context (the last two non-empty messages, each
-over 1,200 characters cut to its first 200 and last 1,000), so the prompt is the live one byte for byte. The older
+"assistant", "text": "…" }]`: it goes through the same code as a live context (the last user message, after
+dropping empty and local-command rows and a final copy of the item's `message`, and the last assistant message after
+it; each over 1,200 characters cut to its first 200 and last 1,000), so the prompt is the live one byte for byte. The older
 string form, `[role] text` blocks separated by a blank line, is approximate: it is cut back into messages at every
 blank line followed by `[word] `, so a message that itself holds such a paragraph (a pasted transcript) is split and
 trimmed differently, and every block is kept. An absent `context` is empty.

@@ -28,6 +28,7 @@ import {
   isFable,
   MODELS,
   parseDecision,
+  pickContext,
   settleTier,
   reviewSystem,
   routeFor,
@@ -1148,22 +1149,23 @@ function contextMessage(text: string): string {
   return masked.length > 1200 ? `${masked.slice(0, 200)}\n…\n${masked.slice(-1000)}` : masked
 }
 
-// The classifier's context from a list of messages: the last two that are not empty, each trimmed by contextMessage.
-// Live classification and a structured replay context both go through here, so the two are the same byte for byte.
-function contextOf(messages: readonly { role: string; text: string }[]): string {
-  const rows = messages.filter(m => m.text.trim() !== '').slice(-2)
-  return rows.map(m => `[${m.role}] ${contextMessage(m.text)}`).join('\n\n')
+// The classifier's context from a list of messages: the ones pickContext chooses (the person's last request and the
+// final answer to it), each trimmed by contextMessage. current is the message being classified, so a copy of it at the
+// end of the list is not shown as context too. Live classification and a structured replay context (with the item's
+// message as current) both go through here, so the two are the same byte for byte.
+function contextOf(messages: readonly { role: string; text: string }[], current?: string): string {
+  return pickContext(messages, current).map(m => `[${m.role}] ${contextMessage(m.text)}`).join('\n\n')
 }
 
-async function recentContext($: EngineInterface): Promise<string> {
-  return contextOf(await $.session.messages())
+async function recentContext($: EngineInterface, current: string): Promise<string> {
+  return contextOf(await $.session.messages(), current)
 }
 
 // A replay item's context. Structured ({ role, text } messages) goes through contextOf exactly as live context does. A
 // string is approximate: it is cut back into messages at a blank line followed by "[role] ", so a message that itself
-// holds such a paragraph is split and its parts trimmed on their own, and every block is kept (no last-two cut).
-function replayContext(context: ReplayContext): string {
-  if (typeof context !== 'string') return contextOf(context)
+// holds such a paragraph is split and its parts trimmed on their own, and every block is kept (no selection).
+function replayContext(context: ReplayContext, message: string): string {
+  if (typeof context !== 'string') return contextOf(context, message)
   return context
     .split(/\n\n(?=\[\w+\] )/)
     .map(block => {
@@ -1193,11 +1195,11 @@ async function floorRisk($: EngineInterface, session: Session, lang: Lang, v: Ve
   return { ...v, tier, reason: `${v.reason}${STR[lang].riskFloor}`.trim() }
 }
 
-// Haiku sorts a text into a tier. withContext adds the last two messages.
+// Haiku sorts a text into a tier. withContext adds the person's last request and its final answer (contextOf).
 async function classifyTier($: EngineInterface, session: Session, lang: Lang, text: string, previous: Tier | null, withContext: boolean): Promise<Classified> {
   try {
     await ensurePrefs($, session)
-    const context = withContext ? await recentContext($) : ''
+    const context = withContext ? await recentContext($, text) : ''
     if (await stillHere($, session) !== 'same') return { ok: false, why: 'session changed' }
     // Timed around the call alone, so the figure is what the person waits on the classifier, not the context read.
     const sentAt = await $.clock.now()
@@ -1308,7 +1310,7 @@ async function runReplay($: EngineInterface, session: Session, lang: Lang, rest:
       const i = next++
       const { item, risk, variant, run } = jobs[i]!
       const system = variant === 'legacy' ? legacyClassifierSystem(lang) : classifierSystem(lang)
-      const prompt = classifierPrompt(item.previous, replayContext(item.context), redact(item.message).slice(0, 6000))
+      const prompt = classifierPrompt(item.previous, replayContext(item.context, item.message), redact(item.message).slice(0, 6000))
       const started = await $.clock.now()
       const r = await replayCall($, system, prompt)
       const ended = await $.clock.now()

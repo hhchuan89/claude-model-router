@@ -51,6 +51,38 @@ Rules:
 - reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.`
 }
 
+// A local slash command (/model-router stats, /clear and the like) is stored as a user row starting with one of these
+// tags. It is the person talking to Claude Code, not to Claude, so it says nothing about the work.
+const LOCAL_COMMAND = /^\s*<(?:command-name|local-command-caveat|local-command-stdout|local-command-stderr)>/
+
+// Which messages the classifier sees as context. session.messages() has one row per message, and every intermediate
+// assistant narration in a turn ("Next I will read X…") is its own row, so "the last two" after a multi-step turn was
+// usually two narration lines and never the person's previous request. Instead: the person's last request and the last
+// assistant row after it (that turn's final answer). Empty rows and local-command rows are dropped first, and a last
+// user row equal to the current message too, since prompt.submit may or may not already list it. With no user row,
+// the last two rows; with no answer after the request, the request alone.
+export function pickContext<T extends { role: string; text: string }>(messages: readonly T[], current?: string): T[] {
+  const rows = messages.filter(m => m.text.trim() !== '' && !LOCAL_COMMAND.test(m.text))
+  const last = rows.at(-1)
+  if (current !== undefined && last?.role === 'user' && last.text.trim() === current.trim()) rows.pop()
+  let user = -1
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i]!.role === 'user') {
+      user = i
+      break
+    }
+  }
+  if (user === -1) return rows.slice(-2)
+  let answer = -1
+  for (let i = rows.length - 1; i > user; i--) {
+    if (rows[i]!.role === 'assistant') {
+      answer = i
+      break
+    }
+  }
+  return answer === -1 ? [rows[user]!] : [rows[user]!, rows[answer]!]
+}
+
 // The user prompt of one classification: the same text the router and the replay command both send.
 export function classifierPrompt(previous: Tier | null, context: string, message: string): string {
   return [

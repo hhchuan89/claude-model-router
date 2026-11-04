@@ -11,7 +11,7 @@ import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { latencyBucket, latencySummary } from '../hooks/latency'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
-import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, pickContext, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
 import { isRisky, riskFloor } from '../hooks/risk'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
@@ -101,6 +101,48 @@ describe('route rules', () => {
     expect(text).toContain('haiku at medium effort')
     expect(text).toContain('FIRST, before any other tool')
     expect(assignmentContext(routeFor('decide', ''))).toContain('Decide the effort this task needs')
+  })
+})
+
+describe('classifier context', () => {
+  const u = (text: string) => ({ role: 'user', text })
+  const a = (text: string) => ({ role: 'assistant', text })
+
+  // WHY: session.messages() has one row per intermediate narration, so the last two rows after a multi-step turn were
+  // narration and the previous request was never seen.
+  test('the previous request and the final answer after it, not the narration between', async () => {
+    const rows = [u('old request'), a('old answer'), u('rename the helper'), a('Next I will read utils.ts'), a('Now the tests'), a('Renamed; tests pass.')]
+    expect(pickContext(rows)).toEqual([u('rename the helper'), a('Renamed; tests pass.')])
+  })
+
+  test('local command rows and empty rows are skipped, leading whitespace included', async () => {
+    const rows = [
+      u('fix the parser'), a('Fixed.'),
+      u('<command-name>/model-router</command-name>\n<command-args>stats</command-args>'),
+      u('  <local-command-caveat>Caveat: the messages below were generated locally</local-command-caveat>'),
+      u('<local-command-stdout>Turns routed: 3</local-command-stdout>'),
+      u('<local-command-stderr>oops</local-command-stderr>'),
+      a('   '), u(''),
+    ]
+    expect(pickContext(rows)).toEqual([u('fix the parser'), a('Fixed.')])
+    // A tag later in the text is the person quoting one, not a command row.
+    expect(pickContext([u('what does <command-name> mean?')])).toEqual([u('what does <command-name> mean?')])
+  })
+
+  test('a trailing copy of the current message is dropped, only when it is the last row and a user row', async () => {
+    const rows = [u('build it'), a('Built.'), u('  now the tests ')]
+    expect(pickContext(rows, 'now the tests')).toEqual([u('build it'), a('Built.')])
+    // Without current (or with another text) the trailing row is the previous request, with no answer yet.
+    expect(pickContext(rows)).toEqual([u('  now the tests ')])
+    expect(pickContext(rows, 'something else')).toEqual([u('  now the tests ')])
+    expect(pickContext([u('now the tests'), a('Done.')], 'now the tests')).toEqual([u('now the tests'), a('Done.')])
+  })
+
+  test('with no user row, the last two rows; with no answer, the request alone; nothing left, nothing', async () => {
+    expect(pickContext([a('one'), a('two'), a('three')])).toEqual([a('two'), a('three')])
+    expect(pickContext([a('earlier'), u('a question')])).toEqual([u('a question')])
+    expect(pickContext([])).toEqual([])
+    expect(pickContext([u('<command-name>/clear</command-name>')])).toEqual([])
   })
 })
 
@@ -376,6 +418,24 @@ test('the classifier context is masked too: earlier messages can hold secrets th
   await $.prompt.submit({ text: 'and now list the files' } as never)
   expect(seen.prompts[0]).toContain('[REDACTED')
   expect(seen.prompts[0]).not.toContain('zzzzzzzzzz')
+})
+
+test('the classifier context is the previous request and its final answer, not narration or local commands', async ($, on) => {
+  const seen = world($, on, '{"tier":"execute","reason":"x"}', {
+    messages: [
+      { role: 'user', text: 'rename the helper in utils' },
+      { role: 'assistant', text: 'Next I will read utils.ts to find the helper.' },
+      { role: 'assistant', text: 'Renamed it; the tests pass.' },
+      { role: 'user', text: '<command-name>/model-router</command-name>\n<command-args>stats</command-args>' },
+      { role: 'user', text: '<local-command-stdout>Turns routed: 3</local-command-stdout>' },
+      { role: 'user', text: 'now add tests for it' },
+    ],
+  })
+  await $.prompt.submit({ text: 'now add tests for it' } as never)
+  const context = /<context>\n([\s\S]*)\n<\/context>/.exec(seen.prompts[0]!)![1]
+  expect(context).toBe('[user] rename the helper in utils\n\n[assistant] Renamed it; the tests pass.')
+  expect(seen.prompts[0]).not.toContain('Next I will read')
+  expect(seen.prompts[0]).not.toContain('<command-name>')
 })
 
 test('a configured reviewer that does not exist leaves no review notice', { options: { reviewModel: 'claude-fable-5-5' } }, async ($, on) => {
