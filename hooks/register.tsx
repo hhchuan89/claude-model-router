@@ -2139,8 +2139,9 @@ export const register: Register = (on, options) => {
   })
 
   on('session.start', async ($, e, next) => {
-    // Registered before the session lookup and whatever it returns: session.start fires once per process, so a lookup
-    // that loses a race or sits in its backoff must not leave /model-router and escalate missing for the whole process.
+    // Registered before the session lookup and whatever it returns: session.start fires once per process, and again only
+    // on an enable, a worker respawn or a reload (never on /clear), so a lookup that loses a race or sits in its backoff
+    // must not leave /model-router and escalate missing until then.
     // Registering again replaces, and every command and tool call resolves its own session.
     await $.command.register({
       name: 'model-router',

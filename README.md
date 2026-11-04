@@ -58,8 +58,8 @@ shortcuts.
 1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
    picks the higher tier. A message that asks for your opinion, or whether something is right, safe or should be done
-   ("is this right?", "should it be 60s?", "你覺得呢？"), is decide even when it is short or also gives an instruction
-   (1.2.1; pending replay validation). The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
+   ("is this right?", "should it be 60s?", "你覺得呢？"), is decide even when it is short or also gives an instruction, while a question about a
+   fact ("is the build green?") stays lookup (1.2.1; pending replay validation). The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
    higher-tier turn the previous tier stays (shown as "unsure: not downgrading"), a first turn never starts on lookup
    (it runs on Sonnet), and an unsure `general-purpose` subagent lookup runs on Sonnet instead of Haiku. Likely secrets
    are masked before classification. **A failed classification never downgrades**: the turn keeps the previous turn's
