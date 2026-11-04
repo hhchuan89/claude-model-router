@@ -2,8 +2,8 @@ import type { Tier } from '../types'
 
 // Whether a message asks for an irreversible or outward-facing action: push, merge, deploy, release, delete, a forced
 // command, a write to production or a database, a pull request, a cherry-pick onto a shared branch, a message to people,
-// or money. Plain code, no model: the classifier judges how much thinking the work needs, and this only keeps such an
-// action off Haiku.
+// a ticket moved to another status, or money. Plain code, no model: the classifier judges how much thinking the work
+// needs, and this only keeps such an action off Haiku.
 // It reads the masked message sentence by sentence, and each sentence part by part (at and / then / 然后 / 再 / 之后).
 // It skips a part that only asks about one of these words ("what does git push do?"), reports one as done ("merged",
 // "I pushed it already", "已经推送了"), or says not to do it ("don't push"). A miss leaves the classifier's tier as it
@@ -17,6 +17,13 @@ const TO_PEOPLE = String.raw`(?:\b(?:slack|jira|confluence|teams|channel|thread|
 // the ticket" or "send the request" does not count.
 const MSG_START = String.raw`(?:^|\b(?:please|pls|and|then|to|you|now|also|go|just|so)\s+)`
 const ZH_PROD = String.raw`(?:生产环境|生產環境|正式环境|正式環境|线上环境|線上環境|生产库|生產庫|正式库|正式庫|\bprod(?:uction)?\b)`
+// Verbs that act on production, in base form, so "restarted" is a report.
+const PROD_VERBS = String.raw`(?:run|apply|execute|exec|migrate|restart|reboot|change|modify|update|write|edit|patch|set|fix|hotfix|seed|backfill|insert|remove|kill|scale|rotate|ship|deploy|redeploy|push|release|delete|drop|truncate|wipe|purge|reset|test)`
+// A ticket: the word, or a Jira-style key (pp-123, after lowercasing). Only with a verb that moves or closes it, so "utf-8"
+// or "sha-256" alone never counts.
+const TICKET = String.raw`(?:tickets?|issues?|jira|工单|工單|单子|單子|[a-z]{2,10}-\d+)`
+// Someone a Chinese message goes to (我 is not: "跟我说一下" asks for an answer).
+const ZH_PERSON = String.raw`(?:他们|他們|她们|她們|他|她|大家|团队|團隊|客户|客戶|用户|用戶|老板|老闆|同事|对方|對方|[a-z@])`
 const ZH_ACT = String.raw`(?:执行|執行|运行|運行|跑|改|修改|更新|删|刪|清(?!楚)|部署|发布|發布|重启|重啟|写入|寫入|插入|迁移|遷移|回滚|回滾|操作)`
 
 const rules: Rule[] = [
@@ -28,7 +35,15 @@ const rules: Rule[] = [
   { re: /\bupdate\s+[\w.[\]"`]+\s+set\b|\binsert\s+into\b|(?<!(?:docker|kubectl)\s)\bexec(?:ute)?\s+(?:proc(?:edure)?\s+\S|(?:\[?\w+\]?\.)?\[?u?sp_\w|\[?\w+\]?\.\[?\w)|(?<!(?:docker|kubectl)\s)\bexec\s+\[?[a-z]\w*_\w/ },
   { re: /\bterraform\s+(?:apply|destroy)\b|\b(?:npm|pnpm|yarn)\s+publish\b|\bgit\s+clean\s+-[a-z]*f|\bgit\s+branch\s+-[a-z]*d\b|\bdocker\s+(?:system\s+prune|(?:container\s+|image\s+|volume\s+)?(?:rm|rmi|prune))\b|\baws\s+s3\s+(?:rm|rb)\b/ },
   // Production only with an action on it: "show me the prod logs" is a lookup.
-  { re: /\b(?:run|apply|execute|exec|migrate|restart|reboot|change|modify|update|write|edit|patch|set|fix|hotfix|seed|backfill|insert|remove|kill|scale|rotate|ship|deploy|redeploy|push|release|delete|drop|truncate|wipe|purge|reset|test)\b[^.?!\n]{0,40}\bprod(?:uction)?\b/ },
+  { re: new RegExp(`\\b${PROD_VERBS}\\b[^.?!\\n]{0,40}\\bprod(?:uction)?\\b`) },
+  // The verb after production, when the part opens with where it runs: "in prod run the migration". "the prod migration
+  // log" and "in prod the migration log shows errors" do not count.
+  { re: new RegExp(`^(?:in|on|against)\\s+(?:the\\s+)?prod(?:uction)?(?:\\s+env(?:ironment)?)?\\s+(?:please\\s+)?${PROD_VERBS}\\b`) },
+  // Moving a ticket to another status: "move PP-123 to Done", "transition the ticket to In Review", "close the ticket".
+  // "move the file to src" and "close the dialog" name no ticket.
+  { re: new RegExp(`\\b(?:mov(?:e|es|ing)|transition(?:s|ing)?|mark(?:s|ing)?)\\s+(?:the\\s+|this\\s+|that\\s+|a\\s+)?(?:jira\\s+)?${TICKET}\\b[^.?!\\n]{0,30}\\b(?:to|as|into)\\b|\\b(?:clos(?:e|es|ing)|resolv(?:e|es|ing)|reopen(?:s|ing)?)\\s+(?:the\\s+|this\\s+|that\\s+|a\\s+)?(?:jira\\s+)?${TICKET}\\b`) },
+  // Telling someone: "tell him in Slack". "tell me", "tell if" and "tell them apart" do not count.
+  { re: /\btell\s+(?:him|her|them(?!\s+apart)|everyone|the\s+(?:team|client|customer|channel|group))\b/ },
   { re: /\b(?:(?:open|create|raise|submit)\s+(?:up\s+)?(?:a|an|a\s+new|new)\s+(?:prs?|pull[- ]requests?|merge[- ]requests?)|(?:merge|decline|approve|close)\b[^.?!\n]{0,40}\b(?:prs?|pull[- ]requests?|merge[- ]requests?))\b|\b(?:create|raise|submit)\b[^.?!\n]{0,40}\b(?:prs?|pull[- ]requests?|merge[- ]requests?)\b/ },
   { re: /\bcherry[- ]?pick\b[^.?!\n]{0,60}\b(?:develop|main|master|staging|release|prod|production)\b/ },
   { re: new RegExp(`${MSG_START}(?:send|post|reply|comment|message|email|e-mail|notify|ping|dm|(?:add|leave|write)\\s+(?:a\\s+)?comment)\\b[^.?!\\n]{0,60}${TO_PEOPLE}`) },
@@ -44,6 +59,11 @@ const rules: Rule[] = [
   { re: /(?:开|開|提|建|创建|建立|合|发|發|提交)\s*(?:个|個|一个|一個)?\s*(?:pr|pull request|合并请求|合併請求)/, zh: true },
   // 回复 / 评论 / 留言 count with someone or somewhere to go to, so "这个 PR 的评论" or "请简短回复" does not.
   { re: /发送|發送|发给|發給|发到|發到|发消息|發訊息|发邮件|發郵件|(?:回复|回覆|回復|评论|評論|留言)(?=\s*(?:一下|下)?\s*(?:给|給|他|她|对方|對方|客户|客戶|用户|用戶|大家|团队|團隊|老板|老闆|同事|群|频道|頻道|邮件|郵件|工单|工單|这|這|那|[a-z@#]))|在[^，。！？\n]{1,20}(?:上|里|裡|下)\s*(?:评论|評論|留言|回复|回覆)/, zh: true },
+  // Telling people: "在群里说一下", "跟他说一下", "通知一下 X". The verb needs 一下 / 一声 after it, or a person after 通知 /
+  // 告诉, so "群里说了什么", "跟他说的一样", "说一下这个函数", "告诉我" and "通知栏" do not count.
+  { re: new RegExp(`(?:群组|群組|群|频道|頻道|slack|teams|thread|工单|工單)\\s*(?:里|裡|上|中)?\\s*(?:说|說|讲|講|问|問|发|發|通知|回|提)\\s*(?:一下|一声|一聲|下)|(?:跟|和|同|给|給|对|對)\\s*${ZH_PERSON}[^，。！？\\n]{0,8}?(?:说|說|讲|講|问|問|回|发|發)\\s*(?:一下|一声|一聲|下)|(?:通知|告诉|告訴|知会|知會)\\s*(?:一下|一声|一聲|下)?\\s*${ZH_PERSON}`), zh: true },
+  // A ticket moved to another status: "把 PP-123 改成 Done", "关掉这个 ticket".
+  { re: new RegExp(`${TICKET}[^，。！？\\n]{0,12}(?:改成|改为|改為|设为|設為|设成|設成|移到|挪到|转到|轉到|拖到)|(?:关掉|關掉|关闭|關閉|结掉|結掉|重开|重開)\\s*(?:这个|這個|那个|那個|这张|這張|那张|那張)?\\s*${TICKET}`), zh: true },
   { re: /付款|转账|轉帳|轉賬|汇款|匯款|退款/, zh: true },
 ]
 

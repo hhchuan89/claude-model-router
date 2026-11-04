@@ -9118,3 +9118,39 @@ describe('/model-router replay (1.2.0)', () => {
     expect(parseReplayArgs('/a.json legacy --repeat 2')).toEqual({ path: '/a.json', variants: ['legacy'], repeat: 2 })
   })
 })
+
+describe('classifier prompt: opinion questions (1.2.1)', () => {
+  // WHY: the remaining under-routes on two datasets were decide-work phrased as a short question or instruction
+  // ("需要改成60秒吧？", "这样对吗？"). The legacy prompt is the replay baseline and must stay as it was.
+  test('the prompt makes an opinion or is-this-right question decide, and the legacy prompt does not', async () => {
+    const rule = "- A message that asks for your opinion, or whether something is right, safe or should be done ('你覺得呢？', 'is this right?', 'should it be 60s?', '这样对吗？'), is decide, even when it is short or also gives an instruction."
+    for (const lang of ['en', 'zh'] as const) {
+      expect(classifierSystem(lang)).toContain(rule)
+      expect(legacyClassifierSystem(lang)).not.toContain('asks for your opinion')
+    }
+  })
+})
+
+describe('risk detector gaps (1.2.1)', () => {
+  const cases: [string, string[], string[]][] = [
+    ['ticket transitions',
+      ['move PP-123 to Done', 'transition the ticket to In Review', 'close the ticket', '把 PP-123 改成 Done', '关掉这个 ticket'],
+      ['what does Done mean', 'what does In Review mean?', 'move the file to src', 'close the dialog then run tests', 'I closed the ticket', '已经关掉这个 ticket', '这个 ticket 关掉了吗', 'use utf-8 to encode']],
+    ['messaging people',
+      ['在群里说一下', '跟他说一下', '通知一下 X', 'tell him in Slack', 'reply to the thread'],
+      ['群里说了什么', '跟他说的一样', '跟我说一下', '说一下这个函数是做什么的', '告诉我怎么做', '通知栏的图标', '在 README 里说明一下', 'tell me what the ticket says', 'help me tell them apart']],
+    ['production with the verb after it',
+      ['in prod run the migration', 'on production restart the service'],
+      ['the prod migration log', 'in prod the migration log shows errors', 'on production the service restarted']],
+  ]
+  for (const [kind, risky, safe] of cases) {
+    // WHY: each of these was a probed miss that let an outward-facing action start on Haiku.
+    test(`${kind}: the instructions are risky`, async () => {
+      for (const t of risky) expect([t, isRisky(t)]).toEqual([t, true])
+    })
+    // WHY: a question, a report or a noun use nearby is a lookup; flooring it would cost a Sonnet turn for nothing.
+    test(`${kind}: a question, report or noun use nearby is not risky`, async () => {
+      for (const t of safe) expect([t, isRisky(t)]).toEqual([t, false])
+    })
+  }
+})

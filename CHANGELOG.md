@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-11-04
+
+### Fixed
+
+- The risk floor missed three kinds of instruction a probe found. It now catches moving a ticket to another status
+  ("move PP-123 to Done", "transition the ticket to In Review", "close the ticket", "把 PP-123 改成 Done",
+  "关掉这个 ticket"), telling people in Chinese and English ("在群里说一下", "跟他说一下", "通知一下 X",
+  "tell him in Slack") and a production action whose verb follows the place ("in prod run the migration",
+  "on production restart the service"). A question, report or noun use nearby ("what does Done mean", "群里说了什么",
+  "the prod migration log") still does not count.
+
+### Changed
+
+- One new classifier rule: a message that asks for your opinion, or whether something is right, safe or should be done
+  ("你覺得呢？", "is this right?", "should it be 60s?", "这样对吗？"), is decide, even when it is short or also gives an
+  instruction. It targets the remaining under-routes on two datasets. **Pending replay validation:** it has not yet been
+  measured with `/model-router replay`. The legacy prompt is unchanged.
+
 ## [1.2.0] - 2026-11-02
 
 1.2.0 changes what an irreversible or outward-facing request costs. **Policy change:** an action you asked for and
