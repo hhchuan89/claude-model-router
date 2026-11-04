@@ -9292,6 +9292,36 @@ describe('classifier prompt: opinion questions (1.2.1)', () => {
   })
 })
 
+describe('classifier prompt: what each tier is not for (1.3.0)', () => {
+  // WHY: the definitions only said what each tier is for, so a long or weighty-sounding request read as decide and a
+  // short "why does this fail?" as lookup. Pending replay validation; the legacy prompt is the baseline and stays as it was.
+  test('each tier ends with what it is not for, one rule says length and importance do not count, and the legacy prompt has neither', async () => {
+    const notFor = [
+      '- **lookup (Haiku):** retrieval or mechanical work with nothing to judge.',
+      '  Not for: anything that needs a judgement call, explaining why something fails, or a change whose content still has to be worked out.',
+      '- **execute (Sonnet):**',
+      '  Not for: choosing between approaches, finding a cause nobody has identified yet, judging whether something is right, or a request whose "what" is still open.',
+      '- **decide (Opus):**',
+      '  Not for: carrying out a plan, spec or instruction that is already settled, or retrieval and mechanical work, however long or important it looks.',
+      'Rules:',
+    ]
+    const rule = '- Judge how much judgement the work needs, not how long the reply will be or how important the topic sounds.'
+    for (const lang of ['en', 'zh'] as const) {
+      const p = classifierSystem(lang)
+      // In this order: each "Not for" line comes after its own tier's definition and before the next tier.
+      let at = -1
+      for (const line of notFor) {
+        const i = p.indexOf(line, at + 1)
+        expect([line, i > at]).toEqual([line, true])
+        at = i
+      }
+      expect(p.indexOf(rule)).toBeGreaterThan(p.indexOf('Rules:'))
+      expect(legacyClassifierSystem(lang)).not.toContain('Not for:')
+      expect(legacyClassifierSystem(lang)).not.toContain('how long the reply will be')
+    }
+  })
+})
+
 describe('risk detector gaps (1.2.1)', () => {
   const cases: [string, string[], string[]][] = [
     ['ticket transitions',

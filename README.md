@@ -60,7 +60,11 @@ shortcuts.
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
    picks the higher tier. A message that asks for your opinion, or whether something is right, safe or should be done
    ("is this right?", "should it be 60s?", "你覺得呢？"), is decide even when it is short or also gives an instruction, while a question about a
-   fact ("is the build green?") stays lookup (1.2.1; pending replay validation). The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
+   fact ("is the build green?") stays lookup (1.2.1; pending replay validation). Each tier's definition also ends with
+   what it is not for (lookup: nothing that needs a judgement call or explaining why something fails; execute: not
+   choosing between approaches, finding an unknown cause or judging whether something is right; decide: not carrying out
+   settled work or retrieval, however long or important it looks), and a rule says to judge the judgement the work
+   needs, not the length of the reply or how important the topic sounds (1.3.0; pending replay validation). The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
    higher-tier turn the previous tier stays (shown as "unsure: not downgrading"), a first turn never starts on lookup
    (it runs on Sonnet), and an unsure `general-purpose` subagent lookup runs on Sonnet instead of Haiku. Likely secrets
    are masked before classification. **A failed classification never downgrades**: the turn keeps the previous turn's
