@@ -2694,6 +2694,29 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(turnTokens).toBe(150)
     })
 
+    test('session.start still registers when a render activates the same session first (interactive race)', async ($, on) => {
+      let gated = true
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+        if (gated) { gated = false; await gate }
+        return next(e)
+      })
+      const commands: string[] = []
+      const tools: string[] = []
+      on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+      on('command.register', async (_$: unknown, e: any) => { commands.push(e.name); return { value: { command: e.name } } })
+      on('tool.register', async (_$: unknown, e: any) => { tools.push(e.name); return { value: { tool: `mcp__model-router__${e.name}` } } })
+      compactWorld($, on)
+      const start = $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      // The band renders while session.start is still waiting on its identity lookup.
+      await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+      release()
+      await start
+      expect(commands).toContain('model-router')
+      expect(tools).toContain('escalate')
+    })
+
     test('route load failures through prompt and turn start cannot erase the assigned route on retry', async ($, on) => {
       let clears = 0
       on('state.set', { plugin: 'model-router', key: 'route' }, async (_$: unknown, e: any, next: any) => {
