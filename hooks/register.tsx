@@ -716,6 +716,7 @@ function refreshUi($: EngineInterface, session: Session, now: number) {
       if (identity === 'different' && here(session)) {
         session.ended = true
         sessionGeneration += 1
+        sessionRetirements += 1
         resetSession($)
       }
       return
@@ -765,10 +766,13 @@ let activeSession: Session | undefined
 const activationId = crypto.randomUUID()
 // Every lifetime (including end and same-id resume) invalidates older identity lookups.
 let sessionGeneration = 0
+// Ends, retirements and replacements: a raced lookup may join only the first activation in this process.
+let sessionRetirements = 0
 let identityRetry = new Backoff()
 
 function newSession(id: string, ended = false): Session {
   identityRetry = new Backoff()
+  if (ended) sessionRetirements += 1
   return { id, stateId: `${activationId}-${++sessionGeneration}`, ended, history: { done: false, retry: new Backoff() }, daily: { done: false, retry: new Backoff() }, prefs: { done: false, retry: new Backoff() }, retries: new Map() }
 }
 
@@ -788,8 +792,13 @@ function here(session: Session | undefined): session is Session {
 
 async function useSession($: EngineInterface): Promise<Session | undefined> {
   const generation = sessionGeneration
+  const retirements = sessionRetirements
   const id = await sessionId($)
-  if (id === undefined || generation !== sessionGeneration) return undefined
+  if (id === undefined) return undefined
+  // A lookup that raced another hook may join the lifetime that hook activated for this id (interactive
+  // ui.render often wins against session.start), but never one that began after an end or retirement.
+  const joined = retirements === sessionRetirements && activeSession?.id === id && !activeSession.ended
+  if (generation !== sessionGeneration && !joined) return undefined
   if (activeSession?.id === id && !activeSession.ended) {
     const session = activeSession
     await readySession($, session)
@@ -797,6 +806,7 @@ async function useSession($: EngineInterface): Promise<Session | undefined> {
     return session
   }
   const first = activeSession === undefined
+  if (!first) sessionRetirements += 1
   const session = newSession(id)
   activeSession = session
   resetSession($, !first)
