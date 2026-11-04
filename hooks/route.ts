@@ -17,30 +17,46 @@ export function classifierSystem(lang: Lang): string {
   return `You route a developer's message to Claude Code (an AI coding agent) to the cheapest model that can do it well.
 Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}
 
-lookup (fast model): pure retrieval or mechanical work with nothing to judge — find/grep/list files, read and report a value
-  or status, run a command the user named and report the output, rename, fix a typo, format, translate a short text,
-  look up a fact or a doc.
-execute (mid model): doing work whose "what" is already settled in the message or the context you can see — a plan, a
-  spec or an exact instruction: implement a clearly specified change, fix a bug whose cause is known, write tests,
-  refactor to a stated target, write docs or a report from known material, extract or transform data, explain how
-  existing code works, carry out a plan that was already agreed.
-decide (top model): anything that needs judgment before acting — design or architecture, choosing between approaches,
-  trade-offs, planning multi-step or multi-file work, finding the root cause of an unexplained failure, security or
-  correctness review, research synthesis or recommendations, evaluating quality, ambiguous requests that need
-  interpreting, working out how a change to business rules, production data or stored procedures should behave,
-  porting a change to a branch whose version of the code differs, and anything irreversible or outward-facing
-  (deploy, push, delete, money, production, messages to people).
+A tier is how much judgement the work needs, not how dangerous it is.
+
+- **lookup (Haiku):** retrieval or mechanical work with nothing to judge. Find, grep or list files; read and report a value or status; run a command the user named and report the output; rename; fix a typo; format; translate or re-explain a short text; look up a fact or a doc; acknowledge; answer a quick factual follow-up.
+- **execute (Sonnet):** work whose "what" is already settled in the message or the visible context, by a plan, a spec or an exact instruction. Examples:
+  - implement a clearly specified change, or fix a bug whose cause is known;
+  - write tests, or refactor to a stated target;
+  - write docs or a report from known material;
+  - extract or transform data;
+  - explain how existing code works;
+  - carry out a plan that was already agreed, including an instructed push, merge, PR, deploy, or a message whose content is settled;
+  - cherry-pick or port a change when the code is the same on both branches.
+- **decide (Opus):** judgement is needed before acting. Examples:
+  - design or architecture, choosing between approaches, trade-offs;
+  - planning multi-step or multi-file work;
+  - finding the root cause of an unexplained failure;
+  - a security or correctness review;
+  - research synthesis or recommendations, evaluating quality;
+  - an ambiguous request that needs interpreting;
+  - working out how a change to business rules, production data or stored procedures should behave;
+  - porting a change to a branch whose version of the code differs.
 
 Rules:
-- A short reply that continues the previous turn ("做吧", "yes", "继续", "go on") keeps the previous tier,
-  except: approving a plan that was just made ("照这个做", "开始吧") is execute, because the plan settles what to do.
-- "Implement it", "add it to the PR", "commit the fixes" or "cherry-pick it" is execute when the context shows what to
-  change (an approved plan, a spec, an exact instruction). When what to change still has to be worked out, it is decide.
+- A reply that only continues work already in progress ("yes", "go on", "继续") keeps the previous tier.
+- Approving a plan that was just made ("照这个做", "开始吧", "go ahead with that") is execute, because the plan settles what to do.
+- A short message that asks for something new ("explain it in Chinese", "how long will it take?") is judged on its own.
+- A message that is only an image or an attachment, with no words, keeps the previous tier.
 - If a message mixes tiers, use the highest one it contains.
 - When unsure between two tiers, pick the higher one.
 - sure: set false when the message is ambiguous, could reasonably be read at two tiers, or depends on context you cannot
   see; otherwise true. An unsure verdict is never used to move work to a cheaper model.
 - reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.`
+}
+
+// The user prompt of one classification: the same text the router and the replay command both send.
+export function classifierPrompt(previous: Tier | null, context: string, message: string): string {
+  return [
+    `<previous_tier>${previous ?? 'none'}</previous_tier>`,
+    `<context>\n${context || '(none)'}\n</context>`,
+    `\n<message>\n${message}\n</message>`,
+  ].join('\n')
 }
 
 // A reason longer than max is cut at a word boundary and marked with an ellipsis, so the band never shows a word
@@ -82,16 +98,15 @@ export function parseDecision(text: string): { tier: Tier; reason: string; sure:
 
 const TIER_RANK: Record<Tier, number> = { lookup: 0, execute: 1, decide: 2 }
 
-// Low confidence never downgrades: after a higher-tier turn the previous tier stays, and a first turn
-// never starts on lookup. A wrong guess upward costs cents; a wrong guess downward costs a failed turn.
+// Low confidence never downgrades: after a higher-tier turn the previous tier stays, and an unsure lookup never runs on
+// Haiku, whatever came before (subagents follow the same rule). A wrong guess upward costs cents; a wrong guess
+// downward costs a failed turn.
 export function settleTier(d: { tier: Tier; reason: string; sure: boolean }, previous: Tier | null): { tier: Tier; reason: string } {
   if (d.sure) return { tier: d.tier, reason: d.reason }
-  if (previous !== null) {
-    return TIER_RANK[previous] > TIER_RANK[d.tier]
-      ? { tier: previous, reason: `${d.reason} (unsure: not downgrading)` }
-      : { tier: d.tier, reason: d.reason }
+  if (previous !== null && TIER_RANK[previous] > TIER_RANK[d.tier]) {
+    return { tier: previous, reason: `${d.reason} (unsure: not downgrading)` }
   }
-  return d.tier === 'lookup' ? { tier: 'execute', reason: `${d.reason} (unsure: not starting on lookup)` } : { tier: d.tier, reason: d.reason }
+  return d.tier === 'lookup' ? { tier: 'execute', reason: `${d.reason} (unsure: not on lookup)` } : { tier: d.tier, reason: d.reason }
 }
 
 // "#opus", "#sonnet" or "#haiku" in a message pins that turn's model.
@@ -140,12 +155,17 @@ export function withSuffixOf(id: string, current: string): string {
   return id.endsWith(suffix) ? id : `${id}${suffix}`
 }
 
+const SONNET_RISK = `An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus, but care: confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled.`
+// The backstop for what the code risk floor cannot see, such as a "yes" to "push it?": Haiku never carries one out.
+// Main thread only: this text goes beside a person's prompt, and subagents never get it.
+const HAIKU_RISK = `Any irreversible or outward-facing action (a push, merge, PR, deploy, delete, a message to people, or a change to production data) needs at least sonnet, even when the user asked for it or has just approved it: call mcp__model-router__escalate with model sonnet FIRST, before any tool. Once on sonnet it does not need opus if what to do is settled; confirm what it will affect and follow the project's confirmation rules.`
+
 export function assignmentContext(r: Route): string {
   const head = `[model-router] This turn is assigned to ${r.model} at ${r.effort} effort (tier: ${r.tier}${r.reason ? ` — ${r.reason}` : ''}).`
   const opus =
     r.model === 'opus'
       ? `You are on opus at ${r.effort} effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed. If it is not ${r.effort}, call mcp__model-router__escalate with that effort first. Then do the work. Once the plan is settled, if carrying it out spans several files or many steps, delegate it to a general-purpose subagent without a model (the router puts settled work on sonnet) with the plan, the paths and the checks to run, then verify the result yourself; make small changes directly.`
-      : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews, anything irreversible) must be made on opus. If the task is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. If it fits, just start.`
+      : `Before doing any work, judge whether this task fits ${r.model}. Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews) must be made on opus. If the task needs one, is beyond ${r.model} or needs more effort, call mcp__model-router__escalate FIRST, before any other tool; the change applies from your next step. ${r.model === 'haiku' ? HAIKU_RISK : SONNET_RISK} If it fits, just start.`
   return `${head}\n${opus}\nEscalation only goes up within a turn; never call it to go down.`
 }
 

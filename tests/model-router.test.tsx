@@ -10,7 +10,9 @@ import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from '../h
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
-import { applyEscalation, assignmentContext, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
+import { isRisky, riskFloor } from '../hooks/risk'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
@@ -32,6 +34,10 @@ describe('route rules', () => {
     expect(settleTier({ tier: 'execute', reason: 'r', sure: false }, 'decide')).toEqual({ tier: 'decide', reason: 'r (unsure: not downgrading)' })
     expect(settleTier({ tier: 'decide', reason: 'r', sure: false }, 'lookup').tier).toBe('decide')
     expect(settleTier({ tier: 'lookup', reason: 'r', sure: false }, null).tier).toBe('execute')
+    // WHY: round 2 replay — unsure lookups were the under-routes ("check UAT", "is this right?"); a lookup turn before
+    // says nothing about this one, so an unsure lookup goes to execute even after a lookup turn.
+    expect(settleTier({ tier: 'lookup', reason: 'r', sure: false }, 'lookup')).toEqual({ tier: 'execute', reason: 'r (unsure: not on lookup)' })
+    expect(settleTier({ tier: 'lookup', reason: 'r', sure: true }, 'lookup').tier).toBe('lookup')
   })
 
   // Seen in the band on 2026-10-26: "…scope of repo changes u (unsure: not downgrading)", a word sliced in half.
@@ -116,8 +122,8 @@ type Reply = string | null | { fail: 'api-error' | 'empty-reply' }
 function world(
   $: any,
   on: any,
-  classifier: Reply | Reply[],
-  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally } = {},
+  classifier: Reply | Reply[] | ((e: { system?: string; prompt: string }) => Promise<Reply>),
+  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally; usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number } } = {},
 ): Seen {
   const seen: Seen = { sessionId: 'sess-1', clock: mock.clock(on), systems: [], submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {}, statuses: [], store: { ...opts.store } }
   on('store.set', { key: /.*/ }, async (_$: unknown, e: any, next: any) => {
@@ -140,9 +146,9 @@ function world(
     seen.systems.push(e.system ?? '')
     seen.maxTokens.push(e.maxTokens)
     seen.prompts.push(e.prompt)
-    const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+    const usage = opts.usage ?? { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     if (e.model === 'haiku') {
-      const reply = Array.isArray(classifier) ? (classifier.shift() ?? null) : classifier
+      const reply = typeof classifier === 'function' ? await classifier(e) : Array.isArray(classifier) ? (classifier.shift() ?? null) : classifier
       if (reply !== null && typeof reply === 'object') {
         return reply.fail === 'api-error'
           ? { value: { isAnswered: false as const, reason: 'api-error' as const, status: 529, error: 'overloaded', usage } }
@@ -5396,9 +5402,10 @@ describe('execute needs a settled plan; opus delegates settled work (v0.10.0)', 
   // "cherry-pick it") while what to change still had to be worked out.
   test('the classifier calls work execute only when what to change is visible', async () => {
     const text = classifierSystem('en')
-    expect(text).toContain('already settled in the message or the context you can see')
-    expect(text).toContain('is execute when the context shows what to\n  change (an approved plan')
-    expect(text).toContain('When what to change still has to be worked out, it is decide.')
+    // 1.2.0: the round 2 definitions say this in their own words (the separate "implement it" rule is gone).
+    expect(text).toContain('already settled in the message or the visible context, by a plan, a spec or an exact instruction')
+    expect(text).toContain('judgement is needed before acting')
+    expect(text).toContain('an ambiguous request that needs interpreting')
     // An approved plan stays execute: the new rule must not contradict the old one.
     expect(text).toContain('is execute, because the plan settles what to do')
     expect(text).toContain('porting a change to a branch whose version of the code differs')
@@ -6731,6 +6738,23 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(seen.asked).toEqual(['haiku', 'haiku'])
       expect(route(seen, 4)).toContain('assigned to haiku')
       expect(route(seen, 4)).not.toContain('pinned')
+    })
+
+    // WHY: with the router paused nothing is routed, so promising "the rest of this session stays on Sonnet" without
+    // saying it waits for the router would mislead; /model-router pin already says so.
+    test('a correction made while the router is off says the pin waits for the router', async ($, on) => {
+      world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      await cmd($, 'off')
+      expect(await cmd($, 'wrong execute')).toContain('The router is off now; the pin applies once it is on.')
+    })
+
+    test('a correction made while the router is on does not mention the router being off', async ($, on) => {
+      world($, on, LOOKUP)
+      await $.prompt.submit({ text: 'rename the helper' } as never)
+      await $.turn.complete(completion('t1'))
+      expect(await cmd($, 'wrong execute')).not.toContain('The router is off')
     })
 
     test('wrong refuses a turn the classifier did not sort, a same-tier answer and learning off', async ($, on) => {
@@ -8267,5 +8291,830 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       expect(await band.find({ text: /^📌 Sonnet/ })).toBeUndefined()
       await band.unmount()
     })
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 1.2.0: the policy (b) classifier prompt, the risk floor in code, the assignment text and the replay command
+// ---------------------------------------------------------------------------------------------------------------------
+
+const T = (tier: 'lookup' | 'execute' | 'decide', sure = true, reason = 'r') => JSON.stringify({ tier, sure, reason })
+
+describe('risk detector (1.2.0)', () => {
+  // WHY: these are the instructed actions that must never run on Haiku, in the ways people actually type them.
+  test('English instructions to push, merge, deploy, delete, force, touch prod, open a PR, message people or pay are risky', async () => {
+    for (const t of [
+      'push the branch', 'git push origin feat/x', 'merge it into develop', 'deploy to UAT', 'release v1.2 now', 'delete the old bucket',
+      'drop table users', 'rm -rf dist', 'git push --force', 'force-push the rebased branch', 'run the migration on prod',
+      'open a PR to develop', 'create a pull request for this', 'decline the PR', 'cherry-pick it to staging',
+      'reply to the customer', 'post the summary to slack', 'comment on the jira ticket', 'send the email to the client', 'pay the invoice',
+      'can you push it?', 'I pushed the fix already, now merge it',
+    ]) expect([t, isRisky(t)]).toEqual([t, true])
+  })
+
+  test('Simplified Chinese instructions are risky', async () => {
+    for (const t of ['推送到 develop', '推上去吧', '改完 push上去', '合并到 main', '部署到 UAT', '上线吧', '删除旧的分支', '发送给客户', '回复客户', '付款', '帮我推送一下吗', '开个PR']) {
+      expect([t, isRisky(t)]).toEqual([t, true])
+    }
+  })
+
+  test('Traditional Chinese instructions are risky', async () => {
+    for (const t of ['合併到 main', '上線吧', '刪除這個檔案', '發送給客戶', '回覆他', '轉帳給供應商', '開個PR']) expect([t, isRisky(t)]).toEqual([t, true])
+  })
+
+  // WHY: asking what a command does is a lookup; flooring it would put every git question on Sonnet.
+  test('a question about the words is not risky, in English and Chinese', async () => {
+    for (const t of ['what does git push do?', 'how does merge work', 'explain git rebase vs merge', 'is it safe to deploy on Friday?', 'git push 是什么？', '推送是什么意思', '为什么部署失败', '合併是什麼']) {
+      expect([t, isRisky(t)]).toEqual([t, false])
+    }
+  })
+
+  // WHY: a report that something is already done asks for nothing irreversible.
+  test('a past-tense report is not risky, in English and Chinese', async () => {
+    for (const t of ['merged', 'I pushed it already', 'the PR was merged yesterday', 'it is already deployed to prod', 'I deleted the branch', '已经推送了', '推送了', '已合併', '剛部署完了']) {
+      expect([t, isRisky(t)]).toEqual([t, false])
+    }
+  })
+
+  test('a negated action and ordinary work are not risky', async () => {
+    for (const t of ["don't push yet", 'do not merge it', '不要推送', '先不合并', 'fix the typo in the error message', 'add a comment to the function', 'rename the helper', 'find every TODO', 'look at the PR', 'check the product page', 'fix the release notes typo', 'add push notifications', 'send the request with axios', 'pay attention to the tests', '']) {
+      expect([t, isRisky(t)]).toEqual([t, false])
+    }
+  })
+})
+
+describe('risk detector review fixes (1.2.0)', () => {
+  const all = (want: boolean, list: string[]) => {
+    for (const t of list) expect([t, isRisky(t)]).toEqual([t, want])
+  }
+
+  // WHY: 别 inside 分别 / 特别 / 区别 / 级别 is not "do not"; reading it as one let a plain instruction to push run on Haiku.
+  test('a word that only contains 别 does not negate the verb after it', async () => {
+    all(true, ['分别推送到 develop 和 staging', '分别部署到 UAT 和 STG', '特别部署到 UAT', '区别对待，分别合并', '級別高的先部署'])
+    all(false, ['别推送', '別部署', '别再部署了', '不要再推送'])
+  })
+
+  // WHY: a negation or a report qualifies the verb right after it; reaching further back cancelled a different verb.
+  test('a negation or a done marker counts only directly before the verb it qualifies', async () => {
+    all(true, ['不用确认直接推送', '不用確認，直接推送到 staging', '按刚说的推送', '照刚才的部署', '照剛才的部署', 'stop the server and deploy', "don't ask just push"])
+    all(false, ["don't push yet", 'do not merge it', 'never force push', 'stop deploying', '不要推送', '不要直接推送', '先不合并', '已经推送了', '刚部署', '剛部署完了'])
+  })
+
+  // WHY: an earlier past-tense word reports another action; only the same verb in the past tense reports this one.
+  test('an english report cancels only the same verb in the past tense', async () => {
+    all(true, ['the fix I pushed looks good so merge it', 'now that the PR is merged push develop to staging', 'I deployed it to UAT so now merge the PR'])
+    all(false, ['merged', 'I pushed it already', 'I already merge it yesterday', 'the PR was merged yesterday', 'it is already deployed to prod'])
+  })
+
+  // WHY: "when CI passes merge it" and "explain the change and push it" are instructions; dropping the clause whole hid them.
+  test('each part of a sentence is read on its own, and a question word counts only in a question', async () => {
+    all(true, ['when CI passes merge it', 'tell me the result and then push', 'explain the change and push it', 'could you check and push?', '测完再部署', '先合并再部署', '推送到 develop 然后合并到 main', '合併到 develop 之後部署到 UAT', '几乎没改，直接推送', '幾乎沒改直接推送'])
+    all(false, ['when does the deploy run', 'explain git rebase vs merge', 'what happens when we redeploy?', 'could you tell me what git push does?', 'can you explain how merge works?', '部署之后的日志在哪'])
+  })
+
+  test('re- before deploy, push and merge counts', async () => {
+    all(true, ['redeploy the payment service', 're-deploy to UAT', 'repush the tag', 'remerge develop into the branch'])
+  })
+
+  // WHY: these write to a database, an account or a registry and cannot be undone from the session.
+  test('SQL writes, infrastructure and publishing commands, and ship or send it are risky', async () => {
+    all(true, [
+      'run UPDATE Users SET IsActive = 0 WHERE Id = 5 on UAT', 'INSERT INTO Workflows VALUES (1)', 'DELETE FROM Users WHERE Id = 5', 'ALTER TABLE Payments ADD Col INT',
+      'TRUNCATE TABLE Logs', 'DROP TABLE Temp', 'EXEC dbo.Workflows_UpdateWorkflowStatusID 5, 22', 'exec sp_CreateUser', 'EXEC Workflows_UpdateWorkflowStatusID 5',
+      'run terraform apply', 'terraform destroy the uat stack', 'npm publish', 'pnpm publish --access public', 'git clean -fdx', 'git branch -D feature/x',
+      'docker system prune -a', 'docker rm -f api', 'docker volume prune', 'aws s3 rm s3://bucket/key',
+      'ship it', 'looks good, send it', 'post it in #dev-alerts', 'slack him the link',
+      '推吧', '发版吧', '發版吧', '上传到 S3', '上傳到 S3',
+    ])
+    all(false, ['execute the plan', 'docker exec -it api sh', 'docker ps', 'update the readme', 'insert a row in the test fixture', 'what does terraform apply do?', 'how do I npm publish a scoped package?', 'send the request with axios', 'git branch --list'])
+  })
+
+  // WHY: a lookup that mentions prod, a PR, a merge or a deploy is still a lookup; flooring it costs a Sonnet turn.
+  test('noun uses and lookups about prod, PRs, merges, deploys, comments and replies are not risky', async () => {
+    all(false, [
+      'show me the prod logs for the last hour', 'check the prod config value of SITE_URL', 'open PR 431 and list the comments', 'open the PR and summarise it',
+      'git log --merges | head', 'show me the merge conflicts', 'read the deploy log', 'look at the pay page component',
+      '查一下线上环境的配置', '生产环境的日志在哪看', '部署文档在哪里', '发布说明在哪', '看一下这个 PR 的评论', '请简短回复', '這個 PR 的評論在哪裡', '我不太清楚生产环境的配置',
+      'could you tell me what git push does?',
+    ])
+    all(true, ['run the migration on prod', 'restart the api in production', '在生产环境执行这个脚本', '把这个配置改到线上环境', 'open a PR to develop', 'create a PR to develop', 'reply on the jira ticket with the result', '回复客户', '在 jira 上评论一下结果'])
+  })
+
+  // WHY: real messages mix a lookup, a report and an instruction in one go; the instruction must still be found.
+  test('realistic multi-clause messages in English, Simplified and Traditional Chinese', async () => {
+    all(true, [
+      'Thanks, the tests pass now. Bump the version, update the changelog and then push it to origin.',
+      'Looks good to me. When the pipeline is green, merge the PR into develop.',
+      'Run UPDATE Payments SET Status = 2 WHERE Id = 9 on UAT, then tell me the row count.',
+      '先跑一下测试，没问题的话推送到 develop 再开个 PR。',
+      '测试都过了，分别部署到 UAT 和 STG，然后在 Slack 通知大家。',
+      '測試都通過了，合併到 develop 之後部署到 UAT。',
+      '不用確認，直接推送到 staging。',
+    ])
+    all(false, [
+      'Can you explain why the build failed and then fix it?',
+      'I already merged the PR yesterday, so just check the pipeline status.',
+      'What happens to the open sessions when we redeploy?',
+      'Read the deploy log and tell me which step failed.',
+      '这个 PR 的评论我看过了，帮我总结一下要改的地方。',
+      '生产环境的日志在哪里看？顺便告诉我部署文档在哪。',
+      '之前已经推送了，现在只需要确认 CI 状态。',
+      '這個分支已經合併了嗎？',
+      '請幫我看一下線上環境的設定，不要改任何東西。',
+    ])
+  })
+})
+
+describe('risk floor (1.2.0)', () => {
+  const route = (seen: Seen, i = 0) => seen.submits[i]!.context?.[0] ?? ''
+
+  // WHY: settleTier already raises an unsure lookup; counting that as a floor inflates the stats figure.
+  test('an unsure risky lookup goes to Sonnet by the unsure rule and is not counted as a floor', async ($, on) => {
+    const seen = world($, on, T('lookup', false, 'git'))
+    await $.prompt.submit({ text: 'push the branch to origin' } as never)
+    expect(route(seen)).toContain('assigned to sonnet')
+    expect(route(seen)).toContain('(unsure: not on lookup)')
+    expect(route(seen)).not.toContain('risky action')
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
+  })
+
+  test('an unsure risky subagent lookup runs on Sonnet and is not counted as a floor', async ($, on) => {
+    const seen = world($, on, T('lookup', false))
+    await spawnAgent($, { prompt: 'push the release branch to origin' })
+    expect(seen.agents).toEqual(['sonnet'])
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
+  })
+
+  test('the floor raises a risky lookup to execute and never moves any other tier', async () => {
+    expect(riskFloor('lookup', true)).toBe('execute')
+    expect(riskFloor('execute', true)).toBe('execute')
+    expect(riskFloor('decide', true)).toBe('decide')
+    expect(riskFloor('lookup', false)).toBe('lookup')
+    expect(riskFloor('execute', false)).toBe('execute')
+    expect(riskFloor('decide', false)).toBe('decide')
+  })
+
+  // WHY: policy (b): an instructed push is settled work, so it runs on Sonnet at the tier's own effort, not on Haiku and not on Opus.
+  test('a risky message classified lookup runs on Sonnet at medium, says why, and is counted', async ($, on) => {
+    const seen = world($, on, T('lookup', true, 'run git'))
+    await $.prompt.submit({ text: 'push the branch to origin' } as never)
+    expect(route(seen)).toContain('assigned to sonnet at medium effort')
+    expect(route(seen)).toContain('run git · risky action: at least Sonnet')
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
+  })
+
+  test('a risky execute or decide verdict is left alone and not counted', async ($, on) => {
+    const seen = world($, on, [T('execute', true, 'ship'), T('decide', true, 'plan')])
+    await $.prompt.submit({ text: 'merge it into develop' } as never)
+    expect(route(seen, 0)).toContain('assigned to sonnet')
+    expect(route(seen, 0)).not.toContain('risky action')
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    await $.prompt.submit({ text: 'deploy, but first work out the rollout order' } as never)
+    expect(route(seen, 1)).toContain('assigned to opus')
+    expect(route(seen, 1)).not.toContain('risky action')
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
+  })
+
+  test('a question about a risky word stays on Haiku', async ($, on) => {
+    const seen = world($, on, T('lookup', true, 'explain'))
+    await $.prompt.submit({ text: 'what does git push do?' } as never)
+    expect(route(seen)).toContain('assigned to haiku')
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 0.')
+  })
+
+  test('the floor note is in Chinese for a Chinese session', { options: { language: 'zh' } }, async ($, on) => {
+    const seen = world($, on, T('lookup', true, '推送'))
+    await $.prompt.submit({ text: '推送到主分支' } as never)
+    expect(route(seen)).toContain('assigned to sonnet')
+    expect(route(seen)).toContain('推送 · 风险操作：至少用 Sonnet')
+  })
+
+  test('a failed classification after a lookup turn keeps the tier but still floors a risky message', async ($, on) => {
+    const seen = world($, on, [T('lookup', true, 'find'), null])
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    expect(route(seen, 0)).toContain('assigned to haiku')
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    await $.prompt.submit({ text: 'now push it' } as never)
+    expect(route(seen, 1)).toContain('assigned to sonnet')
+    expect(route(seen, 1)).toContain('kept previous tier · risky action: at least Sonnet')
+  })
+
+  test('a general-purpose subagent with a risky lookup task runs on Sonnet and counts', async ($, on) => {
+    const seen = world($, on, [T('lookup'), T('lookup')])
+    await spawnAgent($, { prompt: 'grep for TODO' })
+    await spawnAgent($, { prompt: 'push the release branch to origin' })
+    expect(seen.agents).toEqual(['haiku', 'sonnet'])
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
+  })
+
+  // WHY: the owner's policy is that a risky action never runs on Haiku; a Haiku parent used to clamp the floor back to
+  // Haiku, and a subagent gets no assignment text, so nothing else stopped it. Safety wins over the parent ceiling here.
+  test('a Haiku parent spawning push the release branch runs the subagent on Sonnet, and its steps stay on Sonnet', async ($, on) => {
+    const seen = world($, on, T('lookup'))
+    const id = await spawnAgent($, { prompt: 'push the release branch', parentModel: 'claude-haiku-5-5' })
+    expect(seen.agents).toEqual(['sonnet'])
+    await step($, 't1', 'claude-haiku-5-5', id)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', agentId: id, effort: 'medium' })
+    expect(seen.statuses.some(t => t?.includes('risky action: Sonnet, above the Haiku parent'))).toBe(true)
+    expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
+  })
+
+  test('under a Haiku parent a task the risk check does not flag still runs on Haiku', async ($, on) => {
+    const seen = world($, on, T('lookup'))
+    await spawnAgent($, { prompt: 'grep for TODO', parentModel: 'claude-haiku-5-5' })
+    expect(seen.agents).toEqual(['haiku'])
+  })
+
+  test('the Haiku parent exception covers every verdict of an unpinned general-purpose agent, and nothing else', async () => {
+    const hp = { parentModel: 'claude-haiku-5-5' }
+    for (const [tier, sure] of [['lookup', true], ['lookup', false], ['execute', true], ['decide', true], [null, true]] as const) {
+      expect([tier, sure, decideSpawn(spawnInput(hp), tier, sure, true, true)]).toEqual([tier, sure, expect.objectContaining({ model: 'sonnet', ceiling: 'sonnet' })])
+    }
+    expect(decideSpawn(spawnInput(hp), 'execute', true, true, false)).toEqual({ model: 'haiku', reason: 'execute work' })
+    expect(decideSpawn(spawnInput({ ...hp, model: 'haiku' }), 'execute', true, true, true)).toBeUndefined()
+    expect(decideSpawn(spawnInput({ ...hp, subagentType: 'Explore' }), null, true, true, true)).toEqual({ model: 'haiku', reason: 'Explore: lookup' })
+    expect(decideSpawn(spawnInput({ ...hp, fork: true }), 'execute', true, true, true)).toBeUndefined()
+    expect(decideSpawn(spawnInput(), 'execute', true, true, true)).toEqual({ model: 'sonnet', reason: 'execute work' })
+    expect(decideSpawn(spawnInput({ parentModel: 'claude-sonnet-5-5' }), 'decide', true, true, true)).toEqual({ model: undefined, reason: 'decision work, inherits' })
+  })
+
+  // WHY: the exception is the only one; escalation and the ladder keep a ceiling, which is now the Sonnet it was given.
+  test('a subagent raised above its Haiku parent can raise effort but never its model', async () => {
+    const s = startOf('claude-sonnet-5-5', 'claude-haiku-5-5', true, IDS_BY_KEY, false, 'sonnet')
+    expect(s).toMatchObject({ tier: 'sonnet', ceiling: 'sonnet', model: 'claude-sonnet-5-5', effort: 'medium' })
+    expect(escalateAgent(s, { model: 'opus' }, IDS_BY_KEY)).toBeUndefined()
+    expect(escalateAgent(s, { model: 'opus' }, IDS_BY_KEY, 'main')).toBeUndefined()
+    expect(escalateAgent(s, { model: 'opus', effort: 'high' }, IDS_BY_KEY)).toMatchObject({ tier: 'sonnet', effort: 'high' })
+    expect(startOf('claude-sonnet-5-5', 'claude-haiku-5-5', true, IDS_BY_KEY)).toMatchObject({ tier: 'haiku', ceiling: 'haiku' })
+    expect(startOf('claude-opus-5-5', 'claude-opus-5-5', true, IDS_BY_KEY, false, 'sonnet').ceiling).toBe('opus')
+  })
+})
+
+describe('classifier prompt and reply (1.2.0)', () => {
+  // WHY: the round 2 measurement used these definitions word for word; a paraphrase would invalidate it.
+  test('the prompt carries the round 2 tier definitions and rules word for word', async () => {
+    const p = classifierSystem('en')
+    for (const line of [
+      'A tier is how much judgement the work needs, not how dangerous it is.',
+      '- **lookup (Haiku):** retrieval or mechanical work with nothing to judge. Find, grep or list files; read and report a value or status; run a command the user named and report the output; rename; fix a typo; format; translate or re-explain a short text; look up a fact or a doc; acknowledge; answer a quick factual follow-up.',
+      '- **execute (Sonnet):** work whose "what" is already settled in the message or the visible context, by a plan, a spec or an exact instruction. Examples:',
+      '  - carry out a plan that was already agreed, including an instructed push, merge, PR, deploy, or a message whose content is settled;',
+      '  - cherry-pick or port a change when the code is the same on both branches.',
+      '- **decide (Opus):** judgement is needed before acting. Examples:',
+      '  - porting a change to a branch whose version of the code differs.',
+      '- A reply that only continues work already in progress ("yes", "go on", "继续") keeps the previous tier.',
+      '- Approving a plan that was just made ("照这个做", "开始吧", "go ahead with that") is execute, because the plan settles what to do.',
+      '- A short message that asks for something new ("explain it in Chinese", "how long will it take?") is judged on its own.',
+      '- A message that is only an image or an attachment, with no words, keeps the previous tier.',
+      '- If a message mixes tiers, use the highest one it contains.',
+      '- When unsure between two tiers, pick the higher one.',
+    ]) expect([line, p.includes(line)]).toEqual([line, true])
+  })
+
+  // WHY: risk is decided in code; asking the model for it again would bring back the uncalibrated guard.
+  test('the prompt asks for tier, sure and reason only, and no longer makes risky work decide', async () => {
+    const p = classifierSystem('en')
+    expect(p).toContain('Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|false,"reason":string}')
+    expect(p).toContain('- sure: set false when the message is ambiguous')
+    expect(p).not.toMatch(/"risk"|\*\*risk|"p"/)
+    expect(p).not.toContain('Danger is labelled')
+    expect(p).not.toContain('anything irreversible or outward-facing')
+    expect(classifierSystem('zh')).toContain('Simplified Chinese, at most 15 字')
+    expect(legacyClassifierSystem('en')).toContain('anything irreversible or outward-facing')
+    expect(legacyClassifierSystem('en')).not.toBe(classifierSystem('en'))
+  })
+
+  test('a reply is tier, sure and reason; sure defaults to true; a cut reply is unsure; a probability reply is unreadable', async () => {
+    expect(parseDecision('{"tier":"lookup","reason":"x"}')).toEqual({ tier: 'lookup', reason: 'x', sure: true })
+    expect(parseDecision('{"tier":"decide","sure":false,"reason":"x"}')).toEqual({ tier: 'decide', reason: 'x', sure: false })
+    expect(parseDecision('{"tier":"execute","sure":true,"reas')).toEqual({ tier: 'execute', reason: '', sure: false })
+    expect(parseDecision('{"p":{"lookup":0.9,"execute":0.1,"decide":0},"risk":0.1,"reason":"x"}')).toBe(null)
+  })
+})
+
+describe('assignment text for policy (b) (1.2.0)', () => {
+  // WHY: the old text made Sonnet escalate to Opus on every instructed push; settled actions need care, not Opus.
+  test('a settled risky action no longer forces escalation; decisions still do', async () => {
+    for (const tier of ['lookup', 'execute'] as const) {
+      const t = assignmentContext(routeFor(tier, 'x'))
+      expect(t).not.toContain('anything irreversible')
+      expect(t).toContain('Decisions (design, choosing between approaches, trade-offs, plans, unexplained root causes, reviews) must be made on opus')
+      expect(t).toContain('call mcp__model-router__escalate FIRST')
+    }
+    const sonnet = assignmentContext(routeFor('execute', 'x'))
+    expect(sonnet).toContain('An irreversible or outward-facing action the user asked for and already settled (a push, merge, PR, deploy or a message whose content is given) does not need opus')
+    expect(sonnet).toContain("confirm what it will affect, follow the project's confirmation rules, and escalate only if what to do is not settled")
+    expect(sonnet).not.toContain('needs at least sonnet')
+  })
+
+  // WHY: the code floor cannot see an approval: after "git status" on Haiku, a "yes" to "push?" keeps the lookup tier.
+  // The Haiku text is the backstop, so it must send every irreversible or outward-facing action to Sonnet first.
+  test('the haiku text sends any irreversible or outward-facing action to sonnet before any tool, even an approved one', async () => {
+    const t = assignmentContext(routeFor('lookup', 'x'))
+    expect(t).toContain('Any irreversible or outward-facing action (a push, merge, PR, deploy, delete, a message to people, or a change to production data) needs at least sonnet')
+    expect(t).toContain('even when the user asked for it or has just approved it')
+    expect(t).toContain('call mcp__model-router__escalate with model sonnet FIRST, before any tool')
+    // Not the Sonnet sentence: "escalate only if what to do is not settled" would tell Haiku to carry out a settled push.
+    expect(t).not.toContain('escalate only if what to do is not settled')
+  })
+
+  test('the opus text is unchanged', async () => {
+    const t = assignmentContext(routeFor('decide', 'x'))
+    expect(t).toContain('You are on opus at medium effort. Decide the effort this task needs: medium for most work; high for multi-step design, plans or reviews; xhigh for hard debugging or architecture; max only for an irreversible, production-affecting decision or after an attempt at xhigh has failed.')
+    expect(t).not.toContain('already settled')
+  })
+})
+
+describe('/model-router replay (1.2.0)', () => {
+  const IN = '/work/labelled.json'
+  const OUT = '/work/labelled.replay.json'
+  const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
+  const items = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `m${i}`, message: `message ${i}`, context: i % 2 ? '[user] earlier' : '', previous: i % 3 === 0 ? 'execute' : null }))
+  const macrotask = () => new Promise(resolve => (globalThis as any).setTimeout(resolve, 5))
+
+  // The world's classifier for these tests: answers every haiku call (live or replayed) by what was asked, and records
+  // the requests and how many ran at once. null is a timeout.
+  function classifierBy(answer: (system: string, prompt: string, n: number) => string | null | Promise<string | null>) {
+    const calls = { n: 0, inFlight: 0, max: 0, requests: [] as { system: string; prompt: string }[] }
+    const fn = async (e: { system?: string; prompt: string }): Promise<string | null> => {
+      const n = calls.n++
+      calls.requests.push({ system: e.system ?? '', prompt: e.prompt })
+      calls.inFlight++
+      calls.max = Math.max(calls.max, calls.inFlight)
+      for (let i = 0; i < 50; i++) await Promise.resolve()
+      const reply = await answer(e.system ?? '', e.prompt, n)
+      calls.inFlight--
+      return reply
+    }
+    return { calls, fn }
+  }
+  const bothShapes = (system: string) => (system === classifierSystem('en') ? T('lookup', true, 'new') : T('execute', false, 'old'))
+  // The engine turns a path such as /work/x.json into an absolute one on Windows, so the input is stored under both
+  // spellings and the output is found by its name.
+  const put = (seen: Seen, text: string) => {
+    seen.files[IN] = text
+    seen.files['C:\\work\\labelled.json'] = text
+  }
+  const outFile = (seen: Seen) => Object.keys(seen.files).find(k => /labelled\.replay\.json$/.test(k))
+  const readOut = (seen: Seen) => JSON.parse(seen.files[outFile(seen)!]!) as any[]
+  // A replay that hits a timeout pauses on the clock: run it while moving the clock on.
+  async function withClock(seen: Seen, run: Promise<string>): Promise<string> {
+    let done = false
+    void run.then(() => { done = true }, () => { done = true })
+    for (let i = 0; i < 40 && !done; i++) {
+      await macrotask()
+      await seen.clock.advance(REPLAY_PAUSE_MS)
+    }
+    return run
+  }
+
+  test('argument parsing: a path with spaces, an optional variant, --repeat 1 to 3, the output beside the input', async () => {
+    // WHY: Muhafiz's run read /private/tmp/~/router-eval/… — `$.fs` does not expand `~`, so a replay of a file in the home
+    // folder failed unless the path was absolute.
+    expect(resolveReplayPath('~/router-eval/in.json', '/Users/m', '/private/tmp')).toBe('/Users/m/router-eval/in.json')
+    expect(resolveReplayPath('~\\eval\\in.json', 'C:\\Users\\h\\', 'C:\\x')).toBe('C:\\Users\\h\\eval\\in.json')
+    expect(resolveReplayPath('in.json', '/Users/m', '/work/')).toBe('/work/in.json')
+    expect(resolveReplayPath('/abs/in.json', '/Users/m', '/work')).toBe('/abs/in.json')
+    expect(resolveReplayPath('C:/abs/in.json', 'C:/Users/h', 'C:/work')).toBe('C:/abs/in.json')
+    expect(resolveReplayPath('~user/in.json', '/Users/m', '/work')).toBe('/work/~user/in.json')
+    expect(parseReplayArgs(' /a b/c.json ')).toEqual({ path: '/a b/c.json', variants: ['current', 'legacy'], repeat: 1 })
+    expect(parseReplayArgs('/a.json legacy')).toEqual({ path: '/a.json', variants: ['legacy'], repeat: 1 })
+    expect(parseReplayArgs('/a.json current')?.variants).toEqual(['current'])
+    expect(parseReplayArgs('/a.json both')?.variants).toEqual(['current', 'legacy'])
+    expect(parseReplayArgs('/my files/a.json legacy --repeat 3')).toEqual({ path: '/my files/a.json', variants: ['legacy'], repeat: 3 })
+    for (const bad of ['/a.json --repeat 0', '/a.json --repeat 4', '/a.json --repeat x', '/a.json --repeat 1.5', '/a.json --examples /e.json', '   ']) {
+      expect([bad, parseReplayArgs(bad)]).toEqual([bad, null])
+    }
+    expect(replayOutPath('/work/labelled.json')).toBe(OUT)
+    expect(replayOutPath('/work/labelled')).toBe(OUT)
+  })
+
+  test('it is not advertised: the usage text does not mention it, and a bare replay or a bad flag gets its own usage', async ($, on) => {
+    world($, on, T('lookup'))
+    expect(await cmd($, 'nonsense')).not.toContain('replay')
+    expect(await cmd($, 'replay')).toContain('Usage: /model-router replay <path> [current|legacy|both] [--repeat <1-3>]')
+    expect(await cmd($, `replay ${IN} --examples /e.json`)).toContain('Usage: /model-router replay')
+  })
+
+  test('both variants run over every item, both are parsed the same way, and a summary comes back', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(3)))
+    const text = await cmd($, `replay ${IN}`)
+    expect(calls.n).toBe(6)
+    const rows = readOut(seen)
+    expect(rows).toHaveLength(6)
+    const current = rows.filter(r => r.variant === 'current')
+    const legacy = rows.filter(r => r.variant === 'legacy')
+    expect(current.map(r => r.id).sort()).toEqual(['m0', 'm1', 'm2'])
+    expect(current[0]).toMatchObject({ ok: true, run: 1, tier: 'lookup', sure: true, risk: false })
+    expect(legacy[0]).toMatchObject({ ok: true, run: 1, tier: 'execute', sure: false, risk: false })
+    expect(typeof current[0].ms).toBe('number')
+    expect(text).toContain('Replay of 3 items (0 risky by the code check): results in /work/labelled.replay.json')
+    expect(text).toContain('current: 3/3 answered · lookup 3 · execute 0 · decide 0 · unsure 0')
+    expect(text).toContain('legacy: 3/3 answered · lookup 0 · execute 3 · decide 0 · unsure 3')
+  })
+
+  test('a single variant runs only that one, with its own prompt', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    await cmd($, `replay ${IN} legacy`)
+    expect(calls.n).toBe(2)
+    expect(calls.requests.every(r => r.system === legacyClassifierSystem('en'))).toBe(true)
+    expect(readOut(seen).every(r => r.variant === 'legacy')).toBe(true)
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(4)
+    expect(calls.requests.slice(2).every(r => r.system === classifierSystem('en'))).toBe(true)
+    expect(readOut(seen).every(r => r.variant === 'current')).toBe(true)
+  })
+
+  // WHY: run-to-run noise is what round 2 measures; each repeat must be a separate real call with its run number.
+  test('--repeat runs each variant n times and records the run', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    const text = await cmd($, `replay ${IN} --repeat 3`)
+    expect(calls.n).toBe(12)
+    const rows = readOut(seen)
+    expect(rows).toHaveLength(12)
+    for (const id of ['m0', 'm1']) {
+      for (const variant of ['current', 'legacy']) {
+        expect(rows.filter(r => r.id === id && r.variant === variant).map(r => r.run).sort()).toEqual([1, 2, 3])
+      }
+    }
+    expect(text).toContain('Replay of 2 items × 3 runs')
+    expect(text).toContain('current: 6/6 answered')
+  })
+
+  // WHY: the row must say what the code floor would do, while the tier stays the classifier answer, so both can be scored.
+  test('each row records the code risk check of its message, and the tier as the classifier gave it', async ($, on) => {
+    const { fn } = classifierBy(() => T('lookup'))
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify([{ id: 'p', message: 'push the branch' }, { id: 'q', message: 'what does git push do?' }, { id: 'z', message: '已经推送了' }]))
+    const text = await cmd($, `replay ${IN} current`)
+    const rows = readOut(seen)
+    expect(rows.find(r => r.id === 'p')).toMatchObject({ risk: true, tier: 'lookup' })
+    expect(rows.find(r => r.id === 'q')).toMatchObject({ risk: false, tier: 'lookup' })
+    expect(rows.find(r => r.id === 'z')).toMatchObject({ risk: false })
+    expect(text).toContain('(1 risky by the code check)')
+  })
+
+  // WHY: a replay of `~/router-eval/in.json` read `<cwd>/~/router-eval/in.json` on macOS, so it had to be run with an
+  // absolute path; `~` must reach the file in the home folder.
+  test('a path starting with ~ is read from the home folder', async ($, on) => {
+    const { fn } = classifierBy(() => T('execute'))
+    const seen = world($, on, fn)
+    on('env.get', () => ({ value: '/home/m' }))
+    // The kit maps a POSIX path to a drive path on Windows, as `put` does for the other replay tests.
+    seen.files['/home/m/router-eval/in.json'] = JSON.stringify(items(1))
+    seen.files['C:\\home\\m\\router-eval\\in.json'] = JSON.stringify(items(1))
+    const text = await cmd($, 'replay ~/router-eval/in.json current')
+    expect(text).toContain('/home/m/router-eval/in.replay.json')
+    expect(seen.files['/home/m/router-eval/in.replay.json'] ?? seen.files['C:\\home\\m\\router-eval\\in.replay.json']).toBeDefined()
+  })
+
+  test('each row records how long its call took', async ($, on) => {
+    const box: { seen?: Seen } = {}
+    const { fn } = classifierBy(async (_s, prompt) => {
+      await box.seen!.clock.advance(prompt.includes('message 0') ? 1500 : 200)
+      return T('execute')
+    })
+    const seen = world($, on, fn)
+    box.seen = seen
+    put(seen, JSON.stringify(items(1)))
+    await cmd($, `replay ${IN} current`)
+    expect(readOut(seen)[0].ms).toBe(1500)
+  })
+
+  // WHY: the replay measures the real call, so it must send what classifyTier sends; stored corrections reach neither.
+  test('each request is the live call, and stored corrections reach neither', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const stored = { corrections: [{ at: 1, text: 'rename the helper', routed: 'lookup', right: 'decide', source: 'manual' }] }
+    const seen = world($, on, fn, { store: stored })
+    put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: '', previous: null }, { id: 'b', message: 'now the tests', context: '[user] x', previous: 'decide' }]))
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    expect(seen.systems[0]).toBe(classifierSystem('en'))
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    await cmd($, `replay ${IN} both`)
+    const replayed = calls.requests.slice(1)
+    expect(replayed).toHaveLength(4)
+    expect(new Set(replayed.map(r => r.prompt))).toEqual(new Set([classifierPrompt(null, '', 'find every TODO'), classifierPrompt('decide', '[user] x', 'now the tests')]))
+    expect(replayed.map(r => r.system).sort()).toEqual([classifierSystem('en'), classifierSystem('en'), legacyClassifierSystem('en'), legacyClassifierSystem('en')].sort())
+    expect(replayed.every(r => !r.system.includes('rename the helper'))).toBe(true)
+    expect(seen.asked.every(m => m === 'haiku')).toBe(true)
+    expect(seen.maxTokens.every(n => n === seen.maxTokens[0])).toBe(true)
+  })
+
+  test('the replay prompt is byte for byte the prompt a live classification sends', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn, { messages: [{ role: 'user', text: 'earlier question' }, { role: 'assistant', text: 'earlier answer' }] })
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    const live = seen.prompts[0]!
+    put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: '[user] earlier question\n\n[assistant] earlier answer', previous: null }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[1]!.prompt).toBe(live)
+  })
+
+  test('the message is masked and cut to 6000 characters like a live one, and a secret in the raw reply is masked', async ($, on) => {
+    const { calls, fn } = classifierBy(() => `{"tier":"lookup","reason":"sk-ant-api03-${'e'.repeat(30)}"}`)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify([{ id: 'k', message: `use sk-ant-api03-${'q'.repeat(30)} ${'x'.repeat(7000)}`, context: `token sk-ant-api03-${'w'.repeat(30)}`, previous: null }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[0]!.prompt).not.toContain('qqqqqqqqqq')
+    expect(calls.requests[0]!.prompt).not.toContain('wwwwwwwwww')
+    expect(calls.requests[0]!.prompt).toContain('[REDACTED')
+    expect(calls.requests[0]!.prompt.length).toBeLessThan(6000 + 400)
+    expect(readOut(seen)[0].raw).not.toContain('eeeeeeeeee')
+  })
+
+  test('at most 4 requests are in flight at once, and all of them run', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(12)))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(12)
+    expect(calls.max).toBe(4)
+    expect(readOut(seen)).toHaveLength(12)
+  })
+
+  test('a timeout and an unreadable reply are rows with a reason, and the summary counts them', async ($, on) => {
+    const { fn } = classifierBy((_s, prompt) => (prompt.includes('message 0') ? null : prompt.includes('message 1') ? 'no json here' : T('execute')))
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(3)))
+    const text = await withClock(seen, cmd($, `replay ${IN} current`))
+    const rows = readOut(seen)
+    expect(rows.find(r => r.id === 'm0')).toMatchObject({ ok: false, why: 'timeout', risk: false })
+    expect(rows.find(r => r.id === 'm1')).toMatchObject({ ok: false, why: 'unparseable', raw: 'no json here' })
+    expect(rows.find(r => r.id === 'm2')).toMatchObject({ ok: true, tier: 'execute' })
+    expect(text).toContain('current: 1/3 answered')
+    expect(text).toContain('failures: timeout ×1 · unparseable ×1')
+  })
+
+  // WHY: a timeout usually means the API is struggling; starting more calls at once turns one timeout into a storm.
+  test('after a timeout no new request starts until the pause has passed', async ($, on) => {
+    const { calls, fn } = classifierBy((_s, prompt) => (prompt.includes('message 0') ? null : T('execute')))
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(6)))
+    let text: string | undefined
+    const run = cmd($, `replay ${IN} current`).then(t => { text = t; return t })
+    const drain = async () => { for (let i = 0; i < 5; i++) { await macrotask(); await seen.clock.advance(0) } }
+    await drain()
+    expect(calls.n).toBe(4)
+    expect(text).toBeUndefined()
+    await seen.clock.advance(REPLAY_PAUSE_MS - 1)
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(1)
+    await drain()
+    await run
+    expect(calls.n).toBe(6)
+    expect(readOut(seen)).toHaveLength(6)
+  })
+
+  // WHY: a replay is a measuring instrument; if it moved routing it would change the numbers it exists to read.
+  test('it changes no routing state, count, correction or band; only the spend moves', async ($, on) => {
+    const { fn } = classifierBy((system, prompt) => (prompt.includes('design the queue') ? T('decide', true, 'design') : prompt.includes('and the tests?') ? T('lookup', false) : bothShapes(system)))
+    const seen = world($, on, fn)
+    await $.prompt.submit({ text: 'design the queue' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    put(seen, JSON.stringify(items(4)))
+    const countKeys = () => JSON.stringify(Object.fromEntries(Object.entries(seen.store).filter(([k]) => k.startsWith('counts:'))))
+    const countsBefore = countKeys()
+    const submitsBefore = seen.submits.length
+    const statusesBefore = seen.statuses.length
+    const spentBefore = seen.tally?.byRole?.classifier?.tokens ?? 0
+    expect(countsBefore).not.toBe('{}')
+    await cmd($, `replay ${IN}`)
+    expect(countKeys()).toBe(countsBefore)
+    expect(seen.store.corrections).toBeUndefined()
+    expect(seen.submits).toHaveLength(submitsBefore)
+    expect(seen.statuses).toHaveLength(statusesBefore)
+    expect((seen.tally?.byRole?.classifier?.tokens ?? 0) - spentBefore).toBe(16)
+    await $.prompt.submit({ text: 'and the tests?' } as never)
+    expect(seen.submits.at(-1)!.context?.[0]).toContain('assigned to opus')
+    expect(seen.submits.at(-1)!.context?.[0]).toContain('(unsure: not downgrading)')
+  })
+
+  // WHY: a turn can start while a replay is still running; its band and history must show its own cost, not the replay.
+  test('a turn started during a replay does not carry the replay spend, in its tally or its history record', async ($, on) => {
+    const waiting: (() => void)[] = []
+    let open = false
+    const { calls, fn } = classifierBy(async (system, prompt) => {
+      if (prompt.includes('live work')) return T('execute')
+      if (!open) await new Promise<void>(resolve => waiting.push(resolve))
+      return bothShapes(system)
+    })
+    const seen = world($, on, fn)
+    const box: { turn?: Tally; records?: { value: { turnId: string; tokens: number }[] } } = {}
+    on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+      box.turn = e.value.turn
+      return next(e)
+    })
+    on('state.set', { plugin: 'model-router', key: 'turns' }, async (_$: unknown, e: any, next: any) => {
+      box.records = e.value
+      return next(e)
+    })
+    put(seen, JSON.stringify(items(4)))
+    const run = cmd($, `replay ${IN} current`)
+    for (let i = 0; i < 40 && waiting.length < 4; i++) await macrotask()
+    expect(waiting).toHaveLength(4)
+    await $.prompt.submit({ text: 'live work' } as never)
+    expect(seen.submits.at(-1)!.context?.[0]).toContain('assigned to sonnet')
+    const todayBefore = seen.tally!.tokens
+    open = true
+    for (const release of waiting.splice(0)) release()
+    await run
+    expect(calls.n).toBe(5)
+    // The live classifier call is 2 tokens; the four replay calls (8 tokens) go to the day only.
+    expect(seen.tally!.tokens - todayBefore).toBe(8)
+    expect(box.turn!.tokens).toBe(2)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    expect(box.records!.value.find(r => r.turnId === 't1')!.tokens).toBe(2)
+  })
+
+  // WHY: the replay measures the live call; a context the live call would trim must be trimmed the same way.
+  test('a long context is trimmed per message exactly as a live classification trims it', async ($, on) => {
+    const long = `${'a'.repeat(300)}MIDDLE${'b'.repeat(1500)}`
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn, { messages: [{ role: 'user', text: long }, { role: 'assistant', text: `short\n\nwith a blank line ${'c'.repeat(1300)}END` }] })
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    const live = seen.prompts[0]!
+    expect(live).not.toContain('MIDDLE')
+    put(seen, JSON.stringify([{ id: 'a', message: 'find every TODO', context: `[user] ${long}\n\n[assistant] short\n\nwith a blank line ${'c'.repeat(1300)}END`, previous: null }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[1]!.prompt).toBe(live)
+  })
+
+  test('it refuses while a turn is running, and asks the model nothing', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    await $.prompt.submit({ text: 'work' } as never)
+    expect(calls.n).toBe(1)
+    expect(await cmd($, `replay ${IN}`)).toContain('a main turn is running')
+    expect(calls.n).toBe(1)
+    expect(outFile(seen)).toBeUndefined()
+  })
+
+  test('it refuses a file of more than 500 items and accepts exactly 500', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(501)))
+    expect(await cmd($, `replay ${IN}`)).toContain('501 items; at most 500')
+    expect(calls.n).toBe(0)
+    expect(outFile(seen)).toBeUndefined()
+    put(seen, JSON.stringify(items(500)))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(500)
+    expect(readOut(seen)).toHaveLength(500)
+  })
+
+  test('a missing file, bad JSON, a non-array and an item with no message are each refused with a reason', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    expect(await cmd($, 'replay /work/missing.json')).toContain('cannot read /work/missing.json')
+    put(seen, '{nope')
+    expect(await cmd($, `replay ${IN}`)).toContain('not valid JSON')
+    put(seen, '{"a":1}')
+    expect(await cmd($, `replay ${IN}`)).toContain('not a JSON array')
+    put(seen, '[{"id":"x"}]')
+    expect(await cmd($, `replay ${IN}`)).toContain('item 0 has no message')
+    expect(calls.n).toBe(0)
+  })
+
+  test('an unknown previous means none, and a missing id falls back to the position', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify([{ message: 'hello', previous: 'huge' }]))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.requests[0]!.prompt).toBe(classifierPrompt(null, '', 'hello'))
+    expect(readOut(seen)[0].id).toBe('0')
+  })
+
+  // WHY: Haiku is priced higher only for one request over 100,000 tokens; 200 short calls priced as one sum cost 5x too much.
+  test('200 calls of 1000 input tokens are priced one by one at the short prompt rate', async ($, on) => {
+    const { calls, fn } = classifierBy(() => T('execute'))
+    const seen = world($, on, fn, { usage: { input_tokens: 1000, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+    put(seen, JSON.stringify(items(200)))
+    await cmd($, `replay ${IN} current`)
+    expect(calls.n).toBe(200)
+    const day = seen.store[`meter:${storeDay(0)}:sess-1`] as Tally
+    expect(day.tokens).toBe(202000)
+    // 200 x (1000 x 0.1 + 10 x 0.5) / 1e6 = 0.021; priced as one 200,000-token request it would be 0.105.
+    const nanoUsd = (usd: number) => Math.round(usd * 1e9)
+    expect(nanoUsd(day.cost)).toBe(21_000_000)
+    expect(nanoUsd(day.byRole!.classifier!.cost)).toBe(21_000_000)
+    expect(nanoUsd(seen.tally!.cost)).toBe(21_000_000)
+  })
+
+  // WHY: the calls were paid for; a clear or a switch mid-replay must not wipe them from the day and the total.
+  test('a conversation switch mid-replay keeps every finished call on the originating session ledger and shows nothing', async ($, on) => {
+    const waiting: (() => void)[] = []
+    const { calls, fn } = classifierBy(async (_s, prompt) => {
+      if (!prompt.includes('message 0') && !prompt.includes('message 1')) await new Promise<void>(resolve => waiting.push(resolve))
+      return T('execute')
+    })
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(6)))
+    const run = cmd($, `replay ${IN} current`)
+    for (let i = 0; i < 40 && waiting.length < 4; i++) await macrotask()
+    expect(waiting).toHaveLength(4)
+    const key = `meter:${storeDay(0)}:sess-1`
+    expect((seen.store[key] as Tally).tokens).toBe(4)
+    const statusesBefore = seen.statuses.length
+    const tallyBefore = seen.tally
+    seen.sessionId = 'sess-2'
+    for (const release of waiting.splice(0)) release()
+    expect(await run).toBe('Replay cancelled: the conversation changed.')
+    expect(calls.n).toBe(6)
+    expect((seen.store[key] as Tally).tokens).toBe(12)
+    expect((seen.store[key] as Tally).byRole!.classifier!.tokens).toBe(12)
+    expect(Object.keys(seen.store).filter(k => k.endsWith(':sess-2'))).toEqual([])
+    expect(seen.statuses).toHaveLength(statusesBefore)
+    expect(seen.tally).toBe(tallyBefore)
+    expect(outFile(seen)).toBeUndefined()
+  })
+
+  // WHY: a string context is cut back into messages at "\n\n[role] ", so a message holding such a paragraph was split and
+  // trimmed differently from live; the structured form goes through the live helper itself.
+  test('a structured context with an embedded role label is byte for byte the live prompt, and the string form is not', async ($, on) => {
+    const embedded = `${'a'.repeat(300)}\n\n[user] ${'b'.repeat(1300)}`
+    const messages = [{ role: 'user' as const, text: 'dropped: only the last two count' }, { role: 'user' as const, text: 'paste this' }, { role: 'assistant' as const, text: embedded }]
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn, { messages })
+    await $.prompt.submit({ text: 'find every TODO' } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', text: 'ok', reason: 'completed' } as never)
+    const live = seen.prompts[0]!
+    put(seen, JSON.stringify([
+      { id: 's', message: 'find every TODO', context: messages, previous: null },
+      { id: 't', message: 'find every TODO', context: `[user] paste this\n\n[assistant] ${embedded}`, previous: null },
+    ]))
+    await cmd($, `replay ${IN} current`)
+    const replayed = calls.requests.slice(1).map(r => r.prompt)
+    expect(replayed).toHaveLength(2)
+    expect(replayed.filter(p => p === live)).toHaveLength(1)
+    expect(readOut(seen).map(r => r.id).sort()).toEqual(['s', 't'])
+  })
+
+  test('a context that is neither a string nor a list of role and text is refused, and nothing is asked', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    for (const context of [[{ role: 'user' }], [{ text: 'x' }], 7, { role: 'user', text: 'x' }]) {
+      put(seen, JSON.stringify([{ message: 'x', context }]))
+      expect(await cmd($, `replay ${IN}`)).toContain('item 0 has a context that is neither a string nor a list of { role, text }')
+    }
+    expect(calls.n).toBe(0)
+  })
+
+  // WHY: the pause protects a struggling API; a second timeout inside it must restart the 3 seconds, not end early.
+  test('a second timeout 2.9 seconds after the first holds new requests until 3 seconds after the second', async ($, on) => {
+    let open: (() => void) | undefined
+    const { calls, fn } = classifierBy(async (_s, prompt) => {
+      if (prompt.includes('message 0')) return null
+      if (prompt.includes('message 1')) {
+        await new Promise<void>(resolve => { open = resolve })
+        return null
+      }
+      return T('execute')
+    })
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(6)))
+    const run = cmd($, `replay ${IN} current`)
+    const drain = async () => { for (let i = 0; i < 5; i++) { await macrotask(); await seen.clock.advance(0) } }
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(2900)
+    open!()
+    await drain()
+    await seen.clock.advance(100)
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(2899)
+    await drain()
+    expect(calls.n).toBe(4)
+    await seen.clock.advance(1)
+    await drain()
+    await run
+    expect(calls.n).toBe(6)
+  })
+
+  // WHY: a flag the parser skipped used to launch the default replay: up to 1,000 paid calls and an overwritten output.
+  test('a flag with no value, an unknown flag or a malformed value shows the usage and makes no call', async ($, on) => {
+    const { calls, fn } = classifierBy(bothShapes)
+    const seen = world($, on, fn)
+    put(seen, JSON.stringify(items(2)))
+    const bad = ['--repeat', '--bogus', '--bogus 1', '--repeat 3 --bogus', '--bogus --repeat 2', '--repeat=3', '--repeat 2x', '--repeat 2 legacy', '--']
+    for (const flags of bad) {
+      expect([flags, parseReplayArgs(`/a.json ${flags}`)]).toEqual([flags, null])
+      expect([flags, await cmd($, `replay ${IN} ${flags}`)]).toEqual([flags, expect.stringContaining('Usage: /model-router replay')])
+    }
+    expect(calls.n).toBe(0)
+    expect(outFile(seen)).toBeUndefined()
+    expect(parseReplayArgs('/a.json legacy --repeat 2')).toEqual({ path: '/a.json', variants: ['legacy'], repeat: 2 })
   })
 })

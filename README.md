@@ -52,8 +52,8 @@ shortcuts.
 | Tier | Model · effort | What lands here |
 |------|----------------|-----------------|
 | lookup | Haiku · medium | Retrieval and mechanical work with nothing to judge: find/grep/list, read a value or status, run a named command, rename, typo, format, short translation |
-| execute | Sonnet · medium | Work whose "what" is settled in the message or visible context: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan |
-| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs, anything irreversible or outward-facing |
+| execute | Sonnet · medium | Work whose "what" is settled in the message or visible context: a specified change, a bug with a known cause, tests, refactor to a stated target, docs from known material, explaining code, carrying out an agreed plan, including an instructed push, merge, PR, deploy or a message whose content is settled |
+| decide | Opus · medium | Anything that needs judgment first: design, choosing between approaches, trade-offs, plans, unexplained failures, reviews, recommendations, ambiguous requests, working out how a change to business rules, production data or stored procedures should behave, porting to a branch whose code differs |
 
 1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
@@ -67,12 +67,41 @@ shortcuts.
    `unparseable` reply is logged with its first 120 characters (single line, masked) so the cause can be read in the
    events log; a reply cut off after the tier still parses, as an unsure verdict. In earlier versions a failure ran on Sonnet, and 24% of those turns later escalated to Opus (6% of classified turns did).
    `#haiku`, `#sonnet` or `#opus` in a message pins the model.
+   **A risky instruction does not start on Haiku (the risk floor).** A tier measures how much judgement the work needs,
+   not how dangerous it is. Plain code (no model call) checks the masked message for an instruction to push, merge,
+   deploy, release, delete, drop or alter a table, write to a database (UPDATE … SET, INSERT INTO, DELETE FROM, EXEC of
+   a procedure), force, act on production, open, merge or decline a PR, cherry-pick onto a shared branch, run
+   `terraform apply` / `destroy`, `npm publish`, `git clean -f`, `git branch -D`, `docker rm` / `prune` or `aws s3 rm`,
+   ship or send something, message people (Slack, Jira, email, a `#channel`, a reply or comment) or move money, in
+   English and in Simplified and Traditional Chinese (推送 / 合并 / 合併 / 部署 / 上线 / 上線 / 发版 / 上传 / 删除 /
+   刪除 / 发送 / 發送 / 付款 …). It reads each sentence part by part (at and / then / 然后 / 再 / 之后), so "explain the
+   change and push it" counts. A question about such a word ("what does git push do?", "部署文档在哪里"), a report that
+   it is done ("merged", "已经推送了"), a negation just before the verb ("don't push yet", "不要推送") and a noun use
+   ("the prod logs", "the merge conflicts", "这个 PR 的评论") do not count. When it fires on a sure lookup, the turn runs
+   on Sonnet at Sonnet's effort and the reason ends "· risky action: at least Sonnet"; execute and decide are left as
+   they are, and an unsure lookup goes to Sonnet anyway. It applies to classified main turns, to a failed
+   classification that keeps a lookup tier, and to `general-purpose` subagents the call gives no model;
+   `/model-router stats` counts it. Under a Haiku parent such a subagent with a task the check flags runs on Sonnet
+   whatever the classifier said (the event log reason ends "· risky action: Sonnet, above the Haiku parent"): the one
+   case a subagent runs above its parent's tier (see 5).
+   **The floor only sees the message.** It does not cover a confirmation ("yes" to "push it?"), a prompt typed into a
+   running turn, a turn without a person prompt that inherits a route, a `#haiku` or a Haiku pin, an `Explore`, named
+   or custom subagent, a subagent the caller pinned to Haiku, or wording it does not know. On the **main thread** the
+   backstop for those is the Haiku assignment text (see 2): any irreversible or outward-facing action needs at least
+   Sonnet, so Haiku escalates before any tool. Subagents get no assignment text, so a subagent the floor misses has no
+   backstop.
    **The classifier is skipped when it could not change the outcome.** If the last main request was Opus, is within the
    cache TTL and had a context of 50,000 tokens or more (see the round-trip guard, 4), the turn stays on Opus whatever
    the tier, so the prompt goes straight to Opus at the decide effort ("warm large context: classifier skipped") with no
    Haiku call; `/model-router stats` counts these. A `#model` pin still wins.
 2. **Decide before working.** The model reads its assignment beside your prompt and must judge whether the task fits
-   *before* doing any work. If not, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
+   *before* doing any work. Decisions (design, trade-offs, plans, unexplained root causes, reviews) belong on Opus. An
+   irreversible or outward-facing action you asked for and already settled (a push, merge, PR, deploy or a message whose
+   content is given) does not need Opus; the assignment asks for care instead: confirm what it will affect, follow the
+   project's confirmation rules, and escalate only if what to do is not settled. Haiku's assignment says more: any
+   irreversible or outward-facing action (a push, merge, PR, deploy, delete, a message to people, production data)
+   needs at least Sonnet, even when you asked for it or just approved it, so Haiku calls `escalate` to Sonnet before any
+   tool. If the task does not fit, it calls the `escalate` tool first: Haiku may move to Sonnet or Opus or raise its
    effort, Sonnet may move to Opus or raise its effort, Opus may set any effort. A move to a higher model lands at that
    tier's effort in the table (Sonnet medium, Opus medium) unless a higher effort is asked. Escalation only goes up within a turn.
    Effort-only escalation (same model, more effort) exists for the main thread and for subagents alike (a subagent's own effort is capped, see 6).
@@ -106,11 +135,14 @@ shortcuts.
    kept subject to the parent's tier; `inherit`, unknown ids and Fable keep their existing handling. The agent or the
    automatic ladder can raise effort later. `Plan` and named or custom agents declare or inherit their own model and are left alone, as are forks and
    workflow agents. A resumed agent keeps its tracked model, effort and error state without being classified or
-   counted again. A subagent never runs above its parent's tier. A model the caller names is kept, except that it is
+   counted again. A subagent never runs above its parent's tier, with one exception: under a Haiku parent, a
+   `general-purpose` subagent without a model whose task the risk floor flags runs on Sonnet (see 1), and Sonnet is then
+   its ceiling. A model the caller names is kept, except that it is
    capped at the parent's tier.
 6. **Subagents can escalate, are escalated, and have a ceiling.** The same `escalate` tool works inside a subagent: it
    may raise its own model or effort from its next step, but on its own never above **Opus at medium** (haiku and
-   sonnet may reach high; xhigh and max are cut down), and never above the parent's tier. A model change starts the new
+   sonnet may reach high; xhigh and max are cut down), and never above the parent's tier (Sonnet for a risky task under a
+   Haiku parent). A model change starts the new
    tier at medium, or at the asked effort if higher, whatever effort the old model had. Effort-only escalation on the
    same model only goes up. The router also escalates a failing subagent by itself, in two stages. After three tool
    errors in a row it first raises the effort one step on the same model (Haiku · medium → Haiku · high), and if three
@@ -436,6 +468,30 @@ rate, not its write rate, so a round trip no longer shows a saving that was not 
 claude plugin validate .
 claude plugin test .
 ```
+
+**Replaying labelled messages (maintainer tool).** `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`
+(default `both`, once) reads a JSON array of `{ "id", "message", "context", "previous" }` (`previous` is a tier or
+`null`; at most 500 items), sends each message to Haiku exactly as a live classification would (same model, effort,
+limits, masking and 6,000-character cut), and writes `<path without .json>.replay.json` with one row per item, variant
+and run: `id`, `variant` (`current` is the 1.2 prompt, `legacy` the 1.1 prompt kept in `hooks/replay.ts`), `run`, the
+masked start of the reply, `tier` and `sure` as the classifier gave them (both variants are parsed the same way, so the
+unsure rule can be applied to either), `risk` (what the code's risk floor check says about the message; the tier is
+recorded before the floor), `ms` (how long the call took) and `why` when there was no usable reply. `--repeat` runs
+each variant up to 3 times, to measure run-to-run noise. At most 4 requests run at once, and after a timeout no new
+request starts until 3 seconds after the latest timeout. A flag with no value, an unknown flag or a malformed value
+shows the usage text and runs nothing. It refuses to start while a turn is running and changes no routing state,
+count, correction or turn record. Its Haiku spend is added to today's and the total figures as each call completes,
+each call priced on its own, never to a turn; a call that completes after you clear or switch the conversation still
+counts, on the conversation the replay started in. It runs beside
+live turns: a turn you start during a replay works normally, but its classification shares the API with up to 4 replay
+calls and can be slower. It is not listed in the command's usage text.
+
+`context` takes two forms. The exact one is a list of messages, `[{ "role": "user", "text": "…" }, { "role":
+"assistant", "text": "…" }]`: it goes through the same code as a live context (the last two non-empty messages, each
+over 1,200 characters cut to its first 200 and last 1,000), so the prompt is the live one byte for byte. The older
+string form, `[role] text` blocks separated by a blank line, is approximate: it is cut back into messages at every
+blank line followed by `[word] `, so a message that itself holds such a paragraph (a pasted transcript) is split and
+trimmed differently, and every block is kept. An absent `context` is empty.
 
 ## Contributors
 

@@ -3,6 +3,72 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-02
+
+1.2.0 changes what an irreversible or outward-facing request costs. **Policy change:** an action you asked for and
+already settled (a push, merge, PR, deploy or a message whose content is given) is now execute work on Sonnet, not a
+decision for Opus; risk only keeps such an action off Haiku. Design, trade-offs, plans,
+unexplained root causes and reviews still go to Opus.
+
+### Changed
+
+- New classifier prompt: the round 2 tier definitions and rules. A tier is how much judgement the work needs, not how
+  dangerous it is: decide no longer lists "anything irreversible or outward-facing", and execute now includes carrying
+  out an agreed plan with an instructed push, merge, PR, deploy or settled message, and a cherry-pick or port where the
+  code is the same on both branches. New rules cover a reply that only continues work in progress, a short message that
+  asks for something new, and a message that is only an image or an attachment. The separate "implement it / add it to
+  the PR" rule is gone (the execute definition covers it). The reply is still `{"tier","sure","reason"}`, with
+  "when unsure, pick the higher tier" and the `sure` rule; the model is not asked about risk.
+- The assignment text for Haiku and Sonnet no longer says that anything irreversible must be decided on Opus. Sonnet's
+  says that a settled irreversible or outward-facing action needs care instead (confirm what it will affect, follow the
+  project's confirmation rules) and escalation only when what to do is not settled. Haiku's says that any irreversible
+  or outward-facing action (a push, merge, PR, deploy, delete, a message to people, production data) needs at least
+  Sonnet, even when the user asked for it or just approved it, so Haiku escalates to Sonnet before any tool: the backstop
+  for what the code risk floor cannot see, such as a "yes" to "push it?". The Opus text is unchanged.
+- An unsure lookup now goes to execute even when the previous turn was a lookup (before, only a first turn was raised).
+
+Measured (replay of 250 labelled messages, 144 of them not used to write the prompt, 2 runs each, scored against two
+agreeing AI judges): accuracy 66% → 74–76%, over-routing 28–29% → 13–18%, cost proxy −9 to −11%, but under-routing
+5% → 9–10% (mostly decisions phrased as instructions with a question in them). Exact McNemar p = 0.002–0.024.
+
+### Added
+
+- Risk floor, in code: a multilingual keyword check (English, Simplified and Traditional Chinese) over the masked
+  message finds instructions to push, merge, deploy, release, delete, drop a table, force, touch production, open, merge
+  or decline a PR, cherry-pick onto a shared branch, message people (Slack, Jira, email, a reply or comment) or move
+  money. Questions about these words, reports that they are done, and negations do not count. A sure lookup it fires
+  on becomes execute (Sonnet at Sonnet's effort), with "· risky action: at least Sonnet" (or "· 风险操作：至少用 Sonnet")
+  on the reason; execute and decide are never changed, and no effort changes. It covers classified main turns, a failed
+  classification that keeps a lookup tier, and `general-purpose` subagents. `/model-router stats` counts it ("Risky
+  actions raised from lookup to Sonnet"), only when it changed the route (an unsure lookup goes to Sonnet anyway). It
+  does not see a confirmation such as "yes", a prompt typed into a running turn, an inherited route, `#haiku` or a pin;
+  on the main thread the Haiku assignment text covers those (subagents get no assignment text). Under a Haiku parent a
+  `general-purpose` subagent without a model whose task it flags runs on Sonnet, the one exception to "never above the
+  parent"; Sonnet is then that agent's ceiling.
+  Detector fixes from review: each sentence is read part by part (and / then / 然后 / 再 / 之后); a negation or 已 / 刚
+  counts only directly before the verb (分别, 刚才 no longer cancel it); question words count only in a question; `re-`
+  verbs count; noun uses ("the prod logs", "git log --merges", "这个 PR 的评论") do not. New: SQL writes, `terraform
+  apply` / `destroy`, `npm publish`, `git clean -f`, `git branch -D`, `docker rm` / `prune`, `aws s3 rm`, "ship it",
+  "send it", "post it in #channel", "slack him", 推吧, 发版, 上传.
+- `/model-router replay <path> [current|legacy|both] [--repeat <1-3>]`, a maintainer tool not listed in the usage text:
+  it runs the real classifier call over a JSON file of up to 500 labelled messages with the 1.2 prompt, the 1.1 prompt
+  (kept word for word in `hooks/replay.ts`) or both, each up to 3 times, and writes `<path>.replay.json`. Each row holds
+  the run, the tier and `sure` (both prompts parsed the same way), the code risk check of the message and the call's
+  time in ms. At most 4 calls run at once, and no new call starts until 3 seconds after the latest timeout. A context
+  may be a list of `{ role, text }` messages, handled exactly as a live one; the `[role] text` string form is
+  approximate. A missing, unknown or malformed flag shows the usage and runs nothing. It changes no routing state; each
+  call's Haiku spend is priced on its own and added to the day and the total as it completes, never to a turn, and
+  stays on the originating conversation's ledger if you switch. It runs beside live turns, so a classification started
+  during a replay can be slower.
+
+### Not shipped
+
+- An earlier draft of 1.2.0 had the classifier return a probability per tier and a risk score, with per-tier acceptance
+  bars, a model-scored risk guard, corrections chosen by similarity, and `/model-router tune` with stored calibration
+  records. A replay on 102 labelled prompts showed none of it beating the 1.1.0 classifier: the probabilities were not
+  calibrated, the examples lowered accuracy and the guard added nothing. It was removed before release; corrections
+  stay as in 1.1.0 (up to 40 stored, never sent to the classifier).
+
 ## [1.1.0] - 2026-11-02
 
 1.1.0 redesigns the band, adds a way to pin a model, routing corrections that pin the session, weekly usage
