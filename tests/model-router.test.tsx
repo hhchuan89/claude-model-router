@@ -2695,24 +2695,47 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
     })
 
     test('session.start still registers when a render activates the same session first (interactive race)', async ($, on) => {
-      let gated = true
+      // session.start registers first (1.2.1), then looks its session up: the gate arms at registration so it holds
+      // exactly that lookup, and the band's render races it.
+      let gated = false
+      let lookups = 0
       let release!: () => void
       const gate = new Promise<void>(resolve => { release = resolve })
       on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+        lookups++
         if (gated) { gated = false; await gate }
         return next(e)
       })
       const commands: string[] = []
       const tools: string[] = []
       on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
-      on('command.register', async (_$: unknown, e: any) => { commands.push(e.name); return { value: { command: e.name } } })
+      on('command.register', async (_$: unknown, e: any) => { commands.push(e.name); gated = true; return { value: { command: e.name } } })
       on('tool.register', async (_$: unknown, e: any) => { tools.push(e.name); return { value: { tool: `mcp__model-router__${e.name}` } } })
       compactWorld($, on)
       const start = $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      // Wait until session.start's own lookup is the one held at the gate.
+      while (lookups === 0) await new Promise(resolve => globalThis.setTimeout(resolve, 1))
       // The band renders while session.start is still waiting on its identity lookup.
       await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+      // The race really happened: the render looked the session up while session.start's lookup was still held.
+      expect(lookups).toBeGreaterThanOrEqual(2)
       release()
       await start
+      expect(commands).toContain('model-router')
+      expect(tools).toContain('escalate')
+    })
+
+    // WHY (1.2.1 review): a failing first identity lookup puts later lookups into backoff; session.start fires once per
+    // process, so registration must not depend on its lookup at all or /model-router is missing until restart.
+    test('session.start registers even when its identity lookup is unavailable', async ($, on) => {
+      on('session.id', {}, async () => { throw new Error('not bound yet') })
+      const commands: string[] = []
+      const tools: string[] = []
+      on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+      on('command.register', async (_$: unknown, e: any) => { commands.push(e.name); return { value: { command: e.name } } })
+      on('tool.register', async (_$: unknown, e: any) => { tools.push(e.name); return { value: { tool: `mcp__model-router__${e.name}` } } })
+      compactWorld($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
       expect(commands).toContain('model-router')
       expect(tools).toContain('escalate')
     })
@@ -3048,7 +3071,9 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       ending = true
       await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
       expect(ending).toBe(false)
-      expect(registrations).toBe(0)
+      // Registration no longer waits for the lookup (1.2.1): the command and tool exist whatever the lookup returns, and
+      // the stale lookup still does nothing else.
+      expect(registrations).toBe(1)
       // An ordinary hook starts a fresh lifetime; it must never reuse the ended object.
       const r = await $.command.run({ command: 'model-router', args: 'status' } as never)
       expect(r.text).toContain('Current settings')
