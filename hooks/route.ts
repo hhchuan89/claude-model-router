@@ -42,6 +42,7 @@ Rules:
 - A reply that only continues work already in progress ("yes", "go on", "继续") keeps the previous tier.
 - Approving a plan that was just made ("照这个做", "开始吧", "go ahead with that") is execute, because the plan settles what to do.
 - A short message that asks for something new ("explain it in Chinese", "how long will it take?") is judged on its own.
+- A message that asks for your opinion, or whether something is right, safe or should be done ('你覺得呢？', 'is this right?', 'should it be 60s?', '这样对吗？'), is decide, even when it is short or also gives an instruction; a question about a fact ('is the build green?', '这个文件在哪？') stays lookup.
 - A message that is only an image or an attachment, with no words, keeps the previous tier.
 - If a message mixes tiers, use the highest one it contains.
 - When unsure between two tiers, pick the higher one.

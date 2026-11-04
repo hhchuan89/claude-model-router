@@ -2694,6 +2694,58 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(turnTokens).toBe(150)
     })
 
+    test('session.start still registers when a render activates the same session first (interactive race)', async ($, on) => {
+      // session.start registers first (1.2.1), then looks its session up: the gate arms at registration so it holds
+      // exactly that lookup, and the band's render races it.
+      let gated = false
+      let lookups = 0
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      on('session.id', {}, async (_$: unknown, e: any, next: any) => {
+        lookups++
+        if (gated) { gated = false; await gate }
+        return next(e)
+      })
+      const commands: string[] = []
+      const tools: string[] = []
+      on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+      on('command.register', async (_$: unknown, e: any) => { commands.push(e.name); gated = true; return { value: { command: e.name } } })
+      on('tool.register', async (_$: unknown, e: any) => { tools.push(e.name); return { value: { tool: `mcp__model-router__${e.name}` } } })
+      // The router was turned off in an earlier session: only the rest of session.start reads that back.
+      on('store.get', { key: 'enabled' }, async () => ({ value: false }))
+      compactWorld($, on)
+      const start = $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      // Wait until session.start's own lookup is the one held at the gate.
+      while (lookups === 0) await new Promise(resolve => (globalThis as any).setTimeout(resolve, 1))
+      // The band renders while session.start is still waiting on its identity lookup.
+      await $.ui.mount({ plugin: 'model-router', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+      // The race really happened: the render looked the session up while session.start's lookup was still held.
+      expect(lookups).toBeGreaterThanOrEqual(2)
+      release()
+      await start
+      expect(commands).toContain('model-router')
+      expect(tools).toContain('escalate')
+      // WHY: the raced lookup joins the render's activation, so the rest of session.start still runs (stored enabled,
+      // usage seed, prefs, refreshUi, paceNotice). Without the join it returns early and the router stays on.
+      const r = (await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }
+      expect(r.text).toContain('enabled: false')
+    })
+
+    // WHY (1.2.1 review): a failing first identity lookup puts later lookups into backoff; session.start fires once per
+    // process, so registration must not depend on its lookup at all or /model-router is missing until restart.
+    test('session.start registers even when its identity lookup is unavailable', async ($, on) => {
+      on('session.id', {}, async () => { throw new Error('not bound yet') })
+      const commands: string[] = []
+      const tools: string[] = []
+      on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+      on('command.register', async (_$: unknown, e: any) => { commands.push(e.name); return { value: { command: e.name } } })
+      on('tool.register', async (_$: unknown, e: any) => { tools.push(e.name); return { value: { tool: `mcp__model-router__${e.name}` } } })
+      compactWorld($, on)
+      await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+      expect(commands).toContain('model-router')
+      expect(tools).toContain('escalate')
+    })
+
     test('route load failures through prompt and turn start cannot erase the assigned route on retry', async ($, on) => {
       let clears = 0
       on('state.set', { plugin: 'model-router', key: 'route' }, async (_$: unknown, e: any, next: any) => {
@@ -3025,7 +3077,9 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       ending = true
       await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
       expect(ending).toBe(false)
-      expect(registrations).toBe(0)
+      // Registration no longer waits for the lookup (1.2.1): the command and tool exist whatever the lookup returns, and
+      // the stale lookup still does nothing else.
+      expect(registrations).toBe(1)
       // An ordinary hook starts a fresh lifetime; it must never reuse the ended object.
       const r = await $.command.run({ command: 'model-router', args: 'status' } as never)
       expect(r.text).toContain('Current settings')
@@ -9117,4 +9171,55 @@ describe('/model-router replay (1.2.0)', () => {
     expect(outFile(seen)).toBeUndefined()
     expect(parseReplayArgs('/a.json legacy --repeat 2')).toEqual({ path: '/a.json', variants: ['legacy'], repeat: 2 })
   })
+})
+
+describe('classifier prompt: opinion questions (1.2.1)', () => {
+  // WHY: the remaining under-routes on two datasets were decide-work phrased as a short question or instruction
+  // ("需要改成60秒吧？", "这样对吗？"). The legacy prompt is the replay baseline and must stay as it was.
+  test('the prompt makes an opinion or is-this-right question decide, and the legacy prompt does not', async () => {
+    const rule = "- A message that asks for your opinion, or whether something is right, safe or should be done ('你覺得呢？', 'is this right?', 'should it be 60s?', '这样对吗？'), is decide, even when it is short or also gives an instruction; a question about a fact ('is the build green?', '这个文件在哪？') stays lookup."
+    for (const lang of ['en', 'zh'] as const) {
+      expect(classifierSystem(lang)).toContain(rule)
+      expect(legacyClassifierSystem(lang)).not.toContain('asks for your opinion')
+    }
+  })
+})
+
+describe('risk detector gaps (1.2.1)', () => {
+  const cases: [string, string[], string[]][] = [
+    ['ticket transitions',
+      ['move PP-123 to Done', 'transition the ticket to In Review', 'close the ticket', '把 PP-123 改成 Done', '关掉这个 ticket'],
+      ['what does Done mean', 'what does In Review mean?', 'move the file to src', 'close the dialog then run tests', 'I closed the ticket', '已经关掉这个 ticket', '这个 ticket 关掉了吗', 'use utf-8 to encode']],
+    ['messaging people',
+      ['在群里说一下', '跟他说一下', '通知一下 X', 'tell him in Slack', 'reply to the thread'],
+      ['群里说了什么', '跟他说的一样', '跟我说一下', '说一下这个函数是做什么的', '告诉我怎么做', '通知栏的图标', '在 README 里说明一下', 'tell me what the ticket says', 'help me tell them apart']],
+    ['production with the verb after it',
+      ['in prod run the migration', 'on production restart the service'],
+      ['the prod migration log', 'in prod the migration log shows errors', 'on production the service restarted']],
+    ['production with a comma after the place',
+      ['on prod, restart the service', 'in production, run the migration'],
+      ['in prod, the migration log shows errors', 'in prod run times are slow', 'in prod test results look odd']],
+    ['several tickets, mark and set',
+      ['move these tickets to Done', 'move those tickets to Done', 'move all tickets to done', 'move my tickets to Done', 'move both tickets to Done', 'move PP-123 and PP-124 to Done', 'mark PP-123 done', 'set PP-123 to Done'],
+      ['mark step-2 as done', 'set node-18 to the default', 'move these files to src', 'mark the test as skipped']],
+    ['Chinese ticket close with the ticket first',
+      ['把 PP-123 关掉', '把这个 ticket 关了', '把 PP-123 關掉', '把 PP-123 关闭'],
+      ['把编码从 utf-8 改成 gbk', 'node-18 改成 node-20', '我已经把 PP-123 关掉了', '把弹窗关掉']],
+    ['letting people know',
+      ['let the team know in Slack', 'let him know', 'let her know', 'let them know', 'let everyone know in Slack', '在群里发个消息', '在群里發個訊息'],
+      ['let me know', 'let me know when it is done', '发消息的函数在哪里？']],
+    ['Chinese words that only look like messaging',
+      ['跟 @alice 说一下', '通知一下 X'],
+      ['Vue 和 React 的区别讲一下', '通知 webhook 的 payload 格式', '群里发下来的文件帮我看看', '集群里提一下']],
+  ]
+  for (const [kind, risky, safe] of cases) {
+    // WHY: each of these was a probed miss that let an outward-facing action start on Haiku.
+    test(`${kind}: the instructions are risky`, async () => {
+      for (const t of risky) expect([t, isRisky(t)]).toEqual([t, true])
+    })
+    // WHY: a question, a report or a noun use nearby is a lookup; flooring it would cost a Sonnet turn for nothing.
+    test(`${kind}: a question, report or noun use nearby is not risky`, async () => {
+      for (const t of safe) expect([t, isRisky(t)]).toEqual([t, false])
+    })
+  }
 })

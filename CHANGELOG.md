@@ -3,6 +3,32 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-11-04
+
+### Fixed
+
+- `/model-router` and `escalate` could be missing in interactive sessions, because the band's render claimed the
+  session before `session.start`. They are now registered before any session lookup, and a raced lookup can join the
+  first activation, so the rest of `session.start` (the stored on/off state, usage, preferences, the status line)
+  still runs. Thanks to Muhafiz for the report.
+- The risk floor missed three kinds of instruction a probe found. It now catches moving a ticket to another status
+  ("move PP-123 to Done", "transition the ticket to In Review", "close the ticket", "把 PP-123 改成 Done",
+  "关掉这个 ticket"), telling people in Chinese and English ("在群里说一下", "跟他说一下", "通知一下 X",
+  "tell him in Slack") and a production action whose verb follows the place ("in prod run the migration",
+  "on production restart the service"). A question, report or noun use nearby ("what does Done mean", "群里说了什么",
+  "the prod migration log") still does not count. A review probe added more: "on prod, restart the service",
+  "move these tickets to Done", "move PP-123 and PP-124 to Done", "mark PP-123 done", "set PP-123 to Done",
+  "把 PP-123 关掉", "let the team know in Slack" and "在群里发个消息" now count; "Vue 和 React 的区别讲一下",
+  "通知 webhook 的 payload 格式", "群里发下来的文件", "集群里提一下", "utf-8 改成 gbk", "mark step-2 as done" and
+  "in prod run times are slow" no longer do.
+
+### Changed
+
+- One new classifier rule: a message that asks for your opinion, or whether something is right, safe or should be done
+  ("你覺得呢？", "is this right?", "should it be 60s?", "这样对吗？"), is decide, even when it is short or also gives an
+  instruction; a question about a fact ("is the build green?", "这个文件在哪？") stays lookup. It targets the remaining under-routes on two datasets. **Pending replay validation:** it has not yet been
+  measured with `/model-router replay`. The legacy prompt is unchanged.
+
 ## [1.2.0] - 2026-11-02
 
 1.2.0 changes what an irreversible or outward-facing request costs. **Policy change:** an action you asked for and

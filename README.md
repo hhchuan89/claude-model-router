@@ -57,7 +57,9 @@ shortcuts.
 
 1. **Classify.** When you send a prompt, Haiku (low effort, 8 s cap) sorts it with the last two messages as context.
    A short continuation ("yes", "继续") keeps the previous tier, a mix of tiers takes the highest, and when unsure it
-   picks the higher tier. The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
+   picks the higher tier. A message that asks for your opinion, or whether something is right, safe or should be done
+   ("is this right?", "should it be 60s?", "你覺得呢？"), is decide even when it is short or also gives an instruction, while a question about a
+   fact ("is the build green?") stays lookup (1.2.1; pending replay validation). The classifier also says whether it is sure; **an unsure verdict never downgrades**: after a
    higher-tier turn the previous tier stays (shown as "unsure: not downgrading"), a first turn never starts on lookup
    (it runs on Sonnet), and an unsure `general-purpose` subagent lookup runs on Sonnet instead of Haiku. Likely secrets
    are masked before classification. **A failed classification never downgrades**: the turn keeps the previous turn's
@@ -72,12 +74,15 @@ shortcuts.
    deploy, release, delete, drop or alter a table, write to a database (UPDATE … SET, INSERT INTO, DELETE FROM, EXEC of
    a procedure), force, act on production, open, merge or decline a PR, cherry-pick onto a shared branch, run
    `terraform apply` / `destroy`, `npm publish`, `git clean -f`, `git branch -D`, `docker rm` / `prune` or `aws s3 rm`,
-   ship or send something, message people (Slack, Jira, email, a `#channel`, a reply or comment) or move money, in
+   ship or send something, message people (Slack, Jira, email, a `#channel`, a reply or comment, "tell him in Slack",
+   "在群里说一下", "跟他说一下", "通知一下 X"), move a ticket to another status ("move PP-123 to Done", "close the
+   ticket", "把 PP-123 改成 Done", "关掉这个 ticket") or move money, in
    English and in Simplified and Traditional Chinese (推送 / 合并 / 合併 / 部署 / 上线 / 上線 / 发版 / 上传 / 删除 /
-   刪除 / 发送 / 發送 / 付款 …). It reads each sentence part by part (at and / then / 然后 / 再 / 之后), so "explain the
+   刪除 / 发送 / 發送 / 付款 …). Production counts with the verb before it or after it ("run the migration on prod",
+   "in prod run the migration"). It reads each sentence part by part (at and / then / 然后 / 再 / 之后), so "explain the
    change and push it" counts. A question about such a word ("what does git push do?", "部署文档在哪里"), a report that
    it is done ("merged", "已经推送了"), a negation just before the verb ("don't push yet", "不要推送") and a noun use
-   ("the prod logs", "the merge conflicts", "这个 PR 的评论") do not count. When it fires on a sure lookup, the turn runs
+   ("the prod logs", "the prod migration log", "the merge conflicts", "这个 PR 的评论", "群里说了什么") do not count. When it fires on a sure lookup, the turn runs
    on Sonnet at Sonnet's effort and the reason ends "· risky action: at least Sonnet"; execute and decide are left as
    they are, and an unsure lookup goes to Sonnet anyway. It applies to classified main turns, to a failed
    classification that keeps a lookup tier, and to `general-purpose` subagents the call gives no model;
