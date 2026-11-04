@@ -8,6 +8,7 @@ import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } fro
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
+import { latencyBucket, latencySummary } from './latency'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
 import type { PaceMode } from './pace'
 import { barChartSvg, cellWidth, chartAlt, hhmm, lastDays, textChart, weekdayOf } from './history'
@@ -537,6 +538,11 @@ type Counts = {
   pacingSteered: number
   // Lookups the risk floor raised to execute (main turns and subagents alike).
   riskFloors: number
+  // Live classifier calls by how long they took (hooks/latency.ts buckets), with their summed time for a mean. Replay
+  // calls are not counted: they measure a prompt, not what a person waits for.
+  classifierLatency: Record<string, number>
+  classifierMsTotal: number
+  classifierTimed: number
 }
 const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
@@ -559,6 +565,9 @@ const NO_COUNTS: Counts = {
   correctionsEscalate: 0,
   pacingSteered: 0,
   riskFloors: 0,
+  classifierLatency: {},
+  classifierMsTotal: 0,
+  classifierTimed: 0,
 }
 
 // "≈$3.51", and "<$0.01" without a sign in front of it.
@@ -1190,6 +1199,8 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
     await ensurePrefs($, session)
     const context = withContext ? await recentContext($) : ''
     if (await stillHere($, session) !== 'same') return { ok: false, why: 'session changed' }
+    // Timed around the call alone, so the figure is what the person waits on the classifier, not the context read.
+    const sentAt = await $.clock.now()
     const r = await $.model.complete({
       model: 'haiku',
       system: classifierSystem(lang),
@@ -1198,7 +1209,9 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
       effort: 'low',
       timeoutMs: CLASSIFY_MS,
     })
+    const ms = (await $.clock.now()) - sentAt
     if (await stillHere($, session) !== 'same') return { ok: false, why: 'session changed' }
+    await countLatency($, session, ms, !r.isAnswered && r.reason === 'aborted')
     await record($, session, 'claude-haiku-5-5', r.usage, false, true, 'classifier')
     if (!r.isAnswered) {
       if (r.reason === 'aborted') return { ok: false, why: 'timeout' }
@@ -1212,6 +1225,20 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
   } catch {
     return { ok: false, why: 'exception' }
   }
+}
+
+// One live classifier call's time, whatever it returned; the bucket keys are fixed so day counts merge by addition.
+function countLatency($: EngineInterface, session: Session, ms: number, timedOut: boolean): Promise<void> {
+  const bucket = latencyBucket(ms, timedOut)
+  return count($, session, c => {
+    const hist = c.classifierLatency ?? {}
+    return {
+      ...c,
+      classifierLatency: { ...hist, [bucket]: (hist[bucket] ?? 0) + 1 },
+      classifierMsTotal: (c.classifierMsTotal ?? 0) + ms,
+      classifierTimed: (c.classifierTimed ?? 0) + 1,
+    }
+  })
 }
 
 // The classifier call as classifyTier makes it: same model, effort, limits, masking and cut. Returns the raw text, or why
@@ -1790,6 +1817,7 @@ async function statsText($: EngineInterface, session: Session, lang: Lang, compa
       `Fable requests moved to Opus: ${c.fableBlocked}. ` +
       `Routed model not the one that answered: ${c.modelMismatch ?? 0}. ` +
       `Classifier failures: ${failures.length > 0 ? failures.join(' · ') : 'none'}. ` +
+      `${latencySummary(c.classifierLatency, c.classifierMsTotal ?? 0, c.classifierTimed ?? 0)}. ` +
       `Escalations to max effort: ${c.maxEffort ?? 0}. ` +
       `Compactions at idle (cache warm): ${c.idleCompactions ?? 0}. ` +
       `Compactions at the context cap: ${c.capCompactions ?? 0}. ` +

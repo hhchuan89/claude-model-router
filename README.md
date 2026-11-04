@@ -371,14 +371,16 @@ as a **difference**: another model would not necessarily use the same tokens. Ol
 are labelled as unattributed spend. The retained total covers 30 days plus legacy totals. Stats also show turns per
 tier, escalations, warm-cache keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus,
 model mismatches (routed model not the one that answered),
-classifier failures by reason and escalations to max effort (main thread only, counted when effort moves to
-max from below).
+classifier failures by reason, how long live classifier calls take (`Classifier time: median 0.5-1s, 95% within 2s,
+mean 0.8s (n=123)`: the median bucket, the upper edge of the bucket that 95% of calls finish within, or `timeout` when
+more than 5% hit the 8-second cap, and the mean; main turns and subagent classification alike, replay calls not
+counted) and escalations to max effort (main thread only, counted when effort moves to max from below).
 
 This is an estimate; see "Assumptions in the meter" below.
 
 | Command | What it shows |
 |---------|---------------|
-| `/model-router stats` | Router on/off and loaded idle/cap/minimum-context settings, session and daily spend, the same-token comparison and counters (also the default command) |
+| `/model-router stats` | Router on/off and loaded idle/cap/minimum-context settings, session and daily spend, the same-token comparison and counters, including classifier time (also the default command) |
 | `/model-router status` | Router on/off, every loaded option including idle/cap/`compactMinContext`, pending guard timer, cache and safe compaction deadlines, weekly window and last skipped action |
 | `/model-router checkpoint [note]` | Compact between tasks, preserving the information needed to continue |
 | `/model-router context` | Main context size and local category estimates, or an explicit unavailable message; makes no token-count requests |
