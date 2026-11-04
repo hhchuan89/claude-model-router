@@ -25,6 +25,7 @@ import {
   classifierSystem,
   EFFORTS,
   forcedModel,
+  isAlias,
   isFable,
   MODELS,
   parseDecision,
@@ -290,6 +291,7 @@ const STR = {
     pacingNoWindow: '没有每周用量窗口',
     paceAhead: (x: string) => ` · 节奏 ${x} 超前`,
     paceToast: (used: string, x: string, steer: boolean) => `每周用量 ${used}%，节奏 ${x}，超过均匀消耗。${steer ? '未确定的决策将改用 Sonnet。' : ''}`,
+    modelFallback: (configured: string, alias: string) => `model-router：本账户找不到 ${configured}，这一档暂时改用 ${alias}（该系列最新的模型）。请在插件选项里改成现有的 id，或直接用别名。`,
     histNone: '本会话还没有路由过的回复。',
     paused: '路由器已暂停——每一轮都由你自己的模型回答',
     details: '详情',
@@ -435,6 +437,7 @@ const STR = {
     pacingNoWindow: 'no weekly usage window',
     paceAhead: (x: string) => ` · pace ${x} ahead`,
     paceToast: (used: string, x: string, steer: boolean) => `Weekly usage ${used}% is using the week ${x} faster than an even pace.${steer ? ' Unsure decisions now route to Sonnet.' : ''}`,
+    modelFallback: (configured: string, alias: string) => `model-router: ${configured} was not found on this account, so that tier runs on ${alias} (the newest model of its family) for now. Set an id that exists, or the alias, in the plugin options.`,
     histNone: 'No replies routed in this session yet.',
     paused: 'Router paused — your own model answers every turn',
     details: 'Details',
@@ -544,6 +547,8 @@ type Counts = {
   classifierLatency: Record<string, number>
   classifierMsTotal: number
   classifierTimed: number
+  // Tiers whose configured full model id the API reported as not found, so they ran on the family alias instead.
+  modelFallbacks: number
 }
 const NO_COUNTS: Counts = {
   turns: { lookup: 0, execute: 0, decide: 0 },
@@ -569,6 +574,7 @@ const NO_COUNTS: Counts = {
   classifierLatency: {},
   classifierMsTotal: 0,
   classifierTimed: 0,
+  modelFallbacks: 0,
 }
 
 // "≈$3.51", and "<$0.01" without a sign in front of it.
@@ -1734,6 +1740,51 @@ async function reviewerAvailable($: EngineInterface, session: Session, reviewMod
   return ok
 }
 
+// What a configured full model id answers, asked at most once a day per id. Only model_not_found is 'missing': any other
+// failure (overloaded, a timeout, no network) is 'unknown' and not stored, so the configured id stays and the next
+// session asks again. A retired id would otherwise fail every request routed to its tier.
+type Probe = 'ok' | 'missing' | 'unknown'
+async function modelProbe($: EngineInterface, session: Session, id: string): Promise<Probe> {
+  const now = await $.clock.now()
+  const key = `probe:${id}`
+  const seen = (await $.store.get(key)) as { ok: boolean; at: number } | undefined
+  if (await stillHere($, session) !== 'same') return 'unknown'
+  if (seen && now - seen.at < PROBE_EVERY_MS) return seen.ok ? 'ok' : 'missing'
+  let found: Probe = 'unknown'
+  try {
+    const r = await $.model.complete({ model: id, prompt: 'Reply with OK.', maxTokens: 5, timeoutMs: 15000 })
+    if (await stillHere($, session) !== 'same') return 'unknown'
+    await record($, session, id, r.usage, false, true, 'classifier')
+    found = r.isAnswered ? 'ok' : r.reason === 'api-error' && r.error === 'model_not_found' ? 'missing' : 'unknown'
+  } catch {
+    found = 'unknown'
+  }
+  if (found === 'unknown' || await stillHere($, session) !== 'same') return found
+  await $.store.set(key, { ok: found === 'ok', at: now })
+  return found
+}
+
+// Run in the background at session start, never awaited by a turn: until it settles the configured ids are used. One
+// probe per distinct full id; a tier whose id is missing moves to its family alias in `ids` (in place, so every
+// consumer follows), with one toast and one count.
+async function probeTiers($: EngineInterface, session: Session, lang: Lang, configured: Record<ModelKey, string>, ids: Record<ModelKey, string>) {
+  const probes = new Map<string, Promise<Probe>>()
+  await Promise.all(MODELS.map(async tier => {
+    const id = configured[tier]
+    if (isAlias(id)) return
+    if (!probes.has(id)) probes.set(id, bookkeeping($, () => modelProbe($, session, id), 'unknown' as Probe, retryFor(session, `probe ${id}`)))
+    if (await probes.get(id) !== 'missing' || !here(session) || ids[tier] !== id) return
+    const alias = withSuffixOf(tier, id)
+    ids[tier] = alias
+    await count($, session, c => ({ ...c, modelFallbacks: (c.modelFallbacks ?? 0) + 1 }))
+    try {
+      $.ui.toast(STR[lang].modelFallback(id, alias))
+    } catch {
+      // A missing toast surface must not undo the fallback.
+    }
+  }))
+}
+
 async function reviewDecision($: EngineInterface, session: Session, lang: Lang, reviewModel: string, prompt: string, answer: string) {
   const r = await $.model.complete({
     model: reviewModel,
@@ -1828,7 +1879,8 @@ async function statsText($: EngineInterface, session: Session, lang: Lang, compa
       `Cache rewrites after the TTL (100k+ tokens): ${c.cacheExpiryRewrites ?? 0}, costing ${fmtUsd(c.cacheExpiryRewriteCost ?? 0)}. ` +
       `Routing corrections recorded: manual ${c.correctionsManual ?? 0} · escalate ${c.correctionsEscalate ?? 0}. ` +
       `Unsure decisions steered to execute by weekly pacing: ${c.pacingSteered ?? 0}. ` +
-      `Risky actions raised from lookup to Sonnet: ${c.riskFloors ?? 0}.`,
+      `Risky actions raised from lookup to Sonnet: ${c.riskFloors ?? 0}. ` +
+      `Configured model ids not found, run on the alias instead: ${c.modelFallbacks ?? 0}.`,
     '',
     '_API-equivalent prices; work tokens are priced on Opus with switch writes priced as warm reads. Classification and availability probes add cost only. Another model would not use exactly the same tokens. Session records are retained for 30 days; legacy totals are included unchanged._',
   ].join('\n')
@@ -2115,11 +2167,16 @@ async function runCap($: EngineInterface, session: Session, g: Guard, epoch: num
 
 export const register: Register = (on, options) => {
   const lang: Lang = options.language === 'zh' ? 'zh' : 'en'
+  // The family aliases by default: the engine resolves each to the newest model of its family, so a model release or
+  // retirement needs no change here. A full id pins one model; probeTiers checks that it still exists.
   const ids: Record<ModelKey, string> = {
-    haiku: String(options.haikuModel ?? 'claude-haiku-5-5'),
-    sonnet: String(options.sonnetModel ?? 'claude-sonnet-5-5'),
-    opus: String(options.opusModel ?? 'claude-opus-5-5'),
+    haiku: String(options.haikuModel ?? 'haiku'),
+    sonnet: String(options.sonnetModel ?? 'sonnet'),
+    opus: String(options.opusModel ?? 'opus'),
   }
+  // What the options said, before any fallback: probeTiers moves a missing id's tier (ids) to its alias, in place, so
+  // every consumer of ids follows.
+  const configured = { ...ids }
   // false: subagent-only mode. The main thread is neither classified nor rewritten; subagent routing, escalation,
   // Fable blocking (of subagents) and the meter keep working.
   const mainRouting = options.mainRouting !== false
@@ -2218,6 +2275,8 @@ export const register: Register = (on, options) => {
     })
     const session = await useSession($)
     if (!here(session)) return next(e)
+    // Not awaited: a probe can take up to 15 s and must hold up neither the start nor a turn.
+    void probeTiers($, session, lang, configured, ids).catch(err => storeFailure($, err))
     const stored = await bookkeeping($, () => $.store.get('enabled'), compactEnabled, retryFor(session, 'enabled read'))
     if (await stillHere($, session) !== 'same') return next(e)
     compactEnabled = stored !== false
