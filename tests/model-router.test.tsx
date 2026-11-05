@@ -9,8 +9,9 @@ import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMP
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
+import { CLASSIFY_MS, latencyBucket, latencySummary } from '../hooks/latency'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
-import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isAlias, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
 import { isRisky, riskFloor } from '../hooks/risk'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
@@ -103,6 +104,37 @@ describe('route rules', () => {
   })
 })
 
+describe('classifier latency', () => {
+  // WHY: `aborted` also covers a dispatch the person cut short with Escape; counting that as a timeout blamed the
+  // classifier for the person's own stop.
+  test('a call lands in the bucket of its time; an aborted call is a timeout only at the cap, and no bucket before it', async () => {
+    expect(latencyBucket(0, false)).toBe('<0.5s')
+    expect(latencyBucket(499, false)).toBe('<0.5s')
+    expect(latencyBucket(500, false)).toBe('0.5-1s')
+    expect(latencyBucket(1000, false)).toBe('1-2s')
+    expect(latencyBucket(3999, false)).toBe('2-4s')
+    expect(latencyBucket(4000, false)).toBe('4s+')
+    // Answered just past the cap: slow, but not cut off.
+    expect(latencyBucket(8100, false)).toBe('4s+')
+    expect(latencyBucket(CLASSIFY_MS, true)).toBe('timeout')
+    expect(latencyBucket(CLASSIFY_MS - 50, true)).toBe('timeout')
+    expect(latencyBucket(CLASSIFY_MS - 51, true)).toBeNull()
+    expect(latencyBucket(300, true)).toBeNull()
+  })
+
+  test('the summary gives the median bucket, the 95% bound and the mean', async () => {
+    expect(latencySummary({}, 0, 0)).toBe('Classifier time: no calls yet')
+    expect(latencySummary(undefined, 0, 0)).toBe('Classifier time: no calls yet')
+    const hist = { '<0.5s': 30, '0.5-1s': 50, '1-2s': 16, '2-4s': 4 }
+    expect(latencySummary(hist, 80_000, 100)).toBe('Classifier time: median 0.5-1s, 95% within 2s, mean 0.8s (n=100)')
+    // Exactly 95% at the end of a bucket counts as within it.
+    expect(latencySummary({ '<0.5s': 95, '4s+': 5 }, 50_000, 100)).toBe('Classifier time: median <0.5s, 95% within 0.5s, mean 0.5s (n=100)')
+    // The open bucket's bound is the cap: nothing answers much past it.
+    expect(latencySummary({ '<0.5s': 90, '4s+': 10 }, 50_000, 100)).toBe('Classifier time: median <0.5s, 95% within 8s, mean 0.5s (n=100)')
+    expect(latencySummary({ '<0.5s': 2, timeout: 1 }, 9000, 3)).toBe('Classifier time: median <0.5s, 95th percentile: timeout, mean 3.0s (n=3)')
+  })
+})
+
 const BAND_PROPS = {
   hasSurvey: false,
   isWorking: true,
@@ -123,7 +155,8 @@ function world(
   $: any,
   on: any,
   classifier: Reply | Reply[] | ((e: { system?: string; prompt: string }) => Promise<Reply>),
-  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally; usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number } } = {},
+  // models: what model.complete answers for other model ids (an availability probe), as the result's value.
+  opts: { reviewer?: boolean; drop?: boolean; messages?: { role: 'user' | 'assistant'; text: string }[]; store?: Record<string, unknown>; competing?: Tally; usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }; models?: Record<string, () => unknown> } = {},
 ): Seen {
   const seen: Seen = { sessionId: 'sess-1', clock: mock.clock(on), systems: [], submits: [], steps: [], asked: [], maxTokens: [], prompts: [], usage: [], agents: [], files: {}, statuses: [], store: { ...opts.store } }
   on('store.set', { key: /.*/ }, async (_$: unknown, e: any, next: any) => {
@@ -163,6 +196,8 @@ function world(
         ? { value: { isAnswered: true as const, text: e.prompt.startsWith('Reply') ? 'OK' : '少考虑了回滚方案', usage } }
         : { value: { isAnswered: false as const, reason: 'api-error' as const, status: 404, error: 'not_found_error', usage } }
     }
+    const own = opts.models?.[e.model]
+    if (own) return { value: await own() }
     return { deny: 'unexpected model' }
   })
   // As the engine does: the turn starts before the submit resolves.
@@ -257,7 +292,7 @@ test('a lookup turn runs on Haiku at medium effort, with the assignment in conte
   await $.prompt.submit({ text: 'find every TODO in the repo' } as never)
   expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at medium effort')
   await step($, 't1')
-  expect(seen.steps[0]).toEqual({ model: 'claude-haiku-5-5[1m]', effort: 'medium', agentId: undefined })
+  expect(seen.steps[0]).toEqual({ model: 'haiku[1m]', effort: 'medium', agentId: undefined })
 
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /Haiku · medium — 找文件/ })).toBeDefined()
@@ -270,7 +305,7 @@ test('a lookup main turn starts Haiku at medium: headroom without a model switch
   expect(routeFor('lookup', '')).toMatchObject({ model: 'haiku', effort: 'medium' })
   await $.prompt.submit({ text: 'grep for TODO' } as never)
   await step($, 't1')
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
 })
 
 // WHY: main decisions start at medium however the turn got to Opus (Opus picks its own effort from there), so a
@@ -281,7 +316,7 @@ test('main-thread escalation from haiku to opus lands at opus/medium unless a hi
   const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'design call' } as never)) as { result: string }
   expect(up.result).toContain('opus at medium')
   await step($, 't1')
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
   const haiku = routeFor('lookup', '')
   const direct = applyEscalation(haiku, { model: 'opus', reason: 'x' })
   expect(direct.ok && direct.route).toMatchObject({ model: 'opus', effort: 'medium' })
@@ -296,7 +331,7 @@ test('the running model escalates itself, and the next step follows; downgrades 
   const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: '要做设计决策' } as never)) as { result: string }
   expect(up.result).toContain('opus at medium')
   await step($, 't1')
-  expect(seen.steps[1]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'medium', agentId: undefined })
+  expect(seen.steps[1]).toEqual({ model: 'opus[1m]', effort: 'medium', agentId: undefined })
   const down = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'sonnet', reason: 'x' } as never)) as { result: string }
   expect(down.result).toContain('Not changed')
 
@@ -308,7 +343,7 @@ test('Fable 5.1 never runs, not even in a subagent; other subagent models are le
   const seen = world($, on, '{"tier":"execute","reason":"实现"}')
   await step($, 'other', 'claude-fable-5-1[1m]', 'agent-1')
   await step($, 'other', 'claude-sonnet-5-5', 'agent-2')
-  expect(seen.steps[0]!.model).toBe('claude-opus-5-5[1m]')
+  expect(seen.steps[0]!.model).toBe('opus[1m]')
   expect(seen.steps[1]!.model).toBe('claude-sonnet-5-5')
 })
 
@@ -498,7 +533,7 @@ test('a warm Opus cache on a long context keeps the next execute turn on Opus', 
   await $.prompt.submit({ text: 'implement it' } as never)
   expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus')
   await step($, 't2')
-  expect(seen.steps[1]!.model).toBe('claude-opus-5-5[1m]')
+  expect(seen.steps[1]!.model).toBe('opus[1m]')
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   // Changed in v0.8.2: the context is past WARM_CONTEXT_KEEP, so the classifier is skipped and the turn is Opus outright
   // (it used to be classified execute, then kept on Opus: "Sonnet → Opus (保缓存)").
@@ -674,7 +709,7 @@ test('Explore runs on haiku at medium effort from its first request, keeping the
   await step($, 'sub', 'claude-opus-5-5[1m]', id)
   await step($, 'other', 'claude-opus-5-5[1m]')
   expect(seen.agents).toEqual(['haiku'])
-  expect(seen.steps[0]).toEqual({ model: 'claude-haiku-5-5[1m]', effort: 'medium', agentId: id })
+  expect(seen.steps[0]).toEqual({ model: 'haiku[1m]', effort: 'medium', agentId: id })
   expect(seen.steps[1]).toEqual({ model: 'claude-opus-5-5[1m]', effort: 'high', agentId: undefined })
 })
 
@@ -685,7 +720,7 @@ test('general-purpose is classified: lookup runs on haiku, a decision inherits t
   await step($, 'sub', OPUS, lookup)
   await step($, 'sub', OPUS, decide)
   expect(seen.agents).toEqual(['haiku', undefined])
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'haiku', effort: 'medium' })
   expect(seen.steps[1]).toMatchObject({ model: OPUS, effort: 'high' })
 })
 
@@ -694,7 +729,7 @@ test('a classifier failure sends general-purpose to sonnet at medium, not to the
   const id = await spawnAgent($)
   await step($, 'sub', OPUS, id)
   expect(seen.agents).toEqual(['sonnet'])
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'sonnet', effort: 'medium' })
 })
 
 test('a named agent declares its own model: the router neither classifies nor rewrites it', async ($, on) => {
@@ -716,7 +751,7 @@ test('a sonnet parent never gets an opus subagent: the cap holds for named model
   const again = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'opus', reason: 'harder' } as never)) as { result: string }
   expect(again.result).toContain('the ceiling is sonnet')
   await step($, 'sub', 'claude-sonnet-5-5', id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'sonnet', effort: 'medium' })
 })
 
 test('a Fable parent hands opus to subagents and the block is counted', async ($, on) => {
@@ -735,8 +770,8 @@ test('subagent escalation applies from its next request, so the request after th
   const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'sonnet', effort: 'high', reason: 'results contradict' } as never)) as { result: string }
   expect(r.result).toBe('Escalated to sonnet/high from your next step.')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+  expect(seen.steps[0]).toMatchObject({ model: 'haiku', effort: 'medium' })
+  expect(seen.steps[1]).toMatchObject({ model: 'sonnet', effort: 'high' })
 })
 
 test('an unknown subagent cannot move the main route when it escalates', async ($, on) => {
@@ -745,7 +780,7 @@ test('an unknown subagent cannot move the main route when it escalates', async (
   const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: 'ghost', model: 'opus', reason: 'x' } as never)) as { result: string }
   expect(r.result).toContain('No routed agent')
   await step($, 't1')
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
 })
 
 // Changed from v0.3: the first auto-escalation is now effort on the same model (haiku/medium -> haiku/high);
@@ -761,10 +796,10 @@ test('three tool errors in a row raise a subagent one step; a success in between
   await read('bad')
   await read('bad')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'haiku', effort: 'medium' })
   await read('bad')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+  expect(seen.steps[1]).toMatchObject({ model: 'haiku', effort: 'high' })
 })
 
 test('the second run of three errors raises the model; the log says which stage fired', async ($, on) => {
@@ -776,8 +811,8 @@ test('the second run of three errors raises the model; the log says which stage 
   await step($, 'sub', OPUS, id)
   for (let i = 0; i < 3; i++) await bad()
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'haiku', effort: 'high' })
+  expect(seen.steps[1]).toMatchObject({ model: 'sonnet', effort: 'medium' })
   const log = historyOf(seen) as { events: { event: string; to: string; reason: string }[] }
   expect(log.events.filter(ev => ev.event === 'auto-escalated')).toMatchObject([
     { to: 'haiku/high', reason: '3 tool errors in a row: more effort on the same model' },
@@ -791,7 +826,7 @@ test('a subagent can raise only its effort by hand: the model stays, and effort 
   const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'xhigh', reason: 'needs more thought' } as never)) as { result: string }
   expect(r.result).toBe('Escalated to haiku/high from your next step.')
   await step($, 'sub', OPUS, id)
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+  expect(seen.steps[0]).toMatchObject({ model: 'haiku', effort: 'high' })
 })
 
 test('an unsure turn after a decide turn stays on opus: low confidence never downgrades', async ($, on) => {
@@ -800,7 +835,7 @@ test('an unsure turn after a decide turn stays on opus: low confidence never dow
   await $.prompt.submit({ text: 'ok, and the rest?' } as never)
   expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at medium')
   await step($, 't2')
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   expect(await ui.find({ text: /unsure: not downgrading/ })).toBeDefined()
 })
@@ -825,8 +860,8 @@ test('an unsure general-purpose lookup subagent runs on sonnet, a sure one on ha
   await step($, 'sub', OPUS, unsure)
   await step($, 'sub', OPUS, sure)
   expect(seen.agents).toEqual(['sonnet', 'haiku'])
-  expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+  expect(seen.steps[0]).toMatchObject({ model: 'sonnet', effort: 'medium' })
+  expect(seen.steps[1]).toMatchObject({ model: 'haiku', effort: 'medium' })
 })
 
 test('#haiku still wins when the classifier would have been unsure, and the classifier is not asked', async ($, on) => {
@@ -836,11 +871,14 @@ test('#haiku still wins when the classifier would have been unsure, and the clas
   expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at medium')
 })
 
+// WHY: the router sends the family alias; the engine answers with the full id of the model it resolved, which is the same
+// family, not a mismatch. Only a different family counts.
 test('a model the router asked for that is not the one answering is counted as a mismatch', async ($, on) => {
   const seen = world($, on, null)
   const id = await spawnAgent($, { subagentType: 'Explore' })
   seen.usage.push(U(10, 1, 0, 0, 'claude-haiku-5-5'))
   await step($, 'sub', OPUS, id)
+  expect(seen.steps[0]!.model).toBe('haiku')
   let r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('the one that answered: 0')
   seen.usage.push(U(10, 1, 0, 0, 'claude-opus-5-5'))
@@ -965,7 +1003,7 @@ test('a warm 200k-token Opus context is not downgraded to Sonnet for an execute 
   await $.prompt.submit({ text: 'implement it' } as never)
   expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus')
   await step($, 't2')
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5[1m]' })
+  expect(seen.steps[1]).toMatchObject({ model: 'opus[1m]' })
   const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
   // Changed in v0.8.2: at 200k tokens the classifier is skipped (one Haiku call, for the first prompt only) instead of
   // classifying execute and then keeping Opus warm. The Sonnet verdict is never asked for.
@@ -984,7 +1022,7 @@ test('once the cache TTL has passed the same execute turn does move to Sonnet', 
   await $.prompt.submit({ text: 'implement it' } as never)
   expect(seen.submits[1]!.context?.[0]).toContain('assigned to sonnet')
   await step($, 't2')
-  expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+  expect(seen.steps[1]).toMatchObject({ model: 'sonnet[1m]', effort: 'medium' })
 })
 
 describe('turns without a person prompt', () => {
@@ -999,7 +1037,7 @@ describe('turns without a person prompt', () => {
     await step($, 't1')
     await $.turn.start(notification)
     await step($, 'tn')
-    expect(seen.steps[1]).toEqual({ model: 'claude-sonnet-5-5[1m]', effort: 'medium', agentId: undefined })
+    expect(seen.steps[1]).toEqual({ model: 'sonnet[1m]', effort: 'medium', agentId: undefined })
 
     // Logged as an inherit, not as a route; and it is not counted as a routed turn.
     const log = eventsOf(seen)
@@ -1019,7 +1057,7 @@ describe('turns without a person prompt', () => {
     await step($, 't1')
     await $.turn.start(notification)
     await step($, 'tn', 'claude-sonnet-5-5')
-    expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5', effort: 'medium' })
+    expect(seen.steps[1]).toMatchObject({ model: 'opus', effort: 'medium' })
   })
 
   test('after the cache TTL an inherited turn stays unrouted: nothing warm is worth continuing', async ($, on) => {
@@ -1050,7 +1088,7 @@ describe('turns without a person prompt', () => {
     await $.turn.start({ text: 'sub task', turnId: 'ta', agentId: 'agent-1' } as never)
     expect(eventsOf(seen).filter(ev => ev.event === 'turn inherit')).toHaveLength(0)
     await step($, 't1')
-    expect(seen.steps[1]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+    expect(seen.steps[1]).toMatchObject({ model: 'sonnet[1m]', effort: 'medium' })
   })
 })
 
@@ -1064,7 +1102,7 @@ describe('classifier failures', () => {
     expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at medium')
     expect(seen.submits[1]!.context?.[0]).toContain('classifier failed (timeout): kept previous tier')
     await step($, 't2')
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
     expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'opus/medium', reason: 'classifier failed (timeout): kept previous tier' })
   })
 
@@ -1104,6 +1142,45 @@ describe('classifier failures', () => {
     await $.prompt.submit({ text: 'build it' } as never)
     const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
     expect(r.text).toContain('Classifier failures: none.')
+  })
+
+  test('every live classifier call is timed into a bucket, a timeout included, and stats summarise them', async ($, on) => {
+    const times = [300, 700, 8000]
+    const replies: Reply[] = [execute, execute, null]
+    const seen = world($, on, async () => {
+      await seen.clock.advance(times.shift()!)
+      return replies.shift()!
+    })
+    for (const text of ['one', 'two', 'three']) await $.prompt.submit({ text } as never)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier time: median 0.5-1s, 95th percentile: timeout, mean 3.0s (n=3). ')
+    const counts = Object.entries(seen.store).find(([k]) => k.startsWith('counts:'))![1] as Record<string, unknown>
+    expect(counts.classifierLatency).toEqual({ '<0.5s': 1, '0.5-1s': 1, timeout: 1 })
+    expect(counts.classifierMsTotal).toBe(9000)
+    expect(counts.classifierTimed).toBe(3)
+  })
+
+  // WHY: the engine reports a dispatch the person stopped with Escape as aborted too; it says nothing about the
+  // classifier's speed, so it lands in no bucket and moves neither the mean nor n.
+  test('a call aborted well before the cap is not timed; one aborted at the cap is a timeout', async ($, on) => {
+    const times = [300, 700, CLASSIFY_MS]
+    const seen = world($, on, async () => {
+      await seen.clock.advance(times.shift()!)
+      return null
+    })
+    for (const text of ['one', 'two', 'three']) await $.prompt.submit({ text } as never)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier time: median timeout, 95th percentile: timeout, mean 8.0s (n=1). ')
+    const counts = Object.entries(seen.store).find(([k]) => k.startsWith('counts:'))![1] as Record<string, unknown>
+    expect(counts.classifierLatency).toEqual({ timeout: 1 })
+    expect(counts.classifierMsTotal).toBe(CLASSIFY_MS)
+    expect(counts.classifierTimed).toBe(1)
+  })
+
+  test('stats say no calls yet before any classifier call', async ($, on) => {
+    world($, on, execute)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier time: no calls yet. ')
   })
 
   test('a subagent classifier failure still runs on sonnet, records the reason in its start event, and is counted', async ($, on) => {
@@ -1199,7 +1276,7 @@ describe('mainRouting off (subagent-only mode)', () => {
     const id = await spawnAgent($, { subagentType: 'Explore' })
     seen.usage.push(U(1000, 100, 0, 0, 'claude-haiku-5-5'))
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[3]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium', agentId: id })
+    expect(seen.steps[3]).toMatchObject({ model: 'haiku', effort: 'medium', agentId: id })
     const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, model: 'sonnet', reason: 'hard' } as never)) as { result: string }
     expect(up.result).toBe('Escalated to sonnet/medium from your next step.')
     const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
@@ -1257,7 +1334,7 @@ describe('opus effort guidance and the max-effort guard', () => {
     const seen = world($, on, decide)
     await $.prompt.submit({ text: 'which design' } as never)
     await step($, 't1')
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
     const ctx = seen.submits[0]!.context?.[0] ?? ''
     expect(ctx).toContain('assigned to opus at medium')
     expect(ctx).toContain('medium for most work')
@@ -1274,7 +1351,7 @@ describe('opus effort guidance and the max-effort guard', () => {
     const r = (await $.tool.call({ tool: 'mcp__model-router__escalate', agentId: id, effort: 'max', reason: 'irreversible change' } as never)) as { result: string }
     expect(r.result).toBe('Escalated to haiku/high from your next step.')
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+    expect(seen.steps[0]).toMatchObject({ model: 'haiku', effort: 'high' })
     const stats = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
     expect(stats.text).toContain('Escalations to max effort: 0.')
   })
@@ -1291,7 +1368,7 @@ describe('opus effort guidance and the max-effort guard', () => {
     const m = (await $.tool.call({ tool: 'mcp__model-router__escalate', effort: 'max', reason: 'irreversible prod change' } as never)) as { result: string }
     expect(m.result).toContain('opus at max')
     await step($, 't1')
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'max' })
+    expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'max' })
     expect(await stats()).toContain('Escalations to max effort: 1.')
   })
 })
@@ -1309,12 +1386,12 @@ describe('subagent caps (v0.8.1)', () => {
     const r = await call($, { agentId: id, model: 'opus', effort: 'high', reason: 'hard' })
     expect(r.result).toBe('Escalated to opus/medium from your next step.')
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'opus', effort: 'medium' })
     const more = await call($, { agentId: id, effort: 'xhigh', reason: 'harder' })
     expect(more.result).toContain('No change')
     expect(more.result).toContain('the ceiling is opus/medium')
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[1]).toMatchObject({ model: OPUS, effort: 'medium' })
+    expect(seen.steps[1]).toMatchObject({ model: 'opus', effort: 'medium' })
   })
 
   // WHY: the main conversation verifies what subagents return, so it alone may spend more on one; never beyond opus/high.
@@ -1324,11 +1401,11 @@ describe('subagent caps (v0.8.1)', () => {
     const r = await call($, { agent: id, model: 'opus', effort: 'xhigh', reason: 'main judges it needs more' })
     expect(r.result).toBe(`Subagent ${id} now runs opus/high from its next step.`)
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'high' })
+    expect(seen.steps[0]).toMatchObject({ model: 'opus', effort: 'high' })
     const max = await call($, { agent: id, effort: 'max', reason: 'x' })
     expect(max.result).toContain('No change')
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[1]).toMatchObject({ model: OPUS, effort: 'high' })
+    expect(seen.steps[1]).toMatchObject({ model: 'opus', effort: 'high' })
     expect(MAIN_RAISE_CAP).toEqual({ model: 'opus', effort: 'high' })
     expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ agentId: id, event: 'raised by main', to: 'opus/high', reason: 'main judges it needs more' }))
   })
@@ -1339,7 +1416,7 @@ describe('subagent caps (v0.8.1)', () => {
     const r = await call($, { agent: id, model: 'opus', effort: 'high', reason: 'x' })
     expect(r.result).toBe(`Subagent ${id} now runs sonnet/high from its next step.`)
     await step($, 'sub', 'claude-sonnet-5-5', id)
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+    expect(seen.steps[0]).toMatchObject({ model: 'sonnet', effort: 'high' })
   })
 
   test('main naming an agent the router does not track gets a clear reply and changes nothing', async ($, on) => {
@@ -1348,7 +1425,7 @@ describe('subagent caps (v0.8.1)', () => {
     const r = await call($, { agent: 'ghost', model: 'opus', reason: 'x' })
     expect(r.result).toBe('No tracked subagent ghost.')
     await step($, 't1')
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
   })
 
   // WHY: only the main conversation judges what a subagent needs; one subagent steering another would bypass that check.
@@ -1360,8 +1437,8 @@ describe('subagent caps (v0.8.1)', () => {
     expect(r.result).toContain('only the main conversation can raise a subagent')
     await step($, 'sub', OPUS, a)
     await step($, 'sub', OPUS, b)
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
-    expect(seen.steps[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'haiku', effort: 'medium' })
+    expect(seen.steps[1]).toMatchObject({ model: 'haiku', effort: 'medium' })
   })
 
   // WHY: agents that inherit (decide work, Plan, named agents) keep the session's effort, which may be xhigh or max;
@@ -1384,7 +1461,7 @@ describe('subagent caps (v0.8.1)', () => {
     const id = await spawnAgent($, { subagentType: 'Explore' })
     await call($, { agent: id, model: 'opus', effort: 'high', reason: 'x' })
     await step($, 'sub', OPUS, id, 'max')
-    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'high' })
+    expect(seen.steps[0]).toMatchObject({ model: 'opus', effort: 'high' })
   })
 
   // WHY: forks and workflow agents are not tiered by the router, so they are not capped by it either.
@@ -1414,7 +1491,7 @@ describe('subagent caps (v0.8.1)', () => {
     // the original result is otherwise unchanged
     expect(last).toMatchObject({ result: 'boom', isError: true })
     await step($, 'sub', OPUS, id)
-    expect(seen.steps[0]).toMatchObject({ model: OPUS, effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'opus', effort: 'medium' })
     expect(eventsOf(seen).filter(ev => ev.event === 'ceiling reached')).toMatchObject([{ agentId: id, to: 'opus/medium' }])
   })
 
@@ -1494,7 +1571,7 @@ describe('phase 1 routing and meter fixes', () => {
     const up = await call($, { agentId: id, model: 'opus', reason: 'harder' })
     expect(up.result).toBe('Escalated to opus/medium from your next step.')
     await step($, 'sub', OPUS, id)
-    expect(seen.steps.at(-1)).toMatchObject({ model: OPUS, effort: 'medium' })
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'opus', effort: 'medium' })
     expect(seen.asked).toEqual([])
     expect(await statsOf($)).toContain('Subagents routed: haiku 0 · sonnet 0 · opus 0')
   })
@@ -1507,7 +1584,7 @@ describe('phase 1 routing and meter fixes', () => {
     expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
     for (let i = 0; i < 3; i++) await $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
     await step($, 'sub', 'claude-haiku-5-5', id)
-    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'medium' })
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet', effort: 'medium' })
     expect(seen.asked).toEqual([])
     expect(await statsOf($)).toContain('Subagents routed: haiku 0 · sonnet 0 · opus 0')
   })
@@ -1527,7 +1604,7 @@ describe('phase 1 routing and meter fixes', () => {
     expect(resumed).toBe(id)
     expect(seen.asked).toEqual(['haiku'])
     await step($, 'sub', OPUS, id)
-    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet', effort: 'high' })
     expect(await statsOf($)).toContain('Subagents routed: haiku 1 · sonnet 0 · opus 0')
   })
 
@@ -1540,7 +1617,7 @@ describe('phase 1 routing and meter fixes', () => {
     await spawnAgent($, { subagentType: 'Explore', resume: { agentId: id } })
     await $.tool.call({ tool: 'Read', file_path: 'bad', agentId: id } as never)
     await step($, 'sub', OPUS, id)
-    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'haiku', effort: 'high' })
     expect(await statsOf($)).toContain('Subagents routed: haiku 1 · sonnet 0 · opus 0')
   })
 
@@ -1697,7 +1774,7 @@ describe('blockFable (v0.8.2)', () => {
     await step($, 't1', 'claude-fable-5-1[1m]')
     await step($, 'other', 'claude-fable-5-1[1m]', 'agent-1')
     expect(seen.steps[0]!.model).toBe('claude-fable-5-1[1m]')
-    expect(seen.steps[1]!.model).toBe('claude-opus-5-5[1m]')
+    expect(seen.steps[1]!.model).toBe('opus[1m]')
     expect(await statsOf($)).toContain('Fable requests moved to Opus: 1')
   })
 
@@ -1782,7 +1859,7 @@ describe('classifier skipped on a warm large Opus context (v0.8.2)', () => {
     expect(seen.submits[1]!.context?.[0]).toContain('assigned to opus at medium')
     expect(seen.submits[1]!.context?.[0]).toContain('warm large context: classifier skipped')
     await step($, 't2')
-    expect(seen.steps[1]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+    expect(seen.steps[1]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
     expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'opus/medium', reason: 'warm large context: classifier skipped' })
     expect(await statsOf($)).toContain('Classifier skipped (warm large Opus context): 1')
   })
@@ -1968,7 +2045,7 @@ describe('cost exposure and session commands (1.0)', () => {
       await $.session.measure({ context: { window: 1e6, tokens }, rateLimits: [], changed: ['context'] } as never)
       await $.prompt.submit({ text: 'implement it' } as never)
       await step($, 't2')
-      expect(seen.steps[1]!.model).toBe(tokens === 0 ? 'claude-sonnet-5-5[1m]' : 'claude-opus-5-5[1m]')
+      expect(seen.steps[1]!.model).toBe(tokens === 0 ? 'sonnet[1m]' : 'opus[1m]')
       expect(seen.asked).toEqual(tokens === 0 ? ['haiku'] : [])
     })
   }
@@ -2261,7 +2338,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
           await $.prompt.submit({ text: 'work during backoff #sonnet' } as never)
           seen.usage.push(U(100, 50))
           await step($, 't1')
-          expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+          expect(seen.steps.at(-1)!.model).toBe('sonnet[1m]')
           expect(totals).toBe(1)
           expect(scans).toBe(1)
         }
@@ -2341,7 +2418,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(attempts).toBe(6)
       expect(diagnostics).toBe(3)
       await step($, 't101')
-      expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+      expect(seen.steps.at(-1)!.model).toBe('sonnet[1m]')
     })
 
     test('100 failed session-id lookups make one attempt and never reuse the previous identity', async ($, on) => {
@@ -2367,7 +2444,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await new Promise(resolve => setTimeout(resolve, 1100))
       await $.prompt.submit({ text: 'recovered #sonnet' } as never)
       await step($, 't102')
-      expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+      expect(seen.steps.at(-1)!.model).toBe('sonnet[1m]')
       expect(eventsOf(seen, 'sess-2')).toContainEqual(expect.objectContaining({ event: 'turn route', to: 'sonnet/medium' }))
     })
 
@@ -2389,7 +2466,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(seen.submits).toHaveLength(1)
         expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet at medium effort')
         await step($, 't1')
-        expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+        expect(seen.steps[0]).toMatchObject({ model: 'sonnet[1m]', effort: 'medium' })
       })
 
       test(`turn.step returns the engine's answer when the meter's state.${operation} throws`, async ($, on) => {
@@ -2411,7 +2488,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         }
         expect(failures).toBe(1)
         expect(result).toMatchObject({ turnId: 't1', stopReason: 'end_turn', usage: U(100, 50) })
-        expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+        expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
         failing = false
         const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
         expect(await ui.find({ text: /^This reply / })).toBeDefined()
@@ -2447,7 +2524,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(starts).toBe(1)
       expect(eventsOf(seen)).toContainEqual(expect.objectContaining({ event: 'turn route', to: 'haiku/medium' }))
       await step($, 't1')
-      expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+      expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
     })
 
     test('agent.spawn returns the routed agent when its counter write throws', async ($, on) => {
@@ -2459,7 +2536,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(id).toBe('agent-1')
       expect(seen.agents).toEqual(['haiku'])
       await step($, 'a1', `${OPUS}[1m]`, id)
-      expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium', agentId: id })
+      expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium', agentId: id })
     })
 
     test('tool.call replies with the new route when its escalation counter write throws', async ($, on) => {
@@ -2476,7 +2553,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       expect(result.result).toContain('runs on opus at medium effort')
       expect(failures).toBe(1)
       await step($, 't1')
-      expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-5-5[1m]', effort: 'medium' })
+      expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
     })
 
     test('session.compact returns the engine sizes when its detail and usage writes throw', async ($, on) => {
@@ -2585,7 +2662,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         await $.prompt.submit({ text: 'continue #sonnet' } as never)
         seen.usage.push(U(100, 50))
         await step($, 't2')
-        expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+        expect(seen.steps.at(-1)!.model).toBe('sonnet[1m]')
         await $.turn.complete(done('t2'))
         expect(failures).toBeGreaterThan(0)
         failing = false
@@ -2595,7 +2672,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         expect(eventsOf(seen, seen.sessionId).some(e => e.event === 'turn route' && e.to === 'sonnet/medium')).toBe(true)
         // A retry must not clear the route chosen while initialization was unavailable.
         await step($, 't2')
-        expect(seen.steps.at(-1)!.model).toBe('claude-sonnet-5-5[1m]')
+        expect(seen.steps.at(-1)!.model).toBe('sonnet[1m]')
       })
     }
 
@@ -2690,7 +2767,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
       expect(turnTokens).toBe(150)
       await step($, 't1')
-      expect(seen.steps.at(-1)!.model).toBe('claude-haiku-5-5[1m]')
+      expect(seen.steps.at(-1)!.model).toBe('haiku[1m]')
       expect(turnTokens).toBe(150)
     })
 
@@ -2755,10 +2832,10 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       const { seen } = compactWorld($, on)
       await $.prompt.submit({ text: 'continue #haiku' } as never)
       await step($, 't1')
-      expect(seen.steps.at(-1)!.model).toBe('claude-haiku-5-5[1m]')
+      expect(seen.steps.at(-1)!.model).toBe('haiku[1m]')
       await statsOf($)
       await step($, 't1')
-      expect(seen.steps.at(-1)!.model).toBe('claude-haiku-5-5[1m]')
+      expect(seen.steps.at(-1)!.model).toBe('haiku[1m]')
     })
 
     test('a meter load retry keeps spend recorded after its failed initialization', async ($, on) => {
@@ -2845,7 +2922,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
           // The old route and accounting still work, then a fresh completion can arm the next guard.
           seen.usage.push(U(100, 50, 149_900))
           await step($, 't1')
-          expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+          expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet[1m]', effort: 'medium' })
           expect(seen.tally!.tokens).toBeGreaterThan(150_500)
           await $.turn.complete(done('t1'))
           await seen.clock.advance(20 * MIN)
@@ -2899,7 +2976,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await new Promise(resolve => setTimeout(resolve, 1100))
       seen.usage.push(U(100, 50))
       await step($, 't1')
-      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet[1m]', effort: 'medium' })
       expect(seen.tally!.tokens).toBe(150)
     })
 
@@ -2910,7 +2987,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       await $.prompt.submit({ text: 'fresh work #haiku' } as never)
       seen.usage.push(U(100, 50))
       await step($, 't2')
-      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
       const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
       expect(await ui.find({ text: /^This reply under \$0\.01 · / })).toBeDefined()
       await seen.clock.advance(20 * MIN)
@@ -2926,7 +3003,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
       // No session.start: the old object is ended, so the ordinary hook must replace it.
       await $.prompt.submit({ text: 'fresh work #haiku' } as never)
       await step($, 't2')
-      expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+      expect(seen.steps.at(-1)).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
       await seen.clock.advance(20 * MIN)
       expect(c.instructions).toHaveLength(0)
     })
@@ -2966,7 +3043,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         await $.prompt.submit({ text: 'current work #sonnet' } as never)
         seen.usage.push(U(200, 100))
         await step($, 't2')
-        expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+        expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet[1m]', effort: 'medium' })
         expect(members.size).toBe(2)
         expect([...retained.values()].map(state => state.value)).toContainEqual(expect.objectContaining({ turn: expect.objectContaining({ tokens: 150 }) }))
         store = { ...seen.store }
@@ -5356,7 +5433,7 @@ describe('compaction guards and the cache-expiry counter (v0.9.0)', () => {
         const id = await spawnAgent($, { subagentType: 'Explore' })
         seen.usage.push(U(100, 50))
         await step($, 'a1', OPUS, id)
-        expect(seen.steps.at(-1)).toMatchObject({ agentId: id, model: 'claude-haiku-5-5', effort: 'medium' })
+        expect(seen.steps.at(-1)).toMatchObject({ agentId: id, model: 'haiku', effort: 'medium' })
       } finally {
         release?.()
       }
@@ -5496,7 +5573,7 @@ describe('an effort the caller sets on the Agent tool is kept (v0.10.0, review P
     const { seen, ids } = agentWorld($, on)
     await $.tool.call({ tool: 'Agent', tool_use_id: 'call-2', effort: 'max', prompt: 'p', subagent_type: 'Explore' } as never)
     await step($, 'sub', OPUS, ids[0], 'max')
-    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-haiku-5-5', effort: 'high' })
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'haiku', effort: 'high' })
   })
 
   test('without an explicit effort the pin starts at medium; one call never leaks its effort into the next', async ($, on) => {
@@ -6428,7 +6505,7 @@ describe('append-only event logs', () => {
       await statsOf($)
       await $.prompt.submit({ text: 'again #haiku' } as never)
       expect(reads).toBe(1)
-      expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+      expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
       expect(seen.submits).toHaveLength(2)
     })
   }
@@ -6446,7 +6523,7 @@ describe('append-only event logs', () => {
     await statsOf($)
     await $.prompt.submit({ text: 'again #haiku' } as never)
     expect(reads).toBe(1)
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-haiku-5-5[1m]', effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'haiku[1m]', effort: 'medium' })
     expect(seen.submits).toHaveLength(2)
   })
 
@@ -8515,7 +8592,7 @@ describe('risk floor (1.2.0)', () => {
     expect(route(seen)).toContain('assigned to sonnet at medium effort')
     expect(route(seen)).toContain('run git · risky action: at least Sonnet')
     await step($, 't1')
-    expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+    expect(seen.steps[0]).toMatchObject({ model: 'sonnet[1m]', effort: 'medium' })
     expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
   })
 
@@ -8570,7 +8647,7 @@ describe('risk floor (1.2.0)', () => {
     const id = await spawnAgent($, { prompt: 'push the release branch', parentModel: 'claude-haiku-5-5' })
     expect(seen.agents).toEqual(['sonnet'])
     await step($, 't1', 'claude-haiku-5-5', id)
-    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', agentId: id, effort: 'medium' })
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet', agentId: id, effort: 'medium' })
     expect(seen.statuses.some(t => t?.includes('risky action: Sonnet, above the Haiku parent'))).toBe(true)
     expect(await statsOf($)).toContain('Risky actions raised from lookup to Sonnet: 1.')
   })
@@ -9182,6 +9259,191 @@ describe('classifier prompt: opinion questions (1.2.1)', () => {
       expect(classifierSystem(lang)).toContain(rule)
       expect(legacyClassifierSystem(lang)).not.toContain('asks for your opinion')
     }
+  })
+})
+
+describe('model ids that survive model releases (1.2.2)', () => {
+  const ZERO = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+  const NOT_FOUND = { isAnswered: false, reason: 'api-error', status: 404, error: 'model_not_found', usage: ZERO }
+  const OVERLOADED = { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: ZERO }
+  const decide = '{"tier":"decide","sure":true,"reason":"选方案"}'
+
+  // The engine's side of session start, and the toasts it was asked to show.
+  async function start($: any, on: any): Promise<string[]> {
+    const toasts: string[] = []
+    on('command.register', async (_$: unknown, e: any) => ({ value: { command: e.name } }))
+    on('tool.register', async () => ({ value: { tool: 'mcp__model-router__escalate' } }))
+    on('session.usage', async () => ({ value: { startedAt: 0, context: { window: 1e6 }, rateLimits: [] } }))
+    on('session.model', async () => ({ value: 'claude-opus-5-5[1m]' }))
+    on('session.start', async (_$: unknown, e: any) => ({ cwd: e.cwd }))
+    on('ui.toast', async (_$: unknown, e: { text: string }) => {
+      toasts.push(e.text)
+      return { value: undefined }
+    })
+    await $.session.start({ cwd: '/plugin', surface: 'terminal', isInteractive: true })
+    return toasts
+  }
+
+  // The probe runs in the background: let it finish.
+  async function settle(seen: Seen, done: () => boolean) {
+    for (let i = 0; i < 100 && !done(); i++) await seen.clock.advance(0)
+  }
+
+  test('isAlias: a bare family name, with or without a context suffix, is an alias; a full id is not', async () => {
+    for (const id of ['haiku', 'sonnet', 'opus', 'opus[1m]', 'Sonnet[1m]']) expect([id, isAlias(id)]).toEqual([id, true])
+    for (const id of ['claude-opus-5-5', 'claude-haiku-5-5[1m]', 'fable', 'opusplan', '']) expect([id, isAlias(id)]).toEqual([id, false])
+  })
+
+  test('the defaults are the aliases, and no availability probe is made for them', async ($, on) => {
+    const seen = world($, on, decide)
+    await start($, on)
+    await settle(seen, () => false)
+    expect(seen.asked).toEqual([])
+    const status = ((await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }).text
+    expect(status).toContain('haikuModel: haiku\n')
+    expect(status).toContain('sonnetModel: sonnet\n')
+    expect(status).toContain('opusModel: opus\n')
+    await $.prompt.submit({ text: 'which queue should we use' } as never)
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
+  })
+
+  // WHY: a retired full id would fail every request routed to its tier; measured: the API answers model_not_found.
+  test('a configured id the account reports as not found falls back to its alias, with one toast and one count', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { models: { 'claude-opus-9-9': () => NOT_FOUND } })
+    const toasts = await start($, on)
+    await settle(seen, () => toasts.length > 0)
+    expect(seen.asked).toEqual(['claude-opus-9-9'])
+    expect(toasts).toEqual(['model-router: claude-opus-9-9 was not found on this account, so that tier runs on opus (the newest model of its family) for now. Set an id that exists, or the alias, in the plugin options.'])
+    expect(Object.entries(seen.store).find(([k]) => k === 'probe:claude-opus-9-9')?.[1]).toMatchObject({ ok: false })
+    await $.prompt.submit({ text: 'which queue should we use' } as never)
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'opus[1m]', effort: 'medium' })
+    expect(await statsOf($)).toContain('Configured model ids not found, run on the alias instead: 1.')
+    // The probe ran once; the turn did not ask the missing id again.
+    expect(seen.asked.filter(m => m === 'claude-opus-9-9')).toHaveLength(1)
+  })
+
+  // WHY: the API's own 404 kind is not_found_error; matching only the engine's model_not_found string would leave a retired id failing every request.
+  test('a 404 counts as not found whatever its error kind', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { models: { 'claude-opus-9-9': () => ({ ...NOT_FOUND, error: 'not_found_error' }) } })
+    const toasts = await start($, on)
+    await settle(seen, () => toasts.length > 0)
+    expect(toasts).toHaveLength(1)
+    expect(Object.entries(seen.store).find(([k]) => k === 'probe:claude-opus-9-9')?.[1]).toMatchObject({ ok: false })
+  })
+
+  test('a transient error keeps the configured id and stores nothing, so the next session asks again', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { models: { 'claude-opus-9-9': () => OVERLOADED } })
+    const toasts = await start($, on)
+    await settle(seen, () => false)
+    expect(seen.asked).toEqual(['claude-opus-9-9'])
+    expect(toasts).toEqual([])
+    expect(seen.store['probe:claude-opus-9-9']).toBeUndefined()
+    await $.prompt.submit({ text: 'which queue should we use' } as never)
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-9-9[1m]', effort: 'medium' })
+    expect(await statsOf($)).toContain('Configured model ids not found, run on the alias instead: 0.')
+  })
+
+  test('a configured id that answers is kept, and the answer is remembered for a day', { options: { sonnetModel: 'claude-sonnet-5-5' } }, async ($, on) => {
+    const seen = world($, on, '{"tier":"execute","sure":true,"reason":"x"}', { models: { 'claude-sonnet-5-5': () => ({ isAnswered: true, text: 'OK', usage: ZERO }) } })
+    const toasts = await start($, on)
+    await settle(seen, () => seen.store['probe:claude-sonnet-5-5'] !== undefined)
+    expect(seen.asked).toEqual(['claude-sonnet-5-5'])
+    expect(toasts).toEqual([])
+    expect(seen.store['probe:claude-sonnet-5-5']).toMatchObject({ ok: true })
+    await $.prompt.submit({ text: 'build it' } as never)
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-sonnet-5-5[1m]', effort: 'medium' })
+  })
+
+  // WHY: the probe can take up to 15 s; a turn must never wait for it.
+  test('until the probe settles, turns run on the configured id; after it, on the alias', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    let answer: (v: unknown) => void = () => {}
+    const seen = world($, on, [decide, decide], { models: { 'claude-opus-9-9': () => new Promise(resolve => { answer = resolve }) } })
+    const toasts = await start($, on)
+    await settle(seen, () => seen.asked.includes('claude-opus-9-9'))
+    await $.prompt.submit({ text: 'which queue should we use' } as never)
+    await step($, 't1')
+    expect(seen.steps[0]).toMatchObject({ model: 'claude-opus-9-9[1m]' })
+    answer(NOT_FOUND)
+    await settle(seen, () => toasts.length > 0)
+    await $.prompt.submit({ text: 'and which database' } as never)
+    await step($, 't2')
+    expect(seen.steps[1]).toMatchObject({ model: 'opus[1m]' })
+  })
+
+  // WHY: with the router off no tier is routed to, so the probe only spent; and it ran before the on/off state was read.
+  test('no probe is made while the router is off', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { store: { enabled: false }, models: { 'claude-opus-9-9': () => NOT_FOUND } })
+    const toasts = await start($, on)
+    await settle(seen, () => false)
+    expect(seen.asked).toEqual([])
+    expect(toasts).toEqual([])
+    expect(seen.store['probe:claude-opus-9-9']).toBeUndefined()
+  })
+
+  // WHY: the plugin never runs Fable by its own hand, so asking a Fable id whether it exists would only spend.
+  test('a Fable id is not probed', { options: { opusModel: 'claude-fable-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide)
+    const toasts = await start($, on)
+    await settle(seen, () => false)
+    expect(seen.asked).toEqual([])
+    expect(toasts).toEqual([])
+  })
+
+  // WHY: startOf copies the tier's id into the agent at spawn; an agent spawned before the probe answered kept the
+  // missing id, and every later step on it would have failed.
+  test('a subagent spawned before the probe answers follows its tier to the alias; a caller pin is untouched', { options: { sonnetModel: 'claude-sonnet-9-9' } }, async ($, on) => {
+    let answer: (v: unknown) => void = () => {}
+    const execute = '{"tier":"execute","sure":true,"reason":"x"}'
+    const seen = world($, on, [execute, execute], { models: { 'claude-sonnet-9-9': () => new Promise(resolve => { answer = resolve }) } })
+    const toasts = await start($, on)
+    await settle(seen, () => seen.asked.includes('claude-sonnet-9-9'))
+    const routed = await spawnAgent($, { prompt: 'implement the parser change' })
+    const pinned = await spawnAgent($, { prompt: 'implement the parser change', model: 'claude-sonnet-9-9' })
+    expect(seen.agents).toEqual(['sonnet', 'claude-sonnet-9-9'])
+    await step($, 'sub', 'claude-sonnet-5-5[1m]', routed)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-9-9[1m]', agentId: routed })
+    answer(NOT_FOUND)
+    await settle(seen, () => toasts.length > 0)
+    await step($, 'sub', 'claude-sonnet-5-5[1m]', routed)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet[1m]', agentId: routed, effort: 'medium' })
+    await step($, 'sub', 'claude-sonnet-9-9[1m]', pinned)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-9-9[1m]', agentId: pinned })
+  })
+
+  // WHY: status printed the options as loaded, so after a fallback it named an id no request was going to.
+  test('status shows the configured id with the alias it runs on after a fallback', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { models: { 'claude-opus-9-9': () => NOT_FOUND } })
+    const toasts = await start($, on)
+    await settle(seen, () => toasts.length > 0)
+    const status = ((await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }).text
+    expect(status).toContain('opusModel: claude-opus-9-9 (not found; running on opus)\n')
+    expect(status).toContain('sonnetModel: sonnet\n')
+  })
+
+  // WHY: the probe is nobody's turn; booked through the turn meter it inflated the band and history of whatever turn
+  // it landed in.
+  test('a probe resolving during a turn goes on the day, never on the turn', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    let answer: (v: unknown) => void = () => {}
+    const seen = world($, on, [decide, decide], { models: { 'claude-opus-9-9': () => new Promise(resolve => { answer = resolve }) } })
+    const box: { turn?: Tally } = {}
+    on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+      box.turn = e.value.turn
+      return next(e)
+    })
+    await start($, on)
+    await settle(seen, () => seen.asked.includes('claude-opus-9-9'))
+    await $.prompt.submit({ text: 'which queue should we use' } as never)
+    const turnBefore = box.turn!.tokens
+    const dayKey = Object.keys(seen.store).find(k => /^meter:\d{8}:sess-1$/.test(k))!
+    const dayBefore = (seen.store[dayKey] as Tally).tokens
+    answer({ isAnswered: true, text: 'OK', usage: { input_tokens: 7, output_tokens: 3, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+    await settle(seen, () => (seen.store[dayKey] as Tally).tokens !== dayBefore)
+    expect((seen.store[dayKey] as Tally).tokens - dayBefore).toBe(10)
+    expect(box.turn!.tokens).toBe(turnBefore)
   })
 })
 

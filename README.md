@@ -371,15 +371,19 @@ as a **difference**: another model would not necessarily use the same tokens. Ol
 are labelled as unattributed spend. The retained total covers 30 days plus legacy totals. Stats also show turns per
 tier, escalations, warm-cache keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus,
 model mismatches (routed model not the one that answered),
-classifier failures by reason and escalations to max effort (main thread only, counted when effort moves to
-max from below).
+classifier failures by reason, how long live classifier calls take (`Classifier time: median 0.5-1s, 95% within 2s,
+mean 0.8s (n=123)`: the median bucket, the upper edge of the bucket that 95% of calls finish within (the 8-second cap
+for the open `4s+` bucket), or `timeout` when more than 5% hit the cap, and the mean; main turns and subagent
+classification alike, replay calls not counted, and a call you abort yourself before the cap not timed), escalations
+to max effort (main thread only, counted when effort moves to max from below) and tiers whose
+configured model id was not found and ran on the alias instead (see "Model ids" under Options).
 
 This is an estimate; see "Assumptions in the meter" below.
 
 | Command | What it shows |
 |---------|---------------|
-| `/model-router stats` | Router on/off and loaded idle/cap/minimum-context settings, session and daily spend, the same-token comparison and counters (also the default command) |
-| `/model-router status` | Router on/off, every loaded option including idle/cap/`compactMinContext`, pending guard timer, cache and safe compaction deadlines, weekly window and last skipped action |
+| `/model-router stats` | Router on/off and loaded idle/cap/minimum-context settings, session and daily spend, the same-token comparison and counters, including classifier time (also the default command) |
+| `/model-router status` | Router on/off, every loaded option including idle/cap/`compactMinContext` (a tier model id that was not found shows the alias it runs on), pending guard timer, cache and safe compaction deadlines, weekly window and last skipped action |
 | `/model-router checkpoint [note]` | Compact between tasks, preserving the information needed to continue |
 | `/model-router context` | Main context size and local category estimates, or an explicit unavailable message; makes no token-count requests |
 | `/model-router on` / `/model-router off` | Enable or disable routing and guards |
@@ -420,14 +424,24 @@ but leave your own conversation alone, turn `mainRouting` off instead (see Optio
 Changing an option reloads the plugin. Use `/model-router stats` or `/model-router status` to confirm the loaded
 values, including router on/off, idle minutes, the context cap and `compactMinContext`.
 
+**Model ids.** Since 1.2.2 the three tier models default to the aliases `haiku`, `sonnet` and `opus`, which Claude Code
+resolves to the newest model of each family (a `[1m]` suffix is kept), so a model release or retirement needs no change.
+A full id such as `claude-opus-5-5` pins one model. When a tier is set to a full id, the router asks that id for a
+one-word reply at session start, in the background (at most once a day per id; the answer is remembered, and until it
+arrives turns use the configured id). Only a "model not found" answer counts: the tier then runs on its alias for as long as the answer is remembered (a day, so a restart inside that window falls back at once), one toast names the configured id and the alias used, `/model-router status` shows
+`claude-opus-9-9 (not found; running on opus)`, and `/model-router stats` counts it. A subagent the router pinned to the
+id before the answer arrived follows its tier to the alias on its next step. Any other error (overloaded, a timeout, no
+network) keeps the configured id and is asked again next session. Aliases and Fable ids are never probed, and nothing is
+probed while the router is off. The probe's spend goes on the day, never on a turn.
+
 | Option | Default | Range | Meaning |
 |--------|---------|-------|---------|
 | `language` | `en` | `en`, `zh` | Language of the UI, routing reason and price comparison (English or Simplified Chinese) |
 | `mainRouting` | `true` (on) | `true`, `false` | On: classify and route the turns you start, except when the warm-cache guard makes classification unnecessary. Off: **subagent-only mode, the low-risk way to start.** The main thread keeps your session model and effort, with no classification or assignment text, while subagent routing, escalation, Fable blocking for subagents and the meter keep working |
 | `blockFable` | `true` (on) | `true`, `false` | On: Fable never runs on a subagent, or on the main thread while `mainRouting` is on (those requests run on the Decision model); with `mainRouting` off your main model is left alone. Off: Fable is left alone everywhere; a subagent still never runs above its parent |
-| `haikuModel` | `claude-haiku-5-5` | Model-id string | Lookup model id available on your account |
-| `sonnetModel` | `claude-sonnet-5-5` | Model-id string | Execution model id available on your account |
-| `opusModel` | `claude-opus-5-5` | Model-id string | Decision model id available on your account |
+| `haikuModel` | `haiku` | Alias or model id | Lookup model. The alias follows the newest Haiku model; a full id (`claude-haiku-5-5`) pins one (see below) |
+| `sonnetModel` | `sonnet` | Alias or model id | Execution model. The alias follows the newest Sonnet model; a full id pins one |
+| `opusModel` | `opus` | Alias or model id | Decision model. The alias follows the newest Opus model; a full id pins one |
 | `reviewModel` | `""` (off) | Empty string or a model id available on your account | Review Opus decisions only if the model exists there; Fable 5.1 is never used. **The reviewer is sent your request and Opus's answer unmasked** (see Privacy) |
 | `idleCompactMinutes` | `0` (off) | 0–55 minutes; active at 1–55 | Compact the main conversation after this many idle minutes, while the cache is warm, context is at least `compactMinContext` and no background agent is busy. A new prompt cancels it. Values outside 1–55 count as off |
 | `compactMinContext` | `100000` | Tokens ≥ 0; no configured maximum | Minimum context for idle compaction and checkpoint hints (a small context is cheap to rewrite) |
@@ -446,7 +460,7 @@ rates, as of 2026-11-02). They may differ from your actual pricing or plan: on a
 dollars, and another model would not have used exactly the same tokens. The dollar difference and percentage are
 same-token comparisons, not measured savings.
 
-Classification and reviewer availability probes are overhead: they add actual cost without an Opus baseline credit.
+Classification, reviewer availability probes and model-id probes are overhead: they add actual cost without an Opus baseline credit.
 The plugin's own compactions are metered when the engine reports usage. That usage has no model id, so their cost
 is estimated at the last main request's model rates. Missing usage cannot be priced.
 
