@@ -9,6 +9,7 @@ import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMP
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
+import { latencyBucket, latencySummary } from '../hooks/latency'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
@@ -100,6 +101,30 @@ describe('route rules', () => {
     expect(text).toContain('haiku at medium effort')
     expect(text).toContain('FIRST, before any other tool')
     expect(assignmentContext(routeFor('decide', ''))).toContain('Decide the effort this task needs')
+  })
+})
+
+describe('classifier latency', () => {
+  test('a call lands in the bucket of its time; an aborted call is a timeout whatever it took', async () => {
+    expect(latencyBucket(0, false)).toBe('<0.5s')
+    expect(latencyBucket(499, false)).toBe('<0.5s')
+    expect(latencyBucket(500, false)).toBe('0.5-1s')
+    expect(latencyBucket(1000, false)).toBe('1-2s')
+    expect(latencyBucket(3999, false)).toBe('2-4s')
+    expect(latencyBucket(4000, false)).toBe('4-8s')
+    // Answered just past the cap: slow, but not cut off.
+    expect(latencyBucket(8100, false)).toBe('4-8s')
+    expect(latencyBucket(300, true)).toBe('timeout')
+  })
+
+  test('the summary gives the median bucket, the 95% bound and the mean', async () => {
+    expect(latencySummary({}, 0, 0)).toBe('Classifier time: no calls yet')
+    expect(latencySummary(undefined, 0, 0)).toBe('Classifier time: no calls yet')
+    const hist = { '<0.5s': 30, '0.5-1s': 50, '1-2s': 16, '2-4s': 4 }
+    expect(latencySummary(hist, 80_000, 100)).toBe('Classifier time: median 0.5-1s, 95% within 2s, mean 0.8s (n=100)')
+    // Exactly 95% at the end of a bucket counts as within it.
+    expect(latencySummary({ '<0.5s': 95, '4-8s': 5 }, 50_000, 100)).toBe('Classifier time: median <0.5s, 95% within 0.5s, mean 0.5s (n=100)')
+    expect(latencySummary({ '<0.5s': 2, timeout: 1 }, 9000, 3)).toBe('Classifier time: median <0.5s, 95th percentile: timeout, mean 3.0s (n=3)')
   })
 })
 
@@ -1104,6 +1129,28 @@ describe('classifier failures', () => {
     await $.prompt.submit({ text: 'build it' } as never)
     const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
     expect(r.text).toContain('Classifier failures: none.')
+  })
+
+  test('every live classifier call is timed into a bucket, a timeout included, and stats summarise them', async ($, on) => {
+    const times = [300, 700, 8000]
+    const replies: Reply[] = [execute, execute, null]
+    const seen = world($, on, async () => {
+      await seen.clock.advance(times.shift()!)
+      return replies.shift()!
+    })
+    for (const text of ['one', 'two', 'three']) await $.prompt.submit({ text } as never)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier time: median 0.5-1s, 95th percentile: timeout, mean 3.0s (n=3). ')
+    const counts = Object.entries(seen.store).find(([k]) => k.startsWith('counts:'))![1] as Record<string, unknown>
+    expect(counts.classifierLatency).toEqual({ '<0.5s': 1, '0.5-1s': 1, timeout: 1 })
+    expect(counts.classifierMsTotal).toBe(9000)
+    expect(counts.classifierTimed).toBe(3)
+  })
+
+  test('stats say no calls yet before any classifier call', async ($, on) => {
+    world($, on, execute)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier time: no calls yet. ')
   })
 
   test('a subagent classifier failure still runs on sonnet, records the reason in its start event, and is counted', async ($, on) => {
