@@ -428,8 +428,7 @@ values, including router on/off, idle minutes, the context cap and `compactMinCo
 resolves to the newest model of each family (a `[1m]` suffix is kept), so a model release or retirement needs no change.
 A full id such as `claude-opus-5-5` pins one model. When a tier is set to a full id, the router asks that id for a
 one-word reply at session start, in the background (at most once a day per id; the answer is remembered, and until it
-arrives turns use the configured id). Only a "model not found" answer counts: the tier then runs on its alias until Claude
-Code or the plugin restarts, one toast names the configured id and the alias used, `/model-router status` shows
+arrives turns use the configured id). Only a "model not found" answer counts: the tier then runs on its alias for as long as the answer is remembered (a day, so a restart inside that window falls back at once), one toast names the configured id and the alias used, `/model-router status` shows
 `claude-opus-9-9 (not found; running on opus)`, and `/model-router stats` counts it. A subagent the router pinned to the
 id before the answer arrived follows its tier to the alias on its next step. Any other error (overloaded, a timeout, no
 network) keeps the configured id and is asked again next session. Aliases and Fable ids are never probed, and nothing is

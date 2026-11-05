@@ -9324,6 +9324,15 @@ describe('model ids that survive model releases (1.2.2)', () => {
     expect(seen.asked.filter(m => m === 'claude-opus-9-9')).toHaveLength(1)
   })
 
+  // WHY: the API's own 404 kind is not_found_error; matching only the engine's model_not_found string would leave a retired id failing every request.
+  test('a 404 counts as not found whatever its error kind', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { models: { 'claude-opus-9-9': () => ({ ...NOT_FOUND, error: 'not_found_error' }) } })
+    const toasts = await start($, on)
+    await settle(seen, () => toasts.length > 0)
+    expect(toasts).toHaveLength(1)
+    expect(Object.entries(seen.store).find(([k]) => k === 'probe:claude-opus-9-9')?.[1]).toMatchObject({ ok: false })
+  })
+
   test('a transient error keeps the configured id and stores nothing, so the next session asks again', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
     const seen = world($, on, decide, { models: { 'claude-opus-9-9': () => OVERLOADED } })
     const toasts = await start($, on)

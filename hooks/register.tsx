@@ -1757,7 +1757,8 @@ async function modelProbe($: EngineInterface, session: Session, id: string): Pro
     if (await stillHere($, session) !== 'same') return 'unknown'
     // On the day and the total only: the probe is nobody's turn, and it may land while one is running.
     await recordReplay($, session, r.usage, id)
-    found = r.isAnswered ? 'ok' : r.reason === 'api-error' && r.error === 'model_not_found' ? 'missing' : 'unknown'
+    // A 404 from this fixed endpoint can only be the model (the engine's kind is model_not_found; the API's own is not_found_error).
+    found = r.isAnswered ? 'ok' : r.reason === 'api-error' && (r.error === 'model_not_found' || r.status === 404) ? 'missing' : 'unknown'
   } catch {
     found = 'unknown'
   }
