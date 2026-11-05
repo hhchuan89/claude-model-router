@@ -382,9 +382,10 @@ are labelled as unattributed spend. The retained total covers 30 days plus legac
 tier, escalations, warm-cache keeps, classifier calls skipped, routed subagents, Fable requests moved to Opus,
 model mismatches (routed model not the one that answered),
 classifier failures by reason, how long live classifier calls take (`Classifier time: median 0.5-1s, 95% within 2s,
-mean 0.8s (n=123)`: the median bucket, the upper edge of the bucket that 95% of calls finish within, or `timeout` when
-more than 5% hit the 8-second cap, and the mean; main turns and subagent classification alike, replay calls not
-counted), escalations to max effort (main thread only, counted when effort moves to max from below) and tiers whose
+mean 0.8s (n=123)`: the median bucket, the upper edge of the bucket that 95% of calls finish within (the 8-second cap
+for the open `4s+` bucket), or `timeout` when more than 5% hit the cap, and the mean; main turns and subagent
+classification alike, replay calls not counted, and a call you abort yourself before the cap not timed), escalations
+to max effort (main thread only, counted when effort moves to max from below) and tiers whose
 configured model id was not found and ran on the alias instead (see "Model ids" under Options).
 
 This is an estimate; see "Assumptions in the meter" below.
@@ -392,7 +393,7 @@ This is an estimate; see "Assumptions in the meter" below.
 | Command | What it shows |
 |---------|---------------|
 | `/model-router stats` | Router on/off and loaded idle/cap/minimum-context settings, session and daily spend, the same-token comparison and counters, including classifier time (also the default command) |
-| `/model-router status` | Router on/off, every loaded option including idle/cap/`compactMinContext`, pending guard timer, cache and safe compaction deadlines, weekly window and last skipped action |
+| `/model-router status` | Router on/off, every loaded option including idle/cap/`compactMinContext` (a tier model id that was not found shows the alias it runs on), pending guard timer, cache and safe compaction deadlines, weekly window and last skipped action |
 | `/model-router checkpoint [note]` | Compact between tasks, preserving the information needed to continue |
 | `/model-router context` | Main context size and local category estimates, or an explicit unavailable message; makes no token-count requests |
 | `/model-router on` / `/model-router off` | Enable or disable routing and guards |
@@ -438,9 +439,11 @@ resolves to the newest model of each family (a `[1m]` suffix is kept), so a mode
 A full id such as `claude-opus-5-5` pins one model. When a tier is set to a full id, the router asks that id for a
 one-word reply at session start, in the background (at most once a day per id; the answer is remembered, and until it
 arrives turns use the configured id). Only a "model not found" answer counts: the tier then runs on its alias until Claude
-Code or the plugin restarts, one toast names the configured id and the alias used, and `/model-router stats` counts it. Any
-other error (overloaded, a timeout, no network) keeps the configured id and is asked again next session. Aliases are
-never probed.
+Code or the plugin restarts, one toast names the configured id and the alias used, `/model-router status` shows
+`claude-opus-9-9 (not found; running on opus)`, and `/model-router stats` counts it. A subagent the router pinned to the
+id before the answer arrived follows its tier to the alias on its next step. Any other error (overloaded, a timeout, no
+network) keeps the configured id and is asked again next session. Aliases and Fable ids are never probed, and nothing is
+probed while the router is off. The probe's spend goes on the day, never on a turn.
 
 | Option | Default | Range | Meaning |
 |--------|---------|-------|---------|

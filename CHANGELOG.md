@@ -10,12 +10,18 @@ All notable changes to this project are documented here. The format follows
 - `/model-router stats` now shows how long live classifier calls take: `Classifier time: median 0.5-1s, 95% within 2s,
   mean 0.8s (n=123)`. Until now only `/model-router replay` timed a call, so the 8-second cap had no measured basis.
   Every live call that was sent is counted, for main turns and `general-purpose` subagents alike, in fixed buckets
-  (`<0.5s`, `0.5-1s`, `1-2s`, `2-4s`, `4-8s`, `timeout`) plus a summed time for the mean, so counts from many sessions
-  add up. Replay calls are not counted.
+  (`<0.5s`, `0.5-1s`, `1-2s`, `2-4s`, `4s+`, `timeout`) plus a summed time for the mean, so counts from many sessions
+  add up. The 95% figure for the open `4s+` bucket is the 8-second cap. Replay calls are not counted, and neither is a
+  call you abort yourself before the cap (Escape): the engine reports it as aborted too, and it says nothing about the
+  classifier's speed.
 - A tier configured with a full model id is checked at session start, in the background, at most once a day per id.
   If the account reports it as not found (`model_not_found`), that tier runs on its family alias instead, one toast
-  names the configured id and the alias used, and stats count it. Any other error keeps the configured id and is asked
-  again next session; until the check answers, the configured id is used. Aliases are never checked.
+  names the configured id and the alias used, `/model-router status` shows the configured id with
+  `(not found; running on <alias>)`, and stats count it. A subagent the router pinned to the configured id before the
+  answer arrived follows its tier to the alias on its next step (a model the caller named is untouched). Any other
+  error keeps the configured id and is asked again next session; until the check answers, the configured id is used.
+  Aliases and Fable ids are never checked, nothing is checked while the router is off, and the check's spend goes on
+  the day and the total, never on a turn.
 
 ### Changed
 

@@ -58,17 +58,32 @@ Rules:
 // A local slash command (/model-router stats, /clear and the like) is stored as a user row starting with one of these
 // tags. It is the person talking to Claude Code, not to Claude, so it says nothing about the work.
 const LOCAL_COMMAND = /^\s*<(?:command-name|local-command-caveat|local-command-stdout|local-command-stderr)>/
+// A task notification (a background agent finished) is stored as a user row too; it is the engine's text, not the person's.
+const SYSTEM_NOTIFICATION = /^\s*\[SYSTEM NOTIFICATION/
+// Text the engine injects beside a person's message, as a block of its own or in front of the real text (measured on the
+// owner's transcripts). It says nothing about the work, and a copy of the current message does not compare equal with it.
+const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
+
+function stripReminders(text: string): string {
+  return text.replace(SYSTEM_REMINDER, '')
+}
 
 // Which messages the classifier sees as context. session.messages() has one row per message, and every intermediate
 // assistant narration in a turn ("Next I will read X…") is its own row, so "the last two" after a multi-step turn was
 // usually two narration lines and never the person's previous request. Instead: the person's last request and the last
-// assistant row after it (that turn's final answer). Empty rows and local-command rows are dropped first, and a last
-// user row equal to the current message too, since prompt.submit may or may not already list it. With no user row,
-// the last two rows; with no answer after the request, the request alone.
+// assistant row after it (that turn's final answer). System-reminder blocks are stripped from every row first (a row that
+// changed is sent trimmed), then empty rows, local-command rows and task notifications are dropped, and a last user row
+// equal to the current message too, since prompt.submit may or may not already list it. With no user row, the last two
+// rows; with no answer after the request, the request alone.
 export function pickContext<T extends { role: string; text: string }>(messages: readonly T[], current?: string): T[] {
-  const rows = messages.filter(m => m.text.trim() !== '' && !LOCAL_COMMAND.test(m.text))
+  const rows = messages
+    .map(m => {
+      const stripped = stripReminders(m.text)
+      return stripped === m.text ? m : { ...m, text: stripped.trim() }
+    })
+    .filter(m => m.text.trim() !== '' && !LOCAL_COMMAND.test(m.text) && !SYSTEM_NOTIFICATION.test(m.text))
   const last = rows.at(-1)
-  if (current !== undefined && last?.role === 'user' && last.text.trim() === current.trim()) rows.pop()
+  if (current !== undefined && last?.role === 'user' && last.text.trim() === stripReminders(current).trim()) rows.pop()
   let user = -1
   for (let i = rows.length - 1; i >= 0; i--) {
     if (rows[i]!.role === 'user') {

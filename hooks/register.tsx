@@ -8,7 +8,7 @@ import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } fro
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
 import { isPersonOrigin } from './origin'
-import { latencyBucket, latencySummary } from './latency'
+import { CLASSIFY_MS, latencyBucket, latencySummary } from './latency'
 import { fmtPace, isPaceMode, paceOf, sameWindow } from './pace'
 import type { PaceMode } from './pace'
 import { barChartSvg, cellWidth, chartAlt, hhmm, lastDays, textChart, weekdayOf } from './history'
@@ -59,7 +59,6 @@ const FETCH_TOOL = 'fetch_output'
 const FETCH_CALL = `mcp__model-router__${FETCH_TOOL}`
 const TOOL = 'escalate'
 const TOOL_CALL = `mcp__model-router__${TOOL}`
-const CLASSIFY_MS = 8000
 const PROBE_EVERY_MS = 24 * 3600 * 1000
 // The verdict is a JSON object with a tier, a confidence and a reason; 120 tokens cut it off mid-reply.
 const CLASSIFY_MAX_TOKENS = 300
@@ -292,6 +291,7 @@ const STR = {
     paceAhead: (x: string) => ` · 节奏 ${x} 超前`,
     paceToast: (used: string, x: string, steer: boolean) => `每周用量 ${used}%，节奏 ${x}，超过均匀消耗。${steer ? '未确定的决策将改用 Sonnet。' : ''}`,
     modelFallback: (configured: string, alias: string) => `model-router：本账户找不到 ${configured}，这一档暂时改用 ${alias}（该系列最新的模型）。请在插件选项里改成现有的 id，或直接用别名。`,
+    modelNotFound: (alias: string) => `（找不到；改用 ${alias}）`,
     histNone: '本会话还没有路由过的回复。',
     paused: '路由器已暂停——每一轮都由你自己的模型回答',
     details: '详情',
@@ -438,6 +438,7 @@ const STR = {
     paceAhead: (x: string) => ` · pace ${x} ahead`,
     paceToast: (used: string, x: string, steer: boolean) => `Weekly usage ${used}% is using the week ${x} faster than an even pace.${steer ? ' Unsure decisions now route to Sonnet.' : ''}`,
     modelFallback: (configured: string, alias: string) => `model-router: ${configured} was not found on this account, so that tier runs on ${alias} (the newest model of its family) for now. Set an id that exists, or the alias, in the plugin options.`,
+    modelNotFound: (alias: string) => `(not found; running on ${alias})`,
     histNone: 'No replies routed in this session yet.',
     paused: 'Router paused — your own model answers every turn',
     details: 'Details',
@@ -1090,16 +1091,16 @@ async function showSpend($: EngineInterface, session: Session, now: number, turn
   })
 }
 
-// One replay call's spend, on the day and the total of the session the replay started in, never on a turn. Each call is
-// priced on its own: Haiku's long-prompt rate is per request, so a sum priced as one request would cost about 5x too much.
-// Unlike serial, this write does not check that the session is still here: the call was paid for, so it stays on the
-// originating session's ledger after a clear or a switch. It still queues on `writes`, so it never races a live write
-// in this process. Nothing else (routing, counts, the band) is touched here.
-function recordReplay($: EngineInterface, session: Session, u: Usage): Promise<void> {
+// One replay call's (or availability probe's) spend, on the day and the total of the session it started in, never on a
+// turn. Each call is priced on its own: Haiku's long-prompt rate is per request, so a sum priced as one request would cost
+// about 5x too much. Unlike serial, this write does not check that the session is still here: the call was paid for, so
+// it stays on the originating session's ledger after a clear or a switch. It still queues on `writes`, so it never races
+// a live write in this process. Nothing else (routing, counts, the band) is touched here.
+function recordReplay($: EngineInterface, session: Session, u: Usage, modelId = 'claude-haiku-5-5'): Promise<void> {
   writes = writes.then(() => bookkeeping($, async () => {
     const key = `meter:${dayKey(await $.clock.now())}:${session.id}`
     const previous = ((await $.store.get(key)) as Tally | undefined) ?? EMPTY
-    await $.store.set(key, add(previous, 'claude-haiku-5-5', u, false, true, 'classifier'))
+    await $.store.set(key, add(previous, modelId, u, false, true, 'classifier'))
   }, undefined, retryFor(session, 'replay meter'))).catch(err => storeFailure($, err))
   return writes
 }
@@ -1235,9 +1236,11 @@ async function classifyTier($: EngineInterface, session: Session, lang: Lang, te
   }
 }
 
-// One live classifier call's time, whatever it returned; the bucket keys are fixed so day counts merge by addition.
-function countLatency($: EngineInterface, session: Session, ms: number, timedOut: boolean): Promise<void> {
-  const bucket = latencyBucket(ms, timedOut)
+// One live classifier call's time, whatever it returned, except an abort well before the cap (the person's Escape, which
+// lands in no bucket and is not counted); the bucket keys are fixed so day counts merge by addition.
+function countLatency($: EngineInterface, session: Session, ms: number, aborted: boolean): Promise<void> {
+  const bucket = latencyBucket(ms, aborted)
+  if (bucket === null) return Promise.resolve()
   return count($, session, c => {
     const hist = c.classifierLatency ?? {}
     return {
@@ -1754,7 +1757,8 @@ async function modelProbe($: EngineInterface, session: Session, id: string): Pro
   try {
     const r = await $.model.complete({ model: id, prompt: 'Reply with OK.', maxTokens: 5, timeoutMs: 15000 })
     if (await stillHere($, session) !== 'same') return 'unknown'
-    await record($, session, id, r.usage, false, true, 'classifier')
+    // On the day and the total only: the probe is nobody's turn, and it may land while one is running.
+    await recordReplay($, session, r.usage, id)
     found = r.isAnswered ? 'ok' : r.reason === 'api-error' && r.error === 'model_not_found' ? 'missing' : 'unknown'
   } catch {
     found = 'unknown'
@@ -1764,14 +1768,15 @@ async function modelProbe($: EngineInterface, session: Session, id: string): Pro
   return found
 }
 
-// Run in the background at session start, never awaited by a turn: until it settles the configured ids are used. One
-// probe per distinct full id; a tier whose id is missing moves to its family alias in `ids` (in place, so every
-// consumer follows), with one toast and one count.
+// Run in the background at session start (only while the router is on), never awaited by a turn: until it settles the
+// configured ids are used. One probe per distinct full id; a tier whose id is missing moves to its family alias in `ids`
+// (in place, so every consumer follows), with one toast and one count. A Fable id is not probed: the plugin never runs
+// Fable by its own hand, so the call would only spend.
 async function probeTiers($: EngineInterface, session: Session, lang: Lang, configured: Record<ModelKey, string>, ids: Record<ModelKey, string>) {
   const probes = new Map<string, Promise<Probe>>()
   await Promise.all(MODELS.map(async tier => {
     const id = configured[tier]
-    if (isAlias(id)) return
+    if (isAlias(id) || isFable(id)) return
     if (!probes.has(id)) probes.set(id, bookkeeping($, () => modelProbe($, session, id), 'unknown' as Probe, retryFor(session, `probe ${id}`)))
     if (await probes.get(id) !== 'missing' || !here(session) || ids[tier] !== id) return
     const alias = withSuffixOf(tier, id)
@@ -1902,8 +1907,14 @@ async function contextText($: EngineInterface, session: Session, lang: Lang, col
   }
 }
 
-async function statusScreen($: EngineInterface, session: Session, lang: Lang, settings: Record<string, unknown>, compaction: string): Promise<string> {
+// A tier whose configured id fell back to its alias (probeTiers) shows both: the person set one id and runs on another.
+function modelSetting(lang: Lang, configured: string, running: string): string {
+  return running === configured ? configured : `${configured} ${STR[lang].modelNotFound(running)}`
+}
+
+async function statusScreen($: EngineInterface, session: Session, lang: Lang, settings: Record<string, unknown>, compaction: string, configured: Record<ModelKey, string>, ids: Record<ModelKey, string>): Promise<string> {
   const str = STR[lang]
+  const models = { haikuModel: modelSetting(lang, configured.haiku, ids.haiku), sonnetModel: modelSetting(lang, configured.sonnet, ids.sonnet), opusModel: modelSetting(lang, configured.opus, ids.opus) }
   await ensurePrefs($, session)
   try {
     const usage = await $.session.usage()
@@ -1918,7 +1929,7 @@ async function statusScreen($: EngineInterface, session: Session, lang: Lang, se
   publishStatus($)
   return [compaction, '', str.settings,
     `enabled: ${await read($, enabled)}`,
-    ...Object.entries(settings).map(([key, value]) => `${key}: ${value === '' ? '""' : String(value)}`),
+    ...Object.entries({ ...settings, ...models }).map(([key, value]) => `${key}: ${value === '' ? '""' : String(value)}`),
     `${str.pending}: ${pendingText(lang, uiNow) || str.none}${guardPending ? ` (${new Date(guardPending.at).toISOString()})` : ''}`,
     `${str.deadline}: ${lastMain ? new Date(lastMain.at + CACHE_TTL_MS).toISOString() : str.unavailable}`,
     `${str.safeDeadline}: ${lastMain ? new Date(lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS).toISOString() : str.unavailable}`,
@@ -2275,12 +2286,13 @@ export const register: Register = (on, options) => {
     })
     const session = await useSession($)
     if (!here(session)) return next(e)
-    // Not awaited: a probe can take up to 15 s and must hold up neither the start nor a turn.
-    void probeTiers($, session, lang, configured, ids).catch(err => storeFailure($, err))
     const stored = await bookkeeping($, () => $.store.get('enabled'), compactEnabled, retryFor(session, 'enabled read'))
     if (await stillHere($, session) !== 'same') return next(e)
     compactEnabled = stored !== false
     await update($, enabled, () => compactEnabled)
+    // Not awaited: a probe can take up to 15 s and must hold up neither the start nor a turn. Not while the router is off:
+    // then no tier is routed to, so there is nothing to check and nothing to spend on.
+    if (compactEnabled) void probeTiers($, session, lang, configured, ids).catch(err => storeFailure($, err))
     const now = await $.clock.now()
     await bookkeeping($, () => prune($, now), undefined)
     if (await stillHere($, session) !== 'same') return next(e)
@@ -2353,7 +2365,7 @@ export const register: Register = (on, options) => {
       const isOn = await read($, enabled)
       if (await stillHere($, session) !== 'same') return { text: str.checkpointCancelled }
       const compaction = `Compaction in this session: ${isOn ? 'router on' : 'router off, so no automatic compaction runs'} · ${compactionText}`
-      return { text: arg === 'status' ? await statusScreen($, session, lang, settings, compaction) : await statsText($, session, lang, compaction) }
+      return { text: arg === 'status' ? await statusScreen($, session, lang, settings, compaction, configured, ids) : await statsText($, session, lang, compaction) }
     }
     if (arg === 'context') return { text: await contextText($, session, lang, e.presentation?.columns ?? 80) }
     if (arg === 'history') return { text: await historyCommand($, session, lang) }
@@ -2574,9 +2586,14 @@ export const register: Register = (on, options) => {
       model = withSuffixOf(ids[r.model], e.model)
       effort = r.effort
     }
-    // A tiered subagent's own model and effort; an inheriting one keeps what the engine resolved.
+    // A tiered subagent's own model and effort; an inheriting one keeps what the engine resolved. An agent pinned to a
+    // configured id before the probe moved that tier to its alias (startOf copied the id) follows the tier: the id is
+    // missing, so every step on it would fail. A caller-pinned model (sub.model undefined) is untouched.
     if (sub) {
-      if (sub.model !== undefined) model = withSuffixOf(sub.model, e.model)
+      if (sub.model !== undefined) {
+        const fellBack = sub.model === configured[sub.tier] && ids[sub.tier] !== configured[sub.tier]
+        model = withSuffixOf(fellBack ? ids[sub.tier] : sub.model, e.model)
+      }
       if (sub.effort !== undefined) effort = sub.effort
       // Hard ceiling for every tracked subagent, inheriting ones too: xhigh and max are main-thread only.
       effort = capSent(effort)

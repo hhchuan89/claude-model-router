@@ -1,19 +1,25 @@
 // How long live classifier calls take, kept as a small histogram so day counts from many sessions merge by addition.
 // The edges follow the 8-second cap (CLASSIFY_MS): a call that runs out is its own bucket, not the slowest one.
-export const LATENCY_BUCKETS = ['<0.5s', '0.5-1s', '1-2s', '2-4s', '4-8s', 'timeout'] as const
+export const CLASSIFY_MS = 8000
+export const LATENCY_BUCKETS = ['<0.5s', '0.5-1s', '1-2s', '2-4s', '4s+', 'timeout'] as const
 export type LatencyBucket = (typeof LATENCY_BUCKETS)[number]
 
-// The upper edge of each timed bucket, in seconds, for the "95% within" figure.
-const UPPER: Record<Exclude<LatencyBucket, 'timeout'>, string> = { '<0.5s': '0.5s', '0.5-1s': '1s', '1-2s': '2s', '2-4s': '4s', '4-8s': '8s' }
+// The upper edge of each timed bucket, in seconds, for the "95% within" figure. The open bucket's edge is the cap: a
+// call still running at 8 s is cut off, so an answered call landing past it is rare and close to the cap.
+const UPPER: Record<Exclude<LatencyBucket, 'timeout'>, string> = { '<0.5s': '0.5s', '0.5-1s': '1s', '1-2s': '2s', '2-4s': '4s', '4s+': '8s' }
 
-// timedOut: the call ended as aborted. A call that answered just past 8 s still lands in 4-8s: it was not cut off.
-export function latencyBucket(ms: number, timedOut: boolean): LatencyBucket {
-  if (timedOut) return 'timeout'
+// A call aborted well before the cap was cut off by the person (Escape), not by the clock, so it says nothing about
+// the classifier's speed and lands in no bucket (null).
+const ABORT_SLACK_MS = 50
+
+// aborted: the call ended as aborted. A call that answered just past 8 s still lands in 4s+: it was not cut off.
+export function latencyBucket(ms: number, aborted: boolean): LatencyBucket | null {
+  if (aborted) return ms >= CLASSIFY_MS - ABORT_SLACK_MS ? 'timeout' : null
   if (ms < 500) return '<0.5s'
   if (ms < 1000) return '0.5-1s'
   if (ms < 2000) return '1-2s'
   if (ms < 4000) return '2-4s'
-  return '4-8s'
+  return '4s+'
 }
 
 // The first bucket, in order, where the running share of calls reaches `share`.
