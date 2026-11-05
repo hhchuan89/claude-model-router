@@ -20,6 +20,7 @@ Return ONLY one JSON object: {"tier":"lookup"|"execute"|"decide","sure":true|fal
 A tier is how much judgement the work needs, not how dangerous it is.
 
 - **lookup (Haiku):** retrieval or mechanical work with nothing to judge. Find, grep or list files; read and report a value or status; run a command the user named and report the output; rename; fix a typo; format; translate or re-explain a short text; look up a fact or a doc; acknowledge; answer a quick factual follow-up.
+  Not for: anything that needs a judgement call, explaining why something fails, or a change whose content still has to be worked out.
 - **execute (Sonnet):** work whose "what" is already settled in the message or the visible context, by a plan, a spec or an exact instruction. Examples:
   - implement a clearly specified change, or fix a bug whose cause is known;
   - write tests, or refactor to a stated target;
@@ -28,6 +29,7 @@ A tier is how much judgement the work needs, not how dangerous it is.
   - explain how existing code works;
   - carry out a plan that was already agreed, including an instructed push, merge, PR, deploy, or a message whose content is settled;
   - cherry-pick or port a change when the code is the same on both branches.
+  Not for: choosing between approaches, finding a cause nobody has identified yet, judging whether something is right, or a request whose "what" is still open.
 - **decide (Opus):** judgement is needed before acting. Examples:
   - design or architecture, choosing between approaches, trade-offs;
   - planning multi-step or multi-file work;
@@ -37,8 +39,10 @@ A tier is how much judgement the work needs, not how dangerous it is.
   - an ambiguous request that needs interpreting;
   - working out how a change to business rules, production data or stored procedures should behave;
   - porting a change to a branch whose version of the code differs.
+  Not for: carrying out a plan, spec or instruction that is already settled, or retrieval and mechanical work, however long or important it looks.
 
 Rules:
+- Judge how much judgement the work needs, not how long the reply will be or how important the topic sounds.
 - A reply that only continues work already in progress ("yes", "go on", "继续") keeps the previous tier.
 - Approving a plan that was just made ("照这个做", "开始吧", "go ahead with that") is execute, because the plan settles what to do.
 - A short message that asks for something new ("explain it in Chinese", "how long will it take?") is judged on its own.
@@ -49,6 +53,53 @@ Rules:
 - sure: set false when the message is ambiguous, could reasonably be read at two tiers, or depends on context you cannot
   see; otherwise true. An unsure verdict is never used to move work to a cheaper model.
 - reason: ${lang === 'zh' ? 'Simplified Chinese, at most 15 字' : 'English, at most 10 words'}, says what kind of work it is.`
+}
+
+// A local slash command (/model-router stats, /clear and the like) is stored as a user row starting with one of these
+// tags. It is the person talking to Claude Code, not to Claude, so it says nothing about the work.
+const LOCAL_COMMAND = /^\s*<(?:command-name|local-command-caveat|local-command-stdout|local-command-stderr)>/
+// A task notification (a background agent finished) is stored as a user row too; it is the engine's text, not the person's.
+const SYSTEM_NOTIFICATION = /^\s*\[SYSTEM NOTIFICATION/
+// Text the engine injects beside a person's message, as a block of its own or in front of the real text (measured on the
+// owner's transcripts). It says nothing about the work, and a copy of the current message does not compare equal with it.
+const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
+
+function stripReminders(text: string): string {
+  return text.replace(SYSTEM_REMINDER, '')
+}
+
+// Which messages the classifier sees as context. session.messages() has one row per message, and every intermediate
+// assistant narration in a turn ("Next I will read X…") is its own row, so "the last two" after a multi-step turn was
+// usually two narration lines and never the person's previous request. Instead: the person's last request and the last
+// assistant row after it (that turn's final answer). System-reminder blocks are stripped from every row first (a row that
+// changed is sent trimmed), then empty rows, local-command rows and task notifications are dropped, and a last user row
+// equal to the current message too, since prompt.submit may or may not already list it. With no user row, the last two
+// rows; with no answer after the request, the request alone.
+export function pickContext<T extends { role: string; text: string }>(messages: readonly T[], current?: string): T[] {
+  const rows = messages
+    .map(m => {
+      const stripped = stripReminders(m.text)
+      return stripped === m.text ? m : { ...m, text: stripped.trim() }
+    })
+    .filter(m => m.text.trim() !== '' && !LOCAL_COMMAND.test(m.text) && !SYSTEM_NOTIFICATION.test(m.text))
+  const last = rows.at(-1)
+  if (current !== undefined && last?.role === 'user' && last.text.trim() === stripReminders(current).trim()) rows.pop()
+  let user = -1
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i]!.role === 'user') {
+      user = i
+      break
+    }
+  }
+  if (user === -1) return rows.slice(-2)
+  let answer = -1
+  for (let i = rows.length - 1; i > user; i--) {
+    if (rows[i]!.role === 'assistant') {
+      answer = i
+      break
+    }
+  }
+  return answer === -1 ? [rows[user]!] : [rows[user]!, rows[answer]!]
 }
 
 // The user prompt of one classification: the same text the router and the replay command both send.
