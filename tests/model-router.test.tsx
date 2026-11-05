@@ -9,7 +9,7 @@ import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMP
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
-import { latencyBucket, latencySummary } from '../hooks/latency'
+import { CLASSIFY_MS, latencyBucket, latencySummary } from '../hooks/latency'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
 import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isAlias, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
@@ -105,16 +105,21 @@ describe('route rules', () => {
 })
 
 describe('classifier latency', () => {
-  test('a call lands in the bucket of its time; an aborted call is a timeout whatever it took', async () => {
+  // WHY: `aborted` also covers a dispatch the person cut short with Escape; counting that as a timeout blamed the
+  // classifier for the person's own stop.
+  test('a call lands in the bucket of its time; an aborted call is a timeout only at the cap, and no bucket before it', async () => {
     expect(latencyBucket(0, false)).toBe('<0.5s')
     expect(latencyBucket(499, false)).toBe('<0.5s')
     expect(latencyBucket(500, false)).toBe('0.5-1s')
     expect(latencyBucket(1000, false)).toBe('1-2s')
     expect(latencyBucket(3999, false)).toBe('2-4s')
-    expect(latencyBucket(4000, false)).toBe('4-8s')
+    expect(latencyBucket(4000, false)).toBe('4s+')
     // Answered just past the cap: slow, but not cut off.
-    expect(latencyBucket(8100, false)).toBe('4-8s')
-    expect(latencyBucket(300, true)).toBe('timeout')
+    expect(latencyBucket(8100, false)).toBe('4s+')
+    expect(latencyBucket(CLASSIFY_MS, true)).toBe('timeout')
+    expect(latencyBucket(CLASSIFY_MS - 50, true)).toBe('timeout')
+    expect(latencyBucket(CLASSIFY_MS - 51, true)).toBeNull()
+    expect(latencyBucket(300, true)).toBeNull()
   })
 
   test('the summary gives the median bucket, the 95% bound and the mean', async () => {
@@ -123,7 +128,9 @@ describe('classifier latency', () => {
     const hist = { '<0.5s': 30, '0.5-1s': 50, '1-2s': 16, '2-4s': 4 }
     expect(latencySummary(hist, 80_000, 100)).toBe('Classifier time: median 0.5-1s, 95% within 2s, mean 0.8s (n=100)')
     // Exactly 95% at the end of a bucket counts as within it.
-    expect(latencySummary({ '<0.5s': 95, '4-8s': 5 }, 50_000, 100)).toBe('Classifier time: median <0.5s, 95% within 0.5s, mean 0.5s (n=100)')
+    expect(latencySummary({ '<0.5s': 95, '4s+': 5 }, 50_000, 100)).toBe('Classifier time: median <0.5s, 95% within 0.5s, mean 0.5s (n=100)')
+    // The open bucket's bound is the cap: nothing answers much past it.
+    expect(latencySummary({ '<0.5s': 90, '4s+': 10 }, 50_000, 100)).toBe('Classifier time: median <0.5s, 95% within 8s, mean 0.5s (n=100)')
     expect(latencySummary({ '<0.5s': 2, timeout: 1 }, 9000, 3)).toBe('Classifier time: median <0.5s, 95th percentile: timeout, mean 3.0s (n=3)')
   })
 })
@@ -864,11 +871,14 @@ test('#haiku still wins when the classifier would have been unsure, and the clas
   expect(seen.submits[0]!.context?.[0]).toContain('assigned to haiku at medium')
 })
 
+// WHY: the router sends the family alias; the engine answers with the full id of the model it resolved, which is the same
+// family, not a mismatch. Only a different family counts.
 test('a model the router asked for that is not the one answering is counted as a mismatch', async ($, on) => {
   const seen = world($, on, null)
   const id = await spawnAgent($, { subagentType: 'Explore' })
   seen.usage.push(U(10, 1, 0, 0, 'claude-haiku-5-5'))
   await step($, 'sub', OPUS, id)
+  expect(seen.steps[0]!.model).toBe('haiku')
   let r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
   expect(r.text).toContain('the one that answered: 0')
   seen.usage.push(U(10, 1, 0, 0, 'claude-opus-5-5'))
@@ -1148,6 +1158,23 @@ describe('classifier failures', () => {
     expect(counts.classifierLatency).toEqual({ '<0.5s': 1, '0.5-1s': 1, timeout: 1 })
     expect(counts.classifierMsTotal).toBe(9000)
     expect(counts.classifierTimed).toBe(3)
+  })
+
+  // WHY: the engine reports a dispatch the person stopped with Escape as aborted too; it says nothing about the
+  // classifier's speed, so it lands in no bucket and moves neither the mean nor n.
+  test('a call aborted well before the cap is not timed; one aborted at the cap is a timeout', async ($, on) => {
+    const times = [300, 700, CLASSIFY_MS]
+    const seen = world($, on, async () => {
+      await seen.clock.advance(times.shift()!)
+      return null
+    })
+    for (const text of ['one', 'two', 'three']) await $.prompt.submit({ text } as never)
+    const r = (await $.command.run({ command: 'model-router', args: 'stats' } as never)) as { text: string }
+    expect(r.text).toContain('Classifier time: median timeout, 95th percentile: timeout, mean 8.0s (n=1). ')
+    const counts = Object.entries(seen.store).find(([k]) => k.startsWith('counts:'))![1] as Record<string, unknown>
+    expect(counts.classifierLatency).toEqual({ timeout: 1 })
+    expect(counts.classifierMsTotal).toBe(CLASSIFY_MS)
+    expect(counts.classifierTimed).toBe(1)
   })
 
   test('stats say no calls yet before any classifier call', async ($, on) => {
@@ -9235,7 +9262,7 @@ describe('classifier prompt: opinion questions (1.2.1)', () => {
   })
 })
 
-describe('model ids that survive model releases (1.3.0)', () => {
+describe('model ids that survive model releases (1.2.2)', () => {
   const ZERO = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
   const NOT_FOUND = { isAnswered: false, reason: 'api-error', status: 404, error: 'model_not_found', usage: ZERO }
   const OVERLOADED = { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: ZERO }
@@ -9336,6 +9363,78 @@ describe('model ids that survive model releases (1.3.0)', () => {
     await $.prompt.submit({ text: 'and which database' } as never)
     await step($, 't2')
     expect(seen.steps[1]).toMatchObject({ model: 'opus[1m]' })
+  })
+
+  // WHY: with the router off no tier is routed to, so the probe only spent; and it ran before the on/off state was read.
+  test('no probe is made while the router is off', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { store: { enabled: false }, models: { 'claude-opus-9-9': () => NOT_FOUND } })
+    const toasts = await start($, on)
+    await settle(seen, () => false)
+    expect(seen.asked).toEqual([])
+    expect(toasts).toEqual([])
+    expect(seen.store['probe:claude-opus-9-9']).toBeUndefined()
+  })
+
+  // WHY: the plugin never runs Fable by its own hand, so asking a Fable id whether it exists would only spend.
+  test('a Fable id is not probed', { options: { opusModel: 'claude-fable-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide)
+    const toasts = await start($, on)
+    await settle(seen, () => false)
+    expect(seen.asked).toEqual([])
+    expect(toasts).toEqual([])
+  })
+
+  // WHY: startOf copies the tier's id into the agent at spawn; an agent spawned before the probe answered kept the
+  // missing id, and every later step on it would have failed.
+  test('a subagent spawned before the probe answers follows its tier to the alias; a caller pin is untouched', { options: { sonnetModel: 'claude-sonnet-9-9' } }, async ($, on) => {
+    let answer: (v: unknown) => void = () => {}
+    const execute = '{"tier":"execute","sure":true,"reason":"x"}'
+    const seen = world($, on, [execute, execute], { models: { 'claude-sonnet-9-9': () => new Promise(resolve => { answer = resolve }) } })
+    const toasts = await start($, on)
+    await settle(seen, () => seen.asked.includes('claude-sonnet-9-9'))
+    const routed = await spawnAgent($, { prompt: 'implement the parser change' })
+    const pinned = await spawnAgent($, { prompt: 'implement the parser change', model: 'claude-sonnet-9-9' })
+    expect(seen.agents).toEqual(['sonnet', 'claude-sonnet-9-9'])
+    await step($, 'sub', 'claude-sonnet-5-5[1m]', routed)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-9-9[1m]', agentId: routed })
+    answer(NOT_FOUND)
+    await settle(seen, () => toasts.length > 0)
+    await step($, 'sub', 'claude-sonnet-5-5[1m]', routed)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'sonnet[1m]', agentId: routed, effort: 'medium' })
+    await step($, 'sub', 'claude-sonnet-9-9[1m]', pinned)
+    expect(seen.steps.at(-1)).toMatchObject({ model: 'claude-sonnet-9-9[1m]', agentId: pinned })
+  })
+
+  // WHY: status printed the options as loaded, so after a fallback it named an id no request was going to.
+  test('status shows the configured id with the alias it runs on after a fallback', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    const seen = world($, on, decide, { models: { 'claude-opus-9-9': () => NOT_FOUND } })
+    const toasts = await start($, on)
+    await settle(seen, () => toasts.length > 0)
+    const status = ((await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }).text
+    expect(status).toContain('opusModel: claude-opus-9-9 (not found; running on opus)\n')
+    expect(status).toContain('sonnetModel: sonnet\n')
+  })
+
+  // WHY: the probe is nobody's turn; booked through the turn meter it inflated the band and history of whatever turn
+  // it landed in.
+  test('a probe resolving during a turn goes on the day, never on the turn', { options: { opusModel: 'claude-opus-9-9' } }, async ($, on) => {
+    let answer: (v: unknown) => void = () => {}
+    const seen = world($, on, [decide, decide], { models: { 'claude-opus-9-9': () => new Promise(resolve => { answer = resolve }) } })
+    const box: { turn?: Tally } = {}
+    on('state.set', { plugin: 'model-router', key: 'meter' }, async (_$: unknown, e: any, next: any) => {
+      box.turn = e.value.turn
+      return next(e)
+    })
+    await start($, on)
+    await settle(seen, () => seen.asked.includes('claude-opus-9-9'))
+    await $.prompt.submit({ text: 'which queue should we use' } as never)
+    const turnBefore = box.turn!.tokens
+    const dayKey = Object.keys(seen.store).find(k => /^meter:\d{8}:sess-1$/.test(k))!
+    const dayBefore = (seen.store[dayKey] as Tally).tokens
+    answer({ isAnswered: true, text: 'OK', usage: { input_tokens: 7, output_tokens: 3, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } })
+    await settle(seen, () => (seen.store[dayKey] as Tally).tokens !== dayBefore)
+    expect((seen.store[dayKey] as Tally).tokens - dayBefore).toBe(10)
+    expect(box.turn!.tokens).toBe(turnBefore)
   })
 })
 
