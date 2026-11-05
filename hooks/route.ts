@@ -150,6 +150,12 @@ export function isFable(id: string): boolean {
   return /fable/i.test(id)
 }
 
+// A bare family alias ("opus", "sonnet[1m]") is resolved by the engine to the newest model of that family, so it never
+// goes missing when a model is retired and needs no availability probe. Anything else is a full id that pins one model.
+export function isAlias(id: string): boolean {
+  return /^(?:haiku|sonnet|opus)$/i.test(id.replace(/\[[^\]]+\]$/, ''))
+}
+
 // Keeps a context-window suffix such as "[1m]" so a long session still fits after the switch.
 export function withSuffixOf(id: string, current: string): string {
   const suffix = /\[[^\]]+\]$/.exec(current)?.[0] ?? ''

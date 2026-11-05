@@ -32,20 +32,20 @@
     "haikuModel": {
       "type": "string",
       "title": "Lookup model",
-      "description": "Model id for lookups",
-      "default": "claude-haiku-5-5"
+      "description": "Model for lookups. haiku (the default) is an alias that follows the newest Haiku model; a full id such as claude-haiku-5-5 pins one model, and if your account reports it as not found the tier runs on haiku instead (checked daily)",
+      "default": "haiku"
     },
     "sonnetModel": {
       "type": "string",
       "title": "Execution model",
-      "description": "Model id for execution",
-      "default": "claude-sonnet-5-5"
+      "description": "Model for execution. sonnet (the default) is an alias that follows the newest Sonnet model; a full id such as claude-sonnet-5-5 pins one model, and if your account reports it as not found the tier runs on sonnet instead (checked daily)",
+      "default": "sonnet"
     },
     "opusModel": {
       "type": "string",
       "title": "Decision model",
-      "description": "Model id for decisions",
-      "default": "claude-opus-5-5"
+      "description": "Model for decisions. opus (the default) is an alias that follows the newest Opus model; a full id such as claude-opus-5-5 pins one model, and if your account reports it as not found the tier runs on opus instead (checked daily)",
+      "default": "opus"
     },
     "reviewModel": {
       "type": "string",
