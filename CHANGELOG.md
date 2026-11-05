@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - unreleased
+
+Held for a decision: measured with `/model-router replay` on 300 real prompts, neither change beat 1.2.1 (the "not for"
+lines: no measurable difference, p 0.45-0.75; the context rule: 72.9% against 77.8%, p 0.12, with the caveat that the
+judges labelled each prompt while looking at the old context). Do not release without a fair retest. The latency meter
+and the model aliases that were in the first 1.3.0 draft shipped as 1.2.2.
+
+### Changed
+
+- The classifier's context is now your previous request and the final answer to it, instead of "the last two non-empty
+  messages". Measured with a probe plugin: `session.messages()` returns one row per message, every intermediate
+  assistant narration in a turn ("Next I will read X...") is its own row, and local slash commands are user rows starting
+  with `<command-name>` or `<local-command-...>`. So after a multi-step turn the classifier usually saw two narration
+  lines and never the request they belonged to. System-reminder blocks, empty rows, local-command rows, task
+  notifications and a trailing copy of the current message are skipped, then the last user message and the last
+  assistant message after it are sent. Replay's structured `context` goes through the same code, so live and replay
+  prompts are still the same byte for byte.
+- Each tier in the classifier prompt now ends with what it is not for (lookup: no judgement calls, explaining why
+  something fails or a change still to be worked out; execute: no choosing between approaches, unknown causes, judging
+  whether something is right or an open "what"; decide: no settled plan, spec or instruction and no retrieval or
+  mechanical work, however long or important it looks), and one new rule says to judge how much judgement the work
+  needs, not how long the reply will be or how important the topic sounds. The legacy prompt is unchanged.
+
 ## [1.2.2] - 2026-11-05
 
 ### Added

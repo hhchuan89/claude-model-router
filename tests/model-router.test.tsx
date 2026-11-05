@@ -11,7 +11,7 @@ import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
 import { CLASSIFY_MS, latencyBucket, latencySummary } from '../hooks/latency'
 import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekdayOf } from '../hooks/history'
-import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isAlias, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
+import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isAlias, isFable, parseDecision, pickContext, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
 import { isRisky, riskFloor } from '../hooks/risk'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
@@ -101,6 +101,80 @@ describe('route rules', () => {
     expect(text).toContain('haiku at medium effort')
     expect(text).toContain('FIRST, before any other tool')
     expect(assignmentContext(routeFor('decide', ''))).toContain('Decide the effort this task needs')
+  })
+})
+
+describe('classifier context', () => {
+  const u = (text: string) => ({ role: 'user', text })
+  const a = (text: string) => ({ role: 'assistant', text })
+
+  // WHY: session.messages() has one row per intermediate narration, so the last two rows after a multi-step turn were
+  // narration and the previous request was never seen.
+  test('the previous request and the final answer after it, not the narration between', async () => {
+    const rows = [u('old request'), a('old answer'), u('rename the helper'), a('Next I will read utils.ts'), a('Now the tests'), a('Renamed; tests pass.')]
+    expect(pickContext(rows)).toEqual([u('rename the helper'), a('Renamed; tests pass.')])
+  })
+
+  test('local command rows and empty rows are skipped, leading whitespace included', async () => {
+    const rows = [
+      u('fix the parser'), a('Fixed.'),
+      u('<command-name>/model-router</command-name>\n<command-args>stats</command-args>'),
+      u('  <local-command-caveat>Caveat: the messages below were generated locally</local-command-caveat>'),
+      u('<local-command-stdout>Turns routed: 3</local-command-stdout>'),
+      u('<local-command-stderr>oops</local-command-stderr>'),
+      a('   '), u(''),
+    ]
+    expect(pickContext(rows)).toEqual([u('fix the parser'), a('Fixed.')])
+    // A tag later in the text is the person quoting one, not a command row.
+    expect(pickContext([u('what does <command-name> mean?')])).toEqual([u('what does <command-name> mean?')])
+  })
+
+  test('a trailing copy of the current message is dropped, only when it is the last row and a user row', async () => {
+    const rows = [u('build it'), a('Built.'), u('  now the tests ')]
+    expect(pickContext(rows, 'now the tests')).toEqual([u('build it'), a('Built.')])
+    // Without current (or with another text) the trailing row is the previous request, with no answer yet.
+    expect(pickContext(rows)).toEqual([u('  now the tests ')])
+    expect(pickContext(rows, 'something else')).toEqual([u('  now the tests ')])
+    expect(pickContext([u('now the tests'), a('Done.')], 'now the tests')).toEqual([u('now the tests'), a('Done.')])
+  })
+
+  test('with no user row, the last two rows; with no answer, the request alone; nothing left, nothing', async () => {
+    expect(pickContext([a('one'), a('two'), a('three')])).toEqual([a('two'), a('three')])
+    expect(pickContext([a('earlier'), u('a question')])).toEqual([u('a question')])
+    expect(pickContext([])).toEqual([])
+    expect(pickContext([u('<command-name>/clear</command-name>')])).toEqual([])
+  })
+
+  // WHY: measured on the owner's transcripts, a standalone system-reminder row or a task notification is stored as a
+  // user row, and was picked as "the person's last request" (1 of 300).
+  test('a user row that is only a system-reminder block or a task notification is not the previous request', async () => {
+    const rows = [
+      u('fix the parser'), a('Fixed.'),
+      u('<system-reminder>\nThe file was modified by a linter.\n</system-reminder>'),
+      u('  <system-reminder>one</system-reminder>\n\n<system-reminder>two</system-reminder>  '),
+      u('[SYSTEM NOTIFICATION: background agent finished]\nAgent task completed.'),
+      u('  [SYSTEM NOTIFICATION] task done'),
+    ]
+    expect(pickContext(rows)).toEqual([u('fix the parser'), a('Fixed.')])
+  })
+
+  // WHY: a person's prompt can arrive with a leading reminder block, so the trailing copy of the current message was not
+  // recognised and the message was sent as its own context.
+  test('a trailing copy of the current message is still dropped when a system-reminder block leads it', async () => {
+    const current = '<system-reminder>\nuse the Edit tool\n</system-reminder>\nnow the tests'
+    const rows = [u('build it'), a('Built.'), u(current)]
+    expect(pickContext(rows, current)).toEqual([u('build it'), a('Built.')])
+    expect(pickContext(rows, 'now the tests')).toEqual([u('build it'), a('Built.')])
+    expect(pickContext([u('build it'), a('Built.'), u('now the tests')], current)).toEqual([u('build it'), a('Built.')])
+  })
+
+  test('a request with a leading reminder block is kept with the real text only, and an untouched row is sent as it is', async () => {
+    const rows = [u('<system-reminder>\nuse the Edit tool\n</system-reminder>\nrename the helper'), a('Done.')]
+    expect(pickContext(rows)).toEqual([u('rename the helper'), a('Done.')])
+    // Stripped in the middle too, and the row's other fields survive.
+    const row = { role: 'user', text: 'rename <system-reminder>x</system-reminder> the helper', id: 7 }
+    expect(pickContext([row])).toEqual([{ role: 'user', text: 'rename  the helper', id: 7 }])
+    expect(pickContext([u('  rename the helper ')])).toEqual([u('  rename the helper ')])
   })
 })
 
@@ -386,6 +460,24 @@ test('the classifier context is masked too: earlier messages can hold secrets th
   await $.prompt.submit({ text: 'and now list the files' } as never)
   expect(seen.prompts[0]).toContain('[REDACTED')
   expect(seen.prompts[0]).not.toContain('zzzzzzzzzz')
+})
+
+test('the classifier context is the previous request and its final answer, not narration or local commands', async ($, on) => {
+  const seen = world($, on, '{"tier":"execute","reason":"x"}', {
+    messages: [
+      { role: 'user', text: 'rename the helper in utils' },
+      { role: 'assistant', text: 'Next I will read utils.ts to find the helper.' },
+      { role: 'assistant', text: 'Renamed it; the tests pass.' },
+      { role: 'user', text: '<command-name>/model-router</command-name>\n<command-args>stats</command-args>' },
+      { role: 'user', text: '<local-command-stdout>Turns routed: 3</local-command-stdout>' },
+      { role: 'user', text: 'now add tests for it' },
+    ],
+  })
+  await $.prompt.submit({ text: 'now add tests for it' } as never)
+  const context = /<context>\n([\s\S]*)\n<\/context>/.exec(seen.prompts[0]!)![1]
+  expect(context).toBe('[user] rename the helper in utils\n\n[assistant] Renamed it; the tests pass.')
+  expect(seen.prompts[0]).not.toContain('Next I will read')
+  expect(seen.prompts[0]).not.toContain('<command-name>')
 })
 
 test('a configured reviewer that does not exist leaves no review notice', { options: { reviewModel: 'claude-fable-5-5' } }, async ($, on) => {
@@ -9261,6 +9353,37 @@ describe('classifier prompt: opinion questions (1.2.1)', () => {
     }
   })
 })
+
+describe('classifier prompt: what each tier is not for (1.3.0)', () => {
+  // WHY: the definitions only said what each tier is for, so a long or weighty-sounding request read as decide and a
+  // short "why does this fail?" as lookup. Pending replay validation; the legacy prompt is the baseline and stays as it was.
+  test('each tier ends with what it is not for, one rule says length and importance do not count, and the legacy prompt has neither', async () => {
+    const notFor = [
+      '- **lookup (Haiku):** retrieval or mechanical work with nothing to judge.',
+      '  Not for: anything that needs a judgement call, explaining why something fails, or a change whose content still has to be worked out.',
+      '- **execute (Sonnet):**',
+      '  Not for: choosing between approaches, finding a cause nobody has identified yet, judging whether something is right, or a request whose "what" is still open.',
+      '- **decide (Opus):**',
+      '  Not for: carrying out a plan, spec or instruction that is already settled, or retrieval and mechanical work, however long or important it looks.',
+      'Rules:',
+    ]
+    const rule = '- Judge how much judgement the work needs, not how long the reply will be or how important the topic sounds.'
+    for (const lang of ['en', 'zh'] as const) {
+      const p = classifierSystem(lang)
+      // In this order: each "Not for" line comes after its own tier's definition and before the next tier.
+      let at = -1
+      for (const line of notFor) {
+        const i = p.indexOf(line, at + 1)
+        expect([line, i > at]).toEqual([line, true])
+        at = i
+      }
+      expect(p.indexOf(rule)).toBeGreaterThan(p.indexOf('Rules:'))
+      expect(legacyClassifierSystem(lang)).not.toContain('Not for:')
+      expect(legacyClassifierSystem(lang)).not.toContain('how long the reply will be')
+    }
+  })
+})
+
 
 describe('model ids that survive model releases (1.2.2)', () => {
   const ZERO = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
