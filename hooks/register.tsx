@@ -3,7 +3,7 @@ import type { ElementConstructor, EngineInterface, Register, SessionRateLimit, S
 
 import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier, TurnHow, TurnRecord } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, RANK, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, RANK, ratesOf, saved, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
@@ -53,6 +53,7 @@ import {
   startOf,
   stepUp,
 } from './subagent'
+import { isUnseenFable, nothingSeen, seenLine } from './seen'
 
 const FETCH_TOOL = 'fetch_output'
 const FETCH_CALL = `mcp__model-router__${FETCH_TOOL}`
@@ -110,6 +111,8 @@ let timerEpoch = 0
 let compactEnabled = true
 let guardPending: { at: number; kind: 'idle' | 'cap'; waiting?: number } | null = null
 let lastSkipped: string | null = null
+// What the engine has delivered to this router in the session lifetime (see ./seen).
+let delivered = nothingSeen()
 let skippedEpoch = -1
 let rateLimits: SessionRateLimit[] = []
 let uiTick: Timer | null = null
@@ -346,6 +349,8 @@ const STR = {
     deadline: '缓存到期时间',
     safeDeadline: '最晚压缩时间',
     lastSkip: '上次跳过',
+    seen: '本会话路由器收到',
+    fableUnseen: '⚠ Fable 会话：本对话的请求都没有到达路由器——不路由、不改用 Opus、也不计入费用。见 /model-router status',
     unavailable: '无读数',
     categories: '本地估算分类（≈token）',
     noBreakdown: '无本地分类数据。',
@@ -493,6 +498,8 @@ const STR = {
     deadline: 'Cache expires',
     safeDeadline: 'Compact before',
     lastSkip: 'Last skipped action',
+    seen: 'Seen this session',
+    fableUnseen: '⚠ Fable session: no request of this conversation has reached the router — not routed, not moved to Opus, not counted. See /model-router status',
     unavailable: 'unavailable',
     categories: 'Local category estimates (≈tokens)',
     noBreakdown: 'No local breakdown available.',
@@ -896,6 +903,7 @@ function resetSession($: EngineInterface, cancel = true) {
   rateLimits = []
   lastSkipped = null
   skippedEpoch = -1
+  delivered = nothingSeen()
   agentStatus = undefined
   agents.clear()
   agentModels.clear()
@@ -1922,6 +1930,15 @@ async function statusScreen($: EngineInterface, session: Session, lang: Lang, se
   } catch {
     // Keep the last measurement.
   }
+  // Read fresh: a /model switch mid-session is otherwise only picked up at the next measurement.
+  let modelNow: string | undefined
+  try {
+    modelNow = await $.session.model()
+    if (await stillHere($, session) !== 'same') return str.checkpointCancelled
+    sessionModel = priceKey(modelNow)
+  } catch {
+    // Keep the last known model.
+  }
   const now = await $.clock.now()
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   uiNow = now
@@ -1933,6 +1950,8 @@ async function statusScreen($: EngineInterface, session: Session, lang: Lang, se
     `${str.deadline}: ${lastMain ? new Date(lastMain.at + CACHE_TTL_MS).toISOString() : str.unavailable}`,
     `${str.safeDeadline}: ${lastMain ? new Date(lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS).toISOString() : str.unavailable}`,
     weeklyText(lang), pacingLine(lang, now), `${str.lastSkip}: ${lastSkipped ?? str.none}`,
+    seenLine(str.seen, delivered, modelNow ?? sessionModel),
+    ...(isUnseenFable(modelNow ?? sessionModel, delivered) ? [str.fableUnseen] : []),
   ].filter(Boolean).join('\n')
 }
 
@@ -2447,6 +2466,7 @@ export const register: Register = (on, options) => {
     cancelCompact($)
     const session = await useSession($)
     if (!here(session)) return next(e)
+    delivered.prompts += 1
     const origin = e.origin as typeof e.origin | undefined
     // A prompt typed into a running turn joins that turn's route.
     if (!(await read($, enabled)) || !isPersonOrigin(origin) || e.turnId !== undefined || e.text.trim() === '') {
@@ -2501,6 +2521,7 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) cancelCompact($)
     const session = await useSession($)
     if (!here(session)) return next(e)
+    if (e.agentId === undefined) delivered.turns += 1
     if (await stillHere($, session) !== 'same') return next(e)
     // A subagent's or teammate's run is not a main turn: it neither takes the pending route nor inherits one.
     if (e.agentId !== undefined) return next(e)
@@ -2570,6 +2591,7 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     const session = await useSession($)
     if (!here(session)) return yield* next(e)
+    if (e.agentId === undefined) delivered.steps += 1
     if (!(await read($, enabled))) return yield* next(e)
     let model = e.model
     let effort = e.effort
@@ -2639,7 +2661,7 @@ export const register: Register = (on, options) => {
         // The turn started on an expired cache: its first request is the one that rewrote it.
         if (rewrote && turnSteps === 0) turnCold = true
         if (rewrote) {
-          const cost = (u.cache_creation_input_tokens * priceOf(key, promptOf(u)).write) / 1e6
+          const cost = (u.cache_creation_input_tokens * ratesOf(u.model || model, promptOf(u)).write) / 1e6
           await count($, session, c => ({
             ...c,
             cacheExpiryRewrites: (c.cacheExpiryRewrites ?? 0) + 1,
@@ -2852,6 +2874,7 @@ export const register: Register = (on, options) => {
   on('agent.spawn', async ($, e, next) => {
     const session = await useSession($)
     if (!here(session)) return next(e)
+    delivered.spawns += 1
     if (!(await read($, enabled)) || e.fork || e.workflow !== undefined) return next(e)
     if (e.resume !== undefined) {
       const ran = await next(e)
@@ -3080,6 +3103,7 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column" marginTop={1}>
         {cache !== '' && <Text color="warning" wrap="truncate-end">{cache}</Text>}
+        {isUnseenFable(sessionModel, delivered) && <Text color="warning" wrap="truncate-end">{str.fableUnseen}</Text>}
         <Box flexDirection="row" gap={1} alignItems="center">
           <Box flexGrow={1} flexShrink={1} width={0}>
             <Text dimColor wrap="truncate-end">{bandRoute(lang, r, mainRouting)}</Text>

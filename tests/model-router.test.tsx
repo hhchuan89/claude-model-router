@@ -5,7 +5,7 @@ import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 
 import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
-import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
+import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, ratesOf, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
 import type { Correction } from '../hooks/learn'
 import { paceOf, sameWindow } from '../hooks/pace'
@@ -14,6 +14,7 @@ import { barChartSvg, cellWidth, chartAlt, chartAmount, hhmm, textChart, weekday
 import { applyEscalation, assignmentContext, classifierPrompt, classifierSystem, forcedModel, isAlias, isFable, parseDecision, routeFor, settleTier, shorten, withSuffixOf } from '../hooks/route'
 import { legacyClassifierSystem, parseReplayArgs, replayOutPath, REPLAY_PAUSE_MS, resolveReplayPath } from '../hooks/replay'
 import { isRisky, riskFloor } from '../hooks/risk'
+import { isUnseenFable, nothingSeen, seenLine } from '../hooks/seen'
 import { addUsage, capSent, decideSpawn, escalateAgent, HARD_EFFORT_CAP, isCallerPin, logDir, MAIN_RAISE_CAP, SELF_EFFORT_CAP, startOf, stepUp, SUBAGENT_SELF_CAP } from '../hooks/subagent'
 
 describe('route rules', () => {
@@ -1924,7 +1925,7 @@ describe('cost exposure and session commands (1.0)', () => {
       seen.usage.push(U(1000, 500, 220_000, 0, `claude-${model}-5-5`))
       await step($, 't1', `claude-${model}-5-5`)
       // 221k tokens at the official per-million rates (Haiku is over 100k, so its long-prompt write $1 and read $0.05).
-      const expected: Record<string, [string, string]> = { haiku: ['$0.22', '0.011'], sonnet: ['$0.88', '0.022'], opus: ['$1.77', '0.044'], fable: ['$4.42', '0.055'] }
+      const expected: Record<string, [string, string]> = { haiku: ['$0.22', '0.011'], sonnet: ['$0.88', '0.022'], opus: ['$1.77', '0.044'], fable: ['$3.54', '0.044'] }
       const [cold] = expected[model]!
       // The cache of a conversation this size is gone an hour later; the notice prices the re-read at the model's rate.
       await seen.clock.advance(61 * 60_000)
@@ -9484,4 +9485,110 @@ describe('risk detector gaps (1.2.1)', () => {
       for (const t of safe) expect([t, isRisky(t)]).toEqual([t, false])
     })
   }
+})
+
+describe('what the router has been handed, and Fable sessions it never sees (1.2.3)', () => {
+  const FABLE = 'claude-fable-5-2'
+  const WARNING = /Fable session: no request of this conversation has reached the router/
+  const statusOf = async ($: any): Promise<string> => ((await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }).text
+
+  // WHY: in five sessions, 163 main-thread requests ran on Fable with blockFable and mainRouting on, and nothing said
+  // so; other Fable sessions were routed as usual. The warning must rest on what was observed (no main request seen),
+  // not on the model name alone: a Fable session whose requests do arrive is one the router is working on.
+  test('the warning needs both a Fable session model and no main request seen', async () => {
+    expect(isUnseenFable(FABLE, nothingSeen())).toBe(true)
+    expect(isUnseenFable('fable', nothingSeen())).toBe(true)
+    expect(isUnseenFable(FABLE, { ...nothingSeen(), steps: 1 })).toBe(false)
+    // Prompts, turns and subagent starts are not requests: the conversation's own requests are what went missing.
+    expect(isUnseenFable(FABLE, { prompts: 3, turns: 3, steps: 0, spawns: 2 })).toBe(true)
+    expect(isUnseenFable('claude-opus-5-5', nothingSeen())).toBe(false)
+    expect(isUnseenFable(undefined, nothingSeen())).toBe(false)
+  })
+
+  test('the status line names every count and the session model', async () => {
+    expect(seenLine('Seen this session', { prompts: 3, turns: 3, steps: 41, spawns: 2 }, FABLE))
+      .toBe('Seen this session: prompts 3 · main turns 3 · main requests 41 · subagent starts 2 · session model claude-fable-5-2')
+    expect(seenLine('Seen this session', nothingSeen(), undefined)).toContain('session model unknown')
+  })
+
+  test('status counts what was delivered; a subagent request is not a main request', async ($, on) => {
+    world($, on, '{"tier":"decide","reason":"design"}')
+    on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    await step($, 't1')
+    await step($, 't1')
+    await step($, 'other', 'claude-sonnet-5-5', 'agent-9')
+    await spawnAgent($)
+    expect(await statusOf($)).toContain('Seen this session: prompts 1 · main turns 1 · main requests 2 · subagent starts 1 · session model claude-opus-5-5')
+  })
+
+  // WHY: the counts answer "did the engine hand it over?". A paused router that showed zeros would look exactly like
+  // the Fable case, where nothing arrives.
+  test('a paused router still counts what it is handed', async ($, on) => {
+    world($, on, '{"tier":"decide","reason":"design"}')
+    on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+    await $.command.run({ command: 'model-router', args: 'off' } as never)
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    await step($, 't1')
+    expect(await statusOf($)).toContain('prompts 1 · main turns 1 · main requests 1 · subagent starts 0')
+  })
+
+  test('a Fable session no main request has reached warns in the band and on the status screen; the first main request clears both', async ($, on) => {
+    world($, on, '{"tier":"decide","reason":"design"}')
+    on('session.model', async () => ({ value: FABLE }))
+    // The status screen reads the session model itself, so a /model switch shows without waiting for a measurement.
+    const before = await statusOf($)
+    expect(before).toContain('main requests 0 · subagent starts 0 · session model claude-fable-5-2')
+    expect(before).toMatch(WARNING)
+    let ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ type: 'Text', text: WARNING })).toBeDefined()
+
+    await step($, 't1', FABLE)
+    expect(await statusOf($)).not.toMatch(WARNING)
+    ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ text: WARNING })).toBeUndefined()
+  })
+
+  // WHY: the band must warn by itself; a person who never opens the status screen is the one who needs it. The band
+  // learns the session model at session start and at each measurement, so a /model switch shows from the next one.
+  test('the band warns from a measurement alone, without the status screen', async ($, on) => {
+    world($, on, '{"tier":"decide","reason":"design"}')
+    on('session.model', async () => ({ value: FABLE }))
+    await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ type: 'Text', text: WARNING })).toBeDefined()
+  })
+
+  test('an Opus session never shows the Fable warning, before or after its first request', async ($, on) => {
+    world($, on, '{"tier":"decide","reason":"design"}')
+    on('session.model', async () => ({ value: 'claude-opus-5-5' }))
+    expect(await statusOf($)).not.toMatch(WARNING)
+    const ui = await $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(await ui.find({ text: WARNING })).toBeUndefined()
+  })
+
+  // WHY: the table held Fable 5.1's rates after the `fable` alias moved to 5.2. Cache reads dominate a long session, and
+  // 5.2 reads at Opus's rate; output and cache writes are what cost double.
+  test('the Fable entry holds Fable 5.2 rates: reads at the Opus rate, output and writes at twice Opus', async () => {
+    expect(PRICES.fable).toEqual({ input: 8, output: 40, read: 0.2, write: 16 })
+    expect(PRICES.fable.read).toBe(PRICES.opus.read)
+    expect(PRICES.fable.output).toBe(2 * PRICES.opus.output)
+    expect(PRICES.fable.write).toBe(2 * PRICES.opus.write)
+    expect(near(costOf(U(0, 1e6, 1e6, 1e6), 'fable'), 40 + 0.2 + 16)).toBe(true)
+  })
+
+  // WHY: one family entry would price a Fable 5.1 request about 20% low. The meter knows the id that answered, so it
+  // uses that model's own rates, while the request still counts under the one `fable` family in the totals.
+  test('a Fable 5.1 request is metered at 5.1 rates under the fable family; 5.2 and the alias use the family entry', async () => {
+    expect(ratesOf('claude-fable-5-1[1m]', 0)).toEqual({ input: 10, output: 50, read: 0.25, write: 20 })
+    expect(ratesOf('claude-fable-5-2', 0)).toEqual(PRICES.fable)
+    expect(ratesOf('fable', 0)).toEqual(PRICES.fable)
+    expect(ratesOf('claude-opus-5-5', 0)).toEqual(PRICES.opus)
+    const u = U(0, 1e6, 1e6, 1e6, 'claude-fable-5-1')
+    const old = add(EMPTY, 'claude-fable-5-1', u)
+    expect(near(old.cost, 50 + 0.25 + 20)).toBe(true)
+    expect(Object.keys(old.byModel)).toEqual(['fable'])
+    expect(near(old.byUsage!.write!.cost, 20)).toBe(true)
+    expect(near(add(EMPTY, 'claude-fable-5-2', u).cost, 40 + 0.2 + 16)).toBe(true)
+  })
 })
