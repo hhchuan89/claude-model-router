@@ -20,9 +20,14 @@ All notable changes to this project are documented here. The format follows
   rewritten to Haiku, Sonnet or Opus, and an unrouted Fable request was moved to Opus (`blockFable`). The only way to
   use Fable was to pause the router or turn `mainRouting` off, and a paused router routes no subagent and meters
   nothing. Now choosing Fable is enough. Set `respectFableSession` to `false` for the old behaviour.
-- `blockFable` now governs subagents; on the main thread it applies only with `respectFableSession` off.
-- The README's note on the Fable sessions that left no trace names a paused router as the explanation that fits
-  every observation, without claiming it: pauses are not logged.
+- `blockFable` still keeps subagents off Fable. On the main thread it now spares one thing: a respected Fable
+  session's own requests. A Fable request in a session on another model, or one the router put on a Fable id, is
+  still moved to Opus.
+- The Fable warning from 1.2.3 now needs a conversation to exist (context measured above zero), so a new Fable
+  session does not show it, and its text no longer says "not moved to Opus".
+- The decision reviewer (`reviewModel`) is never sent a turn that was left on the session's model.
+- The README's note on the Fable sessions that left no trace names a router paused at the time as the explanation
+  that fits each of them, without claiming it: pauses are not logged.
 
 ## [1.2.3] - 2026-11-10
 

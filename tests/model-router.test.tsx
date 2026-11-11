@@ -1780,9 +1780,7 @@ describe('blockFable (v0.8.2)', () => {
   })
 
   // WHY: the counter incremented on every request, so one Fable turn of 40 steps read as 40 blocks.
-  // Changed in 1.2.4: the main-thread block only exists with respectFableSession off; by default a Fable session is
-  // left on Fable (see the 1.2.4 tests at the end).
-  test('fableBlocked counts once per turn on the main thread and once per subagent, however many steps', { options: { respectFableSession: false } }, async ($, on) => {
+  test('fableBlocked counts once per turn on the main thread and once per subagent, however many steps', async ($, on) => {
     world($, on, null)
     await $.prompt.submit({ text: 'first' } as never)
     for (let i = 0; i < 6; i++) await step($, 't1', 'claude-fable-5-1[1m]')
@@ -9498,13 +9496,17 @@ describe('what the router has been handed, and Fable sessions it never sees (1.2
   // so; other Fable sessions were routed as usual. The warning must rest on what was observed (no main request seen),
   // not on the model name alone: a Fable session whose requests do arrive is one the router is working on.
   test('the warning needs both a Fable session model and no main request seen', async () => {
-    expect(isUnseenFable(FABLE, nothingSeen())).toBe(true)
-    expect(isUnseenFable('fable', nothingSeen())).toBe(true)
-    expect(isUnseenFable(FABLE, { ...nothingSeen(), steps: 1 })).toBe(false)
+    expect(isUnseenFable(FABLE, nothingSeen(), 60_000)).toBe(true)
+    expect(isUnseenFable('fable', nothingSeen(), 60_000)).toBe(true)
+    expect(isUnseenFable(FABLE, { ...nothingSeen(), steps: 1 }, 60_000)).toBe(false)
     // Prompts, turns and subagent starts are not requests: the conversation's own requests are what went missing.
-    expect(isUnseenFable(FABLE, { prompts: 3, turns: 3, steps: 0, spawns: 2 })).toBe(true)
-    expect(isUnseenFable('claude-opus-5-5', nothingSeen())).toBe(false)
-    expect(isUnseenFable(undefined, nothingSeen())).toBe(false)
+    expect(isUnseenFable(FABLE, { prompts: 3, turns: 3, steps: 0, spawns: 2 }, 60_000)).toBe(true)
+    expect(isUnseenFable('claude-opus-5-5', nothingSeen(), 60_000)).toBe(false)
+    expect(isUnseenFable(undefined, nothingSeen(), 60_000)).toBe(false)
+    // WHY (1.2.4): a new Fable session has no conversation the router could have missed; warning there cried wolf
+    // on the normal path. An empty or unmeasured context is not evidence.
+    expect(isUnseenFable(FABLE, nothingSeen(), 0)).toBe(false)
+    expect(isUnseenFable(FABLE, nothingSeen(), undefined)).toBe(false)
   })
 
   test('the status line names every count and the session model', async () => {
@@ -9538,7 +9540,8 @@ describe('what the router has been handed, and Fable sessions it never sees (1.2
   test('a Fable session no main request has reached warns in the band and on the status screen; the first main request clears both', async ($, on) => {
     world($, on, '{"tier":"decide","reason":"design"}')
     on('session.model', async () => ({ value: FABLE }))
-    // The status screen reads the session model itself, so a /model switch shows without waiting for a measurement.
+    // A conversation of 60k tokens exists, and the router has been handed none of its requests.
+    await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
     const before = await statusOf($)
     expect(before).toContain('main requests 0 · subagent starts 0 · session model claude-fable-5-2')
     expect(before).toMatch(WARNING)
@@ -9696,6 +9699,10 @@ describe("a Fable session is the person's own choice (1.2.4)", () => {
     const ui = await mountBand($)
     expect(await ui.find({ text: /^⚙ Fable — your choice/ })).toBeDefined()
     expect(await ui.find({ text: /The router picks a model for each message you send/ })).toBeUndefined()
+    // A new Fable session is the normal path now: nothing has been missed, so nothing warns.
+    expect(await ui.find({ text: /no request of this conversation has reached the router/ })).toBeUndefined()
+    const status = (await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }
+    expect(status.text).not.toMatch(/no request of this conversation has reached the router/)
   })
 
   test('respectFableSession off: a Fable session is routed like any other, and an unrouted Fable request runs on Opus', { options: { respectFableSession: false } }, async ($, on) => {
@@ -9719,5 +9726,100 @@ describe("a Fable session is the person's own choice (1.2.4)", () => {
     expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet')
     const r = (await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }
     expect(r.text).toContain('respectFableSession: true')
+  })
+})
+
+describe('review fixes for the Fable session (1.2.4)', () => {
+  const FABLE = 'claude-fable-5-2'
+  const decide = '{"tier":"decide","reason":"design"}'
+  const execute = '{"tier":"execute","reason":"build"}'
+  const notification = { text: '<task-notification>build finished</task-notification>', turnId: 'tn' } as never
+  const mountBand = ($: any) => $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+
+  // WHY: the Fable turn's placeholder route carried model opus, so with a reviewer configured every Fable turn was sent
+  // to it, unmasked, labelled as an Opus decision. The reviewer is for decisions the router put on Opus.
+  test('a turn left on Fable is never sent to the decision reviewer', { options: { reviewModel: 'claude-fable-5-5' } }, async ($, on) => {
+    const session = mock.session(on)
+    const seen = world($, on, decide, { reviewer: true })
+    on('session.model', async () => ({ value: FABLE }))
+    await $.prompt.submit({ text: 'which queue should we use' } as never)
+    await $.turn.complete({ answer: 'SQS', durationMs: 1000, isAborted: false, turnId: 't1', text: 'SQS', reason: 'completed' } as never)
+    await seen.clock.advance(0)
+    // Neither the review nor its availability probe: the reviewer model is not called at all.
+    expect(seen.asked.filter(m => m === 'claude-fable-5-5').length).toBe(0)
+    expect(JSON.stringify(session.appended())).not.toContain('Decision review')
+  })
+
+  // WHY: the first version switched the main-thread block off with the option alone. A tier configured to a Fable id
+  // then put a session on another model onto Fable: the router's own rewrite, not the person's choice of session model.
+  test('a session on another model is not put on Fable by a tier configured to a Fable id', { options: { sonnetModel: 'claude-fable-5-2' } }, async ($, on) => {
+    const seen = world($, on, execute)
+    on('session.model', async () => ({ value: OPUS }))
+    await $.prompt.submit({ text: 'build it' } as never)
+    await step($, 't1')
+    expect(seen.steps[0]!.model).toBe('opus[1m]')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 1')
+  })
+
+  test('a Fable request the router did not route, in a session on another model, still runs on Opus', async ($, on) => {
+    const seen = world($, on, decide)
+    on('session.model', async () => ({ value: OPUS }))
+    await $.turn.start(notification)
+    await step($, 'tn', FABLE)
+    expect(seen.steps[0]!.model).toBe('opus')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 1')
+  })
+
+  // WHY: after /model fable with no message since, the router still believes the session is on the old model. Moving
+  // that first request to Opus would rewrite the whole context cache twice, so it asks the engine before moving it.
+  test('a request that arrives on Fable right after a /model switch is checked against the engine, not a stale belief', async ($, on) => {
+    const seen = world($, on, decide)
+    let model = OPUS
+    on('session.model', async () => ({ value: model }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    await step($, 't1')
+    model = FABLE
+    await $.turn.start(notification)
+    await step($, 'tn', FABLE)
+    expect(seen.steps.at(-1)!.model).toBe(FABLE)
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 0')
+  })
+
+  test('a pin still names the model in a Fable session', async ($, on) => {
+    const seen = world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.command.run({ command: 'model-router', args: 'pin sonnet 1' } as never)
+    await $.prompt.submit({ text: 'tidy the imports' } as never)
+    expect(seen.asked).toEqual([])
+    expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet')
+    await step($, 't1', FABLE)
+    expect(seen.steps[0]!.model).toBe('sonnet')
+    // The pin is spent: the next message is the Fable session's own again.
+    await $.prompt.submit({ text: 'and the next thing' } as never)
+    expect(seen.submits[1]!.context).toBeUndefined()
+  })
+
+  // WHY: a failed model lookup must not flip a Fable session into routing, nor an Opus session out of it.
+  test('when the engine cannot say the model, the last known one decides', async ($, on) => {
+    const seen = world($, on, decide)
+    let fail = false
+    on('session.model', async () => fail ? { deny: 'unavailable' } : { value: FABLE })
+    await $.session.measure({ context: { window: 1e6, tokens: 0 }, rateLimits: [], changed: ['context'] } as never)
+    fail = true
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    expect(seen.asked).toEqual([])
+    expect(seen.submits[0]!.context).toBeUndefined()
+  })
+
+  test('after a switch away from Fable the band stops saying the conversation stays on Fable', async ($, on) => {
+    world($, on, decide)
+    let model = FABLE
+    on('session.model', async () => ({ value: model }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    await step($, 't1', FABLE)
+    expect(await (await mountBand($)).find({ text: /^⚙ Fable — your choice/ })).toBeDefined()
+    model = OPUS
+    await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
+    expect(await (await mountBand($)).find({ text: /stays on Fable/ })).toBeUndefined()
   })
 })

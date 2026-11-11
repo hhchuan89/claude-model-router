@@ -26,7 +26,7 @@
     "blockFable": {
       "type": "boolean",
       "title": "Block Fable",
-      "description": "On (the default): Fable never runs on a subagent; a subagent that asks for it, or would inherit it from a Fable session, runs on your Decision model instead. On the main conversation Fable is only moved to the Decision model when Respect a Fable session is off and main routing is on. Off: Fable is left alone everywhere; a subagent still never runs above its parent.",
+      "description": "On (the default): Fable never runs on a subagent; a subagent that asks for it, or would inherit it from a Fable session, runs on your Decision model instead. On the main conversation, while main routing is on, a Fable request is moved to the Decision model unless it is a respected Fable session's own. Off: Fable is left alone everywhere; a subagent still never runs above its parent.",
       "default": true
     },
     "respectFableSession": {

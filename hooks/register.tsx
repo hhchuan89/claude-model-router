@@ -351,7 +351,7 @@ const STR = {
     lastSkip: '上次跳过',
     seen: '本会话路由器收到',
     fableSession: '你选了 Fable：这个对话留在 Fable 上，子代理照常路由',
-    fableUnseen: '⚠ Fable 会话：本对话的请求都没有到达路由器——不路由、不改用 Opus、也不计入费用。见 /model-router status',
+    fableUnseen: '⚠ Fable 会话：本对话的请求都没有到达路由器——这里不路由，也不计入费用。见 /model-router status',
     unavailable: '无读数',
     categories: '本地估算分类（≈token）',
     noBreakdown: '无本地分类数据。',
@@ -501,7 +501,7 @@ const STR = {
     lastSkip: 'Last skipped action',
     seen: 'Seen this session',
     fableSession: 'your choice: this conversation stays on Fable, its subagents are still routed',
-    fableUnseen: '⚠ Fable session: no request of this conversation has reached the router — not routed, not moved to Opus, not counted. See /model-router status',
+    fableUnseen: '⚠ Fable session: no request of this conversation has reached the router — nothing here is routed or counted. See /model-router status',
     unavailable: 'unavailable',
     categories: 'Local category estimates (≈tokens)',
     noBreakdown: 'No local breakdown available.',
@@ -1628,7 +1628,7 @@ function bandRoute(lang: Lang, r: Route | null, routesMain: boolean, fableSessio
   const effortOf = (m: ModelKey) => TIER_ROUTE[TIER_OF[m]].effort
   // A pin set since the last route, or one that replaced the pin the route ran on, is what the next reply will use.
   if (pin && (r?.how !== 'pinned' || r.model !== pin.model)) return `📌 ${LABEL[pin.model]} · ${effortOf(pin.model)} — ${str.pinWaiting(pin.left)}`
-  if (r?.how === 'fable-session' || (!r && routesMain && fableSession)) return `⚙ Fable — ${str.fableSession}`
+  if (fableSession && (r?.how === 'fable-session' || (!r && routesMain))) return `⚙ Fable — ${str.fableSession}`
   if (!r) return `⚙ ${routesMain ? str.bandIdle : str.bandSubagents}`
   if (r.sessionModel) return `⚙ ${str.sessionRow} — ${str.unrouted(/\(([^)]*)\)/.exec(r.reason)?.[1] ?? '')}`
   const label = `${LABEL[r.model]} · ${r.effort}`
@@ -1926,10 +1926,12 @@ async function statusScreen($: EngineInterface, session: Session, lang: Lang, se
   const str = STR[lang]
   const models = { haikuModel: modelSetting(lang, configured.haiku, ids.haiku), sonnetModel: modelSetting(lang, configured.sonnet, ids.sonnet), opusModel: modelSetting(lang, configured.opus, ids.opus) }
   await ensurePrefs($, session)
+  let contextNow: number | undefined
   try {
     const usage = await $.session.usage()
     if (await stillHere($, session) !== 'same') return str.checkpointCancelled
     rateLimits = usage.rateLimits
+    contextNow = usage.context.tokens
   } catch {
     // Keep the last measurement.
   }
@@ -1954,7 +1956,7 @@ async function statusScreen($: EngineInterface, session: Session, lang: Lang, se
     `${str.safeDeadline}: ${lastMain ? new Date(lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS).toISOString() : str.unavailable}`,
     weeklyText(lang), pacingLine(lang, now), `${str.lastSkip}: ${lastSkipped ?? str.none}`,
     seenLine(str.seen, delivered, modelNow ?? sessionModel),
-    ...(isUnseenFable(modelNow ?? sessionModel, delivered) ? [str.fableUnseen] : []),
+    ...(isUnseenFable(modelNow ?? sessionModel, delivered, contextNow ?? contextReading().tokens) ? [str.fableUnseen] : []),
   ].filter(Boolean).join('\n')
 }
 
@@ -2652,9 +2654,25 @@ export const register: Register = (on, options) => {
       // Hard ceiling for every tracked subagent, inheriting ones too: xhigh and max are main-thread only.
       effort = capSent(effort)
     }
-    // With main routing off, or in a Fable session that is respected, the main model is the person's own choice:
-    // only subagents are kept off Fable.
-    if (blockFable && isFable(model) && (!isMain || (mainRouting && !respectFable))) {
+    // The main thread's own Fable is left alone in two cases: main routing is off, or this is a Fable session the
+    // router respects and the request arrived on Fable as the engine sent it (model === e.model). A request the
+    // router itself rewrote onto a Fable id (a tier configured to one) is still moved, and so is a Fable request in
+    // a session on another model.
+    let ownFable = false
+    if (isMain && respectFable && isFable(model) && model === e.model) {
+      // The belief can be stale after a /model switch with no message since: ask before moving the person's own model.
+      if (sessionModel !== 'fable') {
+        try {
+          const id = await $.session.model()
+          if (await stillHere($, session) !== 'same') return yield* next(e)
+          sessionModel = priceKey(id)
+        } catch {
+          // Keep the last known model.
+        }
+      }
+      ownFable = sessionModel === 'fable'
+    }
+    if (blockFable && isFable(model) && (!isMain || (mainRouting && !ownFable))) {
       model = withSuffixOf(ids.opus, e.model)
       const key = isMain ? `turn:${e.turnId}` : `agent:${e.agentId}`
       if (!fableCounted.has(key)) {
@@ -3006,7 +3024,7 @@ export const register: Register = (on, options) => {
     if (await stillHere($, session) !== 'same' || stale(epoch)) return done
     const isOn = await read($, enabled)
     if (await stillHere($, session) !== 'same' || stale(epoch) || !isOn) return done
-    if (e.agentId === undefined && !e.isAborted && r && r.turnId === e.turnId && r.model === 'opus') {
+    if (e.agentId === undefined && !e.isAborted && r && r.turnId === e.turnId && r.model === 'opus' && !r.sessionModel) {
       void maybeReview($, session, lang, reviewModel, pendingPrompt, e.answer)
     }
     if (e.agentId === undefined && !e.isAborted && checkpointHints) {
@@ -3137,7 +3155,7 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column" marginTop={1}>
         {cache !== '' && <Text color="warning" wrap="truncate-end">{cache}</Text>}
-        {isUnseenFable(sessionModel, delivered) && <Text color="warning" wrap="truncate-end">{str.fableUnseen}</Text>}
+        {isUnseenFable(sessionModel, delivered, contextReading().tokens) && <Text color="warning" wrap="truncate-end">{str.fableUnseen}</Text>}
         <Box flexDirection="row" gap={1} alignItems="center">
           <Box flexGrow={1} flexShrink={1} width={0}>
             <Text dimColor wrap="truncate-end">{bandRoute(lang, r, mainRouting, respectFable && sessionModel === 'fable')}</Text>
