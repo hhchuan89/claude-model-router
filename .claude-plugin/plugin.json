@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Routes every Claude Code turn to the cheapest model that can do it well (Haiku lookups, Sonnet execution, Opus decisions), lets the model escalate itself, routes subagents too, keeps a warm cache when switching would cost more, and compares costs with the same work tokens at Opus prices. Classification runs on your own Anthropic account; no third party sees your prompts.",
   "author": {
     "name": "hhchuan89"
@@ -20,13 +20,19 @@
     "mainRouting": {
       "type": "boolean",
       "title": "Route the main conversation",
-      "description": "On (the default): every turn you start is classified and runs on the cheapest model that fits. Off: subagent-only mode, the low-risk way to start. The main thread is left on your own model (Fable included), and subagent routing, escalation, Fable blocking for subagents and the meter keep working.",
+      "description": "On (the default): every turn you start is classified and runs on the cheapest model that fits. Off: subagent-only mode, the low-risk way to start. The main thread is left on your own model (Fable included), and subagent routing, escalation, Fable blocking for subagents and the meter keep working. A Fable session gets this treatment by itself while Respect a Fable session is on.",
       "default": true
     },
     "blockFable": {
       "type": "boolean",
       "title": "Block Fable",
-      "description": "On (the default): Fable never runs on a subagent, and never on the main conversation while main routing is on; those requests run on your Decision model instead. With main routing off, your own main model is left alone and only subagents are kept off Fable. Off: Fable is left alone everywhere, so you can run Fable as your main model; a subagent still never runs above its parent.",
+      "description": "On (the default): Fable never runs on a subagent; a subagent that asks for it, or would inherit it from a Fable session, runs on your Decision model instead. On the main conversation Fable is only moved to the Decision model when Respect a Fable session is off and main routing is on. Off: Fable is left alone everywhere; a subagent still never runs above its parent.",
+      "default": true
+    },
+    "respectFableSession": {
+      "type": "boolean",
+      "title": "Respect a Fable session",
+      "description": "On (the default): when you choose Fable as the session model, the router leaves your conversation on Fable: no classification, no move to another model (a #model in a message or a pin still wins). Its subagents are still routed to the cheaper models, and the session is still counted. Sessions on any other model are routed as usual. Off: a Fable session is routed like any other, so with Block Fable on Fable never answers on the main conversation.",
       "default": true
     },
     "haikuModel": {

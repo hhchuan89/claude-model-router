@@ -163,21 +163,31 @@ shortcuts.
    <id>."; a subagent passing `agent` is refused). **Hard ceiling:** no tracked subagent request is ever sent above
    effort high, including agents that inherit the session's model and effort, so an xhigh or max session still
    sends them at high; xhigh and max are main-thread only. Forks and workflow agents are not capped by the router.
-7. **Fable blocking (`blockFable`, on by default).** With it on, a subagent asking for Fable runs on Opus instead, a
-   Fable parent never passes Fable down, and while main routing is on a Fable request on the main thread runs on Opus
-   too. With `mainRouting` off the main model is your own choice and is left alone; only subagents are kept off Fable.
-   With `blockFable` off nothing is rewritten for Fable, so you can run Fable as your main model and keep the other
-   features; a subagent still never runs above its parent (its own cap stays Opus at medium, and main can raise it to Opus
-   at high). Each block is counted once per turn on the main thread and once per subagent, not once per request.
-   **Known limitation, observed 2026-11-10 (engines 2.1.317 to 2.1.321):** in five sessions, 163 main-thread
-   requests ran on Fable with `blockFable` and `mainRouting` at their defaults. In each of them Fable had been picked
-   with `/model` inside the session. Four show no router activity at all (no assignment, no event log); in the fifth
-   the router routed other turns but left the Fable turns after the `/model` switch alone. Sessions that started with
-   Fable already the default were routed as usual, with subagents kept off Fable. The cause is not known, and whether
-   the router was paused in the silent sessions cannot be read back afterwards. So the band shows a warning while a
-   Fable session has had no main request reach the router, and `/model-router status` prints what the router has
-   been handed (`Seen this session: prompts · main turns · main requests · subagent starts`) next to `enabled`, so
-   you can tell a session the router left alone from one it never saw.
+7. **A Fable session is your own choice (`respectFableSession`, on by default).** No account defaults to Fable, so a
+   session on Fable is one you picked, with `/model`, `--model` or a saved default. The router leaves that
+   conversation on Fable: no classifier call, no assignment text, no move to another model. A `#opus`, `#sonnet` or
+   `#haiku` in a message, or a pin, still names the model for that turn. Everything else keeps working: its
+   subagents are routed to the cheaper models and kept off Fable, the session is counted in the meter at Fable's
+   rates, and compaction runs. The session model is read again at every message, so a `/model` switch applies from
+   the next one, in both directions. Sessions on any other model are routed as before, and Fable is never chosen
+   by the router itself, so an account without Fable is unaffected. Fable costs more per token than Opus and draws
+   down usage limits faster; it suits a long or large job, not a short one, and switching a long conversation onto
+   it or back rewrites the whole context cache.
+   With `respectFableSession` off a Fable session is routed like any other.
+   **Fable blocking (`blockFable`, on by default)** covers subagents: one asking for Fable runs on Opus instead, and
+   a Fable parent never passes Fable down. On the main thread it only applies with `respectFableSession` off and
+   `mainRouting` on, where a Fable request the router did not route runs on Opus too. With `blockFable` off nothing
+   is rewritten for Fable; a subagent still never runs above its parent (its own cap stays Opus at medium, and main
+   can raise it to Opus at high). Each block is counted once per turn on the main thread and once per subagent, not
+   once per request.
+   **Before 1.2.4, observed 2026-11-10 (engines 2.1.317 to 2.1.321):** in five sessions, 163 main-thread requests ran
+   on Fable with no trace in the router's logs or meter, each after Fable was picked with `/model` inside the
+   session, while sessions that started on Fable were routed to Opus. A paused router explains all of it (paused, it
+   passes every request through unrouted and uncounted, and Pause applies to every new session until
+   `/model-router on`), but pauses are not logged, so this cannot be confirmed afterwards. To make it checkable, the
+   band warns while a Fable session has had no main request reach the router, and `/model-router status` prints
+   `enabled` and what the router has been handed (`Seen this session: prompts · main turns · main requests ·
+   subagent starts`).
    Optionally, set `reviewModel` to a model id available on your account and, if that model exists there
    (checked once a day), each Opus decision is reviewed by it and the review is added as a notice. **The reviewer is sent
    your request and Opus's answer unmasked.** The reviewer is off by default: with `reviewModel` empty the router makes
@@ -447,7 +457,8 @@ probed while the router is off. The probe's spend goes on the day, never on a tu
 |--------|---------|-------|---------|
 | `language` | `en` | `en`, `zh` | Language of the UI, routing reason and price comparison (English or Simplified Chinese) |
 | `mainRouting` | `true` (on) | `true`, `false` | On: classify and route the turns you start, except when the warm-cache guard makes classification unnecessary. Off: **subagent-only mode, the low-risk way to start.** The main thread keeps your session model and effort, with no classification or assignment text, while subagent routing, escalation, Fable blocking for subagents and the meter keep working |
-| `blockFable` | `true` (on) | `true`, `false` | On: Fable never runs on a subagent, or on the main thread while `mainRouting` is on (those requests run on the Decision model); with `mainRouting` off your main model is left alone. Off: Fable is left alone everywhere; a subagent still never runs above its parent |
+| `blockFable` | `true` (on) | `true`, `false` | On: Fable never runs on a subagent (it runs on the Decision model instead). On the main thread it only applies with `respectFableSession` off and `mainRouting` on. Off: Fable is left alone everywhere; a subagent still never runs above its parent |
+| `respectFableSession` | `true` (on) | `true`, `false` | On: a session whose model is Fable stays on Fable (no classification, no move to another model; `#model` or a pin still wins), while its subagents are routed and the session is counted. Off: a Fable session is routed like any other |
 | `haikuModel` | `haiku` | Alias or model id | Lookup model. The alias follows the newest Haiku model; a full id (`claude-haiku-5-5`) pins one (see below) |
 | `sonnetModel` | `sonnet` | Alias or model id | Execution model. The alias follows the newest Sonnet model; a full id pins one |
 | `opusModel` | `opus` | Alias or model id | Decision model. The alias follows the newest Opus model; a full id pins one |

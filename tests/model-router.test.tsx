@@ -1780,7 +1780,9 @@ describe('blockFable (v0.8.2)', () => {
   })
 
   // WHY: the counter incremented on every request, so one Fable turn of 40 steps read as 40 blocks.
-  test('fableBlocked counts once per turn on the main thread and once per subagent, however many steps', async ($, on) => {
+  // Changed in 1.2.4: the main-thread block only exists with respectFableSession off; by default a Fable session is
+  // left on Fable (see the 1.2.4 tests at the end).
+  test('fableBlocked counts once per turn on the main thread and once per subagent, however many steps', { options: { respectFableSession: false } }, async ($, on) => {
     world($, on, null)
     await $.prompt.submit({ text: 'first' } as never)
     for (let i = 0; i < 6; i++) await step($, 't1', 'claude-fable-5-1[1m]')
@@ -9590,5 +9592,132 @@ describe('what the router has been handed, and Fable sessions it never sees (1.2
     expect(Object.keys(old.byModel)).toEqual(['fable'])
     expect(near(old.byUsage!.write!.cost, 20)).toBe(true)
     expect(near(add(EMPTY, 'claude-fable-5-2', u).cost, 40 + 0.2 + 16)).toBe(true)
+  })
+})
+
+describe("a Fable session is the person's own choice (1.2.4)", () => {
+  const FABLE = 'claude-fable-5-2'
+  const decide = '{"tier":"decide","reason":"design"}'
+  const execute = '{"tier":"execute","reason":"build"}'
+  const notification = { text: '<task-notification>build finished</task-notification>', turnId: 'tn' } as never
+  const mountBand = ($: any) => $.ui.mount({ plugin: 'model-router', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+
+  // WHY: no account defaults to Fable, so a Fable session is always someone's choice. Redirecting it to Opus left one way
+  // to use Fable: pause the router, and a paused router routes no subagent and meters nothing.
+  test('the main thread stays on Fable: no classifier call, no assignment text, no move to Opus', async ($, on) => {
+    const seen = world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    expect(seen.asked).toEqual([])
+    expect(seen.submits[0]!.context).toBeUndefined()
+    await step($, 't1', FABLE)
+    expect(seen.steps[0]).toEqual({ model: FABLE, effort: 'high', agentId: undefined })
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 0')
+    const ui = await mountBand($)
+    expect(await ui.find({ text: /^⚙ Fable — your choice: this conversation stays on Fable, its subagents are still routed$/ })).toBeDefined()
+    expect(eventsOf(seen).at(-1)).toMatchObject({ event: 'turn route', to: 'session model' })
+    // An unrouted turn gives the escalate tool nothing to change: Fable is not moved by the model either.
+    const up = (await $.tool.call({ tool: 'mcp__model-router__escalate', model: 'opus', reason: 'x' } as never)) as { result: string }
+    expect(up.result).toContain('No routed turn')
+  })
+
+  // WHY: the point of not pausing the router is that the session is still counted, at what Fable costs.
+  test('the session is metered at Fable rates', async ($, on) => {
+    const seen = world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    const u = U(1000, 500, 200_000, 3000, FABLE)
+    seen.usage.push(u)
+    await step($, 't1', FABLE)
+    // The request went out on Fable, so the usage that came back is Fable's: the mock would report Fable either way.
+    expect(seen.steps[0]!.model).toBe(FABLE)
+    expect(near(seen.tally!.byModel.fable!.cost, costOf(u, 'fable'))).toBe(true)
+    expect(seen.tally!.byModel.opus).toBeUndefined()
+  })
+
+  // WHY: Fable plans and verifies; the settled work it hands out is what the cheaper models are for.
+  // A guard: this held before 1.2.4 too, and respecting the main thread must not loosen it.
+  test('its subagents are still routed to the cheaper models and never run on Fable', async ($, on) => {
+    const seen = world($, on, execute)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.prompt.submit({ text: 'build it' } as never)
+    await spawnAgent($, { parentModel: FABLE })
+    await spawnAgent($, { parentModel: FABLE, subagentType: 'Plan' })
+    expect(seen.agents).toEqual(['sonnet', 'opus'])
+    await step($, 'other', FABLE, 'agent-9')
+    expect(seen.steps.at(-1)!.model).toBe('opus')
+    // The Plan agent that would have inherited Fable, and the stray Fable request: two blocks, none for the main thread.
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 2')
+  })
+
+  test('a #model in the message still names the model for that turn', async ($, on) => {
+    const seen = world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.prompt.submit({ text: 'check this once more #opus' } as never)
+    expect(seen.submits[0]!.context?.[0]).toContain('assigned to opus')
+    await step($, 't1', FABLE)
+    expect(seen.steps[0]!.model).toBe('opus')
+  })
+
+  // WHY: the model is read at every message, not only at session start: someone who switches to Fable for a big job, or
+  // back to Opus after it, must not wait for a measurement or a restart.
+  test('a /model switch applies from the next message, in both directions', async ($, on) => {
+    const seen = world($, on, decide)
+    let model = OPUS
+    on('session.model', async () => ({ value: model }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    expect(seen.submits[0]!.context?.[0]).toContain('assigned to opus')
+    model = FABLE
+    await $.prompt.submit({ text: 'now the big migration' } as never)
+    expect(seen.submits[1]!.context).toBeUndefined()
+    await step($, 't2', FABLE)
+    expect(seen.steps.at(-1)!.model).toBe(FABLE)
+    model = OPUS
+    await $.prompt.submit({ text: 'and a small fix' } as never)
+    expect(seen.submits[2]!.context?.[0]).toContain('[model-router] This turn is assigned to')
+  })
+
+  // WHY: a background task's notification in a Fable session must not be the one request that jumps to Opus and back.
+  test('a turn nobody typed is left on Fable too', async ($, on) => {
+    const seen = world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    await step($, 't1', FABLE)
+    await $.turn.start(notification)
+    await step($, 'tn', FABLE)
+    expect(seen.steps.map(st => st.model)).toEqual([FABLE, FABLE])
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 0')
+  })
+
+  test('before the first message the band already says the session stays on Fable', async ($, on) => {
+    world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.session.measure({ context: { window: 1e6, tokens: 0 }, rateLimits: [], changed: ['context'] } as never)
+    const ui = await mountBand($)
+    expect(await ui.find({ text: /^⚙ Fable — your choice/ })).toBeDefined()
+    expect(await ui.find({ text: /The router picks a model for each message you send/ })).toBeUndefined()
+  })
+
+  test('respectFableSession off: a Fable session is routed like any other, and an unrouted Fable request runs on Opus', { options: { respectFableSession: false } }, async ($, on) => {
+    const seen = world($, on, execute)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.prompt.submit({ text: 'build it' } as never)
+    expect(seen.asked).toEqual(['haiku'])
+    expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet')
+    await step($, 't1', FABLE)
+    expect(seen.steps[0]!.model).toBe('sonnet')
+    await step($, 'unrouted', FABLE)
+    expect(seen.steps[1]!.model).toBe('opus')
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 1')
+  })
+
+  test('a session on another model is classified and routed exactly as before', async ($, on) => {
+    const seen = world($, on, execute)
+    on('session.model', async () => ({ value: OPUS }))
+    await $.prompt.submit({ text: 'build it' } as never)
+    expect(seen.asked).toEqual(['haiku'])
+    expect(seen.submits[0]!.context?.[0]).toContain('assigned to sonnet')
+    const r = (await $.command.run({ command: 'model-router', args: 'status' } as never)) as { text: string }
+    expect(r.text).toContain('respectFableSession: true')
   })
 })

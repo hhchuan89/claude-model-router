@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.4] - 2026-11-10
+
+### Added
+
+- `respectFableSession` (on by default): a session whose model is Fable is left on Fable. The router makes no
+  classifier call for it, adds no assignment text and moves nothing to another model; a `#model` in a message or a
+  pin still wins for its turn. Its subagents are still routed to the cheaper models and kept off Fable, the session
+  is metered at Fable's rates, and compaction runs. The session model is read again at every message, so a `/model`
+  switch applies from the next one. The band shows `⚙ Fable — your choice: this conversation stays on Fable, its
+  subagents are still routed`, and the turn is logged as a `turn route` to `session model`.
+
+### Changed
+
+- **Default behaviour change:** with `mainRouting` on, a Fable session's main thread used to be classified and
+  rewritten to Haiku, Sonnet or Opus, and an unrouted Fable request was moved to Opus (`blockFable`). The only way to
+  use Fable was to pause the router or turn `mainRouting` off, and a paused router routes no subagent and meters
+  nothing. Now choosing Fable is enough. Set `respectFableSession` to `false` for the old behaviour.
+- `blockFable` now governs subagents; on the main thread it applies only with `respectFableSession` off.
+- The README's note on the Fable sessions that left no trace names a paused router as the explanation that fits
+  every observation, without claiming it: pauses are not logged.
+
 ## [1.2.3] - 2026-11-10
 
 ### Added

@@ -350,6 +350,7 @@ const STR = {
     safeDeadline: '最晚压缩时间',
     lastSkip: '上次跳过',
     seen: '本会话路由器收到',
+    fableSession: '你选了 Fable：这个对话留在 Fable 上，子代理照常路由',
     fableUnseen: '⚠ Fable 会话：本对话的请求都没有到达路由器——不路由、不改用 Opus、也不计入费用。见 /model-router status',
     unavailable: '无读数',
     categories: '本地估算分类（≈token）',
@@ -499,6 +500,7 @@ const STR = {
     safeDeadline: 'Compact before',
     lastSkip: 'Last skipped action',
     seen: 'Seen this session',
+    fableSession: 'your choice: this conversation stays on Fable, its subagents are still routed',
     fableUnseen: '⚠ Fable session: no request of this conversation has reached the router — not routed, not moved to Opus, not counted. See /model-router status',
     unavailable: 'unavailable',
     categories: 'Local category estimates (≈tokens)',
@@ -1621,11 +1623,12 @@ function contextLine(lang: Lang, now: number): string {
 }
 
 // Row 1 of the band: what the router chose, in words.
-function bandRoute(lang: Lang, r: Route | null, routesMain: boolean): string {
+function bandRoute(lang: Lang, r: Route | null, routesMain: boolean, fableSession = false): string {
   const str = STR[lang]
   const effortOf = (m: ModelKey) => TIER_ROUTE[TIER_OF[m]].effort
   // A pin set since the last route, or one that replaced the pin the route ran on, is what the next reply will use.
   if (pin && (r?.how !== 'pinned' || r.model !== pin.model)) return `📌 ${LABEL[pin.model]} · ${effortOf(pin.model)} — ${str.pinWaiting(pin.left)}`
+  if (r?.how === 'fable-session' || (!r && routesMain && fableSession)) return `⚙ Fable — ${str.fableSession}`
   if (!r) return `⚙ ${routesMain ? str.bandIdle : str.bandSubagents}`
   if (r.sessionModel) return `⚙ ${str.sessionRow} — ${str.unrouted(/\(([^)]*)\)/.exec(r.reason)?.[1] ?? '')}`
   const label = `${LABEL[r.model]} · ${r.effort}`
@@ -2212,6 +2215,11 @@ export const register: Register = (on, options) => {
   // true (the default): Fable never runs on a subagent, and on the main thread when main routing is on. false: Fable is
   // left alone everywhere (a subagent still never runs above its parent).
   const blockFable = options.blockFable !== false
+  // true (the default): a session whose model is Fable is the person's own choice. Its main thread is neither
+  // classified nor rewritten nor moved to Opus (a #model in the message or a pin still wins); its subagents are
+  // routed and kept off Fable as before, and the session is metered. false: a Fable main thread is routed like any
+  // other while main routing is on, which with blockFable means Fable never answers on it.
+  const respectFable = options.respectFableSession !== false
   // Empty (the default) leaves the reviewer off.
   const reviewModel = String(options.reviewModel ?? '').trim()
   // Minutes of idle after which the main context is compacted while the cache is still warm; 0 (the default) is off.
@@ -2240,7 +2248,7 @@ export const register: Register = (on, options) => {
     'Explicit checkpoints remain available when the router is off.'
   uiLang = lang
   const settings = {
-    language: lang, mainRouting, blockFable, haikuModel: ids.haiku, sonnetModel: ids.sonnet, opusModel: ids.opus,
+    language: lang, mainRouting, blockFable, respectFableSession: respectFable, haikuModel: ids.haiku, sonnetModel: ids.sonnet, opusModel: ids.opus,
     reviewModel, idleCompactMinutes: idleMinutes, compactMinContext, compactAtContext, checkpointHints, shrinkToolOutput,
     learnFromCorrections: learning, weeklyPacing: pacingOption,
   }
@@ -2476,6 +2484,31 @@ export const register: Register = (on, options) => {
     // The turn's tally starts here, so it includes the classifier's own call.
     await bookkeeping($, () => update($, memberOf(meter, { requestId: session.stateId }), m => here(session) ? { turn: EMPTY, today: (m ?? { today: EMPTY }).today } : m), undefined)
     if (!mainRouting) return next(e)
+    // A Fable session is left on Fable: no classifier call, no assignment text, nothing to rewrite. Read fresh, so a
+    // /model switch applies from this message on. A #model in the message or a pin names a model and still wins.
+    if (respectFable && !forcedModel(e.text) && !pin) {
+      let onFable = sessionModel === 'fable'
+      try {
+        const id = await $.session.model()
+        if (await stillHere($, session) !== 'same') return next(e)
+        sessionModel = priceKey(id)
+        onFable = isFable(id)
+      } catch {
+        // Keep the last known model.
+      }
+      if (await stillHere($, session) !== 'same') return next(e)
+      if (onFable) {
+        // turn.start binds this for the band and the log, like any turn left on the session's model.
+        pending = { ...routeFor('decide', str.fableSession), sessionModel: true, how: 'fable-session' }
+        pendingPrompt = e.text
+        const entered = await next(e)
+        if (await stillHere($, session) === 'same' && entered.drop !== undefined) {
+          pending = null
+          pendingPrompt = ''
+        }
+        return entered
+      }
+    }
     let r = await classify($, session, lang, e.text, routed(await read($, memberOf(route, { requestId: session.stateId }))))
     if (await stillHere($, session) !== 'same') return next(e)
     if (r.sessionModel) {
@@ -2619,8 +2652,9 @@ export const register: Register = (on, options) => {
       // Hard ceiling for every tracked subagent, inheriting ones too: xhigh and max are main-thread only.
       effort = capSent(effort)
     }
-    // With main routing off the main model is the person's own choice: only subagents are kept off Fable.
-    if (blockFable && isFable(model) && (!isMain || mainRouting)) {
+    // With main routing off, or in a Fable session that is respected, the main model is the person's own choice:
+    // only subagents are kept off Fable.
+    if (blockFable && isFable(model) && (!isMain || (mainRouting && !respectFable))) {
       model = withSuffixOf(ids.opus, e.model)
       const key = isMain ? `turn:${e.turnId}` : `agent:${e.agentId}`
       if (!fableCounted.has(key)) {
@@ -3106,7 +3140,7 @@ export const register: Register = (on, options) => {
         {isUnseenFable(sessionModel, delivered) && <Text color="warning" wrap="truncate-end">{str.fableUnseen}</Text>}
         <Box flexDirection="row" gap={1} alignItems="center">
           <Box flexGrow={1} flexShrink={1} width={0}>
-            <Text dimColor wrap="truncate-end">{bandRoute(lang, r, mainRouting)}</Text>
+            <Text dimColor wrap="truncate-end">{bandRoute(lang, r, mainRouting, respectFable && sessionModel === 'fable')}</Text>
           </Box>
           <Button key="band-details" label={expanded ? str.hideDetails : str.details} onPress={() => toggleDetails($, session)} />
           <Button key="router-disable" label={str.disable} onPress={() => setEnabled($, session, false)} />
