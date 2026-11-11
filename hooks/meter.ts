@@ -1,14 +1,15 @@
 import type { ModelKey, SpendRole, SpendUsage, Tally } from '../types'
 
 // USD per million tokens, Anthropic first-party API rates as listed on
-// https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-11-02): input, output, cache read and the 1-hour
+// https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-11-02; Fable 2026-11-10): input, output, cache read and the 1-hour
 // cache write (Claude Code caches with a 1-hour TTL, priced at 2x input).
 type Price = { input: number; output: number; read: number; write: number }
 export const PRICES: Record<ModelKey | 'fable', Price> = {
   haiku: { input: 0.1, output: 0.5, read: 0.01, write: 0.2 },
   sonnet: { input: 2, output: 10, read: 0.1, write: 4 },
   opus: { input: 4, output: 20, read: 0.2, write: 8 },
-  fable: { input: 10, output: 50, read: 0.25, write: 20 },
+  // Fable 5.2, which the `fable` alias names (fetched from the pricing page 2026-11-10). Fable 5.1 costs more: see ratesOf.
+  fable: { input: 8, output: 40, read: 0.2, write: 16 },
 }
 // Haiku 5.5 is priced higher for a prompt over 100,000 tokens. The prompt is all of a request's input: uncached input,
 // cache reads and cache writes together, and each request is priced on its own.
@@ -18,6 +19,15 @@ const HAIKU_LONG: Price = { input: 0.5, output: 2.5, read: 0.05, write: 1 }
 // The rates for one request (or, for a context-only estimate, a context) of `prompt` tokens.
 export function priceOf(key: keyof typeof PRICES, prompt: number): Price {
   return key === 'haiku' && prompt > LONG_PROMPT_TOKENS ? HAIKU_LONG : PRICES[key]
+}
+
+// Fable 5.1 costs more than the 5.2 rates the family entry holds. Where the id that answered is known (the meter and
+// the cache-rewrite counter) a 5.1 request is priced at its own rates. An estimate made from the family alone (the
+// band's cache notice, a switch cost, a compaction estimate) uses the family entry, so for a 5.1 session it reads
+// about 20% low.
+const FABLE_51: Price = { input: 10, output: 50, read: 0.25, write: 20 }
+export function ratesOf(modelId: string, prompt: number): Price {
+  return /fable-5-1(?!\d)/i.test(modelId) ? FABLE_51 : priceOf(priceKey(modelId), prompt)
 }
 
 export function promptOf(u: Usage): number {
@@ -63,7 +73,10 @@ export function priceKey(modelId: string): keyof typeof PRICES {
 }
 
 export function costOf(u: Usage, key: keyof typeof PRICES): number {
-  const p = priceOf(key, promptOf(u))
+  return costAt(u, priceOf(key, promptOf(u)))
+}
+
+function costAt(u: Usage, p: Price): number {
   return (
     (u.input_tokens * p.input +
       u.output_tokens * p.output +
@@ -96,12 +109,12 @@ export function isSwitchStep(prev: LastRequest | null, key: keyof typeof PRICES,
 
 export function add(t: Tally, modelId: string, u: Usage, switched = false, overhead = false, role: SpendRole = 'main'): Tally {
   const key = priceKey(modelId)
-  const cost = costOf(u, key)
+  const rates = ratesOf(modelId, promptOf(u))
+  const cost = costAt(u, rates)
   const tokens = tokensOf(u)
   const prev = t.byModel[key] ?? { tokens: 0, cost: 0 }
   const prevRole = t.byRole?.[role] ?? { tokens: 0, cost: 0 }
   const byUsage = { ...t.byUsage }
-  const rates = priceOf(key, promptOf(u))
   const amounts: Record<SpendUsage, number> = { read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, input: u.input_tokens, output: u.output_tokens }
   for (const kind of Object.keys(amounts) as SpendUsage[]) {
     const prev = byUsage[kind] ?? { tokens: 0, cost: 0 }

@@ -169,6 +169,15 @@ shortcuts.
    With `blockFable` off nothing is rewritten for Fable, so you can run Fable as your main model and keep the other
    features; a subagent still never runs above its parent (its own cap stays Opus at medium, and main can raise it to Opus
    at high). Each block is counted once per turn on the main thread and once per subagent, not once per request.
+   **Known limitation, observed 2026-11-10 (engines 2.1.317 to 2.1.321):** in five sessions, 163 main-thread
+   requests ran on Fable with `blockFable` and `mainRouting` at their defaults. In each of them Fable had been picked
+   with `/model` inside the session. Four show no router activity at all (no assignment, no event log); in the fifth
+   the router routed other turns but left the Fable turns after the `/model` switch alone. Sessions that started with
+   Fable already the default were routed as usual, with subagents kept off Fable. The cause is not known, and whether
+   the router was paused in the silent sessions cannot be read back afterwards. So the band shows a warning while a
+   Fable session has had no main request reach the router, and `/model-router status` prints what the router has
+   been handed (`Seen this session: prompts · main turns · main requests · subagent starts`) next to `enabled`, so
+   you can tell a session the router left alone from one it never saw.
    Optionally, set `reviewModel` to a model id available on your account and, if that model exists there
    (checked once a day), each Opus decision is reviewed by it and the review is added as a notice. **The reviewer is sent
    your request and Opus's answer unmasked.** The reviewer is off by default: with `reviewModel` empty the router makes
@@ -472,7 +481,7 @@ figures cannot be corrected retrospectively because they do not separate classif
 Prices per million tokens in the table follow the official pricing page (https://platform.claude.com/docs/en/about-claude/pricing,
 checked 2026-11-02), request by request: Opus 5.5 $4 in / $20 out / $0.20 cache read / $8 cache write (1-hour); Sonnet 5.5
 $2 / $10 / $0.10 / $4; Haiku 5.5 $0.10 / $0.50 / $0.01 / $0.20 for a prompt of up to 100,000 tokens and $0.50 / $2.50 /
-$0.05 / $1 above that; Fable 5.1 $10 / $50 / $0.25 / $20. A prompt's length counts all its input: uncached input, cache
+$0.05 / $1 above that; Fable 5.2 $8 / $40 / $0.20 / $16 (fetched 2026-11-10); a Fable 5.1 request is metered at its own $10 / $50 / $0.25 / $20, while estimates made from the model family (the cache notice, a switch cost) use the 5.2 rates. A prompt's length counts all its input: uncached input, cache
 reads and cache writes together, and each request is priced on its own size (a context-only estimate such as the
 cold-resume cost uses the context size the same way). Change `hooks/meter.ts` if your rates differ.
 

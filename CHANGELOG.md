@@ -3,6 +3,32 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] - 2026-11-10
+
+### Added
+
+- `/model-router status` ends with what the engine has handed the router in this session:
+  `Seen this session: prompts 3 · main turns 3 · main requests 41 · subagent starts 2 · session model claude-fable-5-2`.
+  Each figure is counted at the top of its hook, before any other check, so it shows what was delivered and not what
+  the router did with it. The session model on that screen is read fresh, so a `/model` switch shows at once.
+- A warning in the band, and on the status screen, while the session model is Fable and no main request has reached
+  the router: nothing in that conversation is routed, moved to Opus or counted. It goes away with the first main
+  request the router sees.
+
+### Changed
+
+- The Fable price entry holds Fable 5.2's rates ($8 / $40 / $0.20 cache read / $16 one-hour cache write, fetched from
+  the pricing page 2026-11-10) instead of Fable 5.1's. A Fable 5.1 request is still metered at its own rates, by the id
+  that answered; estimates made from the model family alone (the band's cache notice, a switch cost, a compaction
+  estimate) use the 5.2 rates, so for a 5.1 session they read about 20% low.
+
+### Known limitation
+
+- Observed 2026-11-10 on engines 2.1.317 to 2.1.321: in five sessions, 163 main-thread requests ran on Fable with
+  `blockFable` and `mainRouting` at their defaults, each after Fable was picked with `/model` inside the session.
+  Sessions that started with Fable already the default were routed as usual. The cause is not known and this
+  release does not fix it; it makes it visible. See "Fable blocking" in the README.
+
 ## [1.2.2] - 2026-11-05
 
 ### Added
