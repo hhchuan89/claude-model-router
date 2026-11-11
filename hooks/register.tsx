@@ -2597,8 +2597,9 @@ export const register: Register = (on, options) => {
         if (await stillHere($, session) !== 'same') return next(e)
         // A /model switch to Fable since that route: the session's model is the person's own choice, and the old
         // route is not theirs to continue. Left to inherit it, this turn would run on Opus or Sonnet.
-        let onFable = false
-        if (respectFable && prev && last && now - last.at <= CACHE_TTL_MS) {
+        const warm = !!(prev && last && now - last.at <= CACHE_TTL_MS)
+        let onFable = sessionModel === 'fable'
+        if (respectFable && warm) {
           try {
             const id = await $.session.model()
             if (await stillHere($, session) !== 'same') return next(e)
@@ -2614,7 +2615,7 @@ export const register: Register = (on, options) => {
             await logEvent($, session, 'main', 'turn route', 'session model', r.reason)
           }
         }
-        if (!onFable && prev && last && now - last.at <= CACHE_TTL_MS) {
+        if (!(respectFable && onFable) && warm && prev) {
           inherited = true
           const r: Route = { ...prev, turnId: e.turnId, reason: str.inherited, how: 'inherited', steered: undefined }
           turnSteps = 0
@@ -3172,9 +3173,8 @@ export const register: Register = (on, options) => {
       .filter(([, tier]) => target !== undefined && tier !== target.tier && TIER_ROUTE[tier].model !== target.model)
 
     // What the plugin observed (no main request yet) outranks the row that says the session is left on Fable: a resumed
-    // Fable session would otherwise show both, until its first message. A turn bound as a Fable session's own means
-    // the router is being handed this conversation, so that row stands for the moment before its first request.
-    const unseenFable = isUnseenFable(sessionModel, delivered, contextReading().tokens) && r?.how !== 'fable-session'
+    // Fable session would otherwise show both, until its first request. A started turn does not clear it: only a request does.
+    const unseenFable = isUnseenFable(sessionModel, delivered, contextReading().tokens)
     return (
       <Box flexDirection="column" marginTop={1}>
         {cache !== '' && <Text color="warning" wrap="truncate-end">{cache}</Text>}

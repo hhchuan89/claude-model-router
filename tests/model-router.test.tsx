@@ -9874,4 +9874,36 @@ describe('review fixes for the Fable session (1.3.0)', () => {
     expect(await after.find({ text: /no request of this conversation has reached the router/ })).toBeUndefined()
     expect(await after.find({ text: /^⚙ Fable — your choice/ })).toBeDefined()
   })
+
+  // WHY (second review): a turn that has started is not a request that has arrived. The 1.2.3 failure is turns delivered
+  // and no request: the band must keep warning then, as the status screen does.
+  test('a Fable turn that started but sent no request still warns on the band', async ($, on) => {
+    world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
+    await $.prompt.submit({ text: 'carry on' } as never)
+    await $.turn.start({ text: 'carry on', turnId: 't1' } as never)
+    const ui = await mountBand($)
+    expect(await ui.find({ text: /no request of this conversation has reached the router/ })).toBeDefined()
+    expect(await ui.find({ text: /your choice/ })).toBeUndefined()
+  })
+
+  // WHY (second review): the notification branch must keep the last known model when the engine cannot say it, as the
+  // typed-prompt path does; otherwise it inherits the old route and moves the person's Fable request to Opus.
+  test('a notification after a switch to Fable still stays on Fable when the model lookup fails', async ($, on) => {
+    const seen = world($, on, decide)
+    let model = OPUS
+    let fail = false
+    on('session.model', async () => fail ? { deny: 'unavailable' } : { value: model })
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    seen.usage.push(U(1000, 500, 200_000, 3000, OPUS))
+    await step($, 't1')
+    model = FABLE
+    await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
+    fail = true
+    await $.turn.start(notification)
+    await step($, 'tn', FABLE)
+    expect(seen.steps.at(-1)!.model).toBe(FABLE)
+    expect(eventsOf(seen).some(ev => ev.event === 'turn inherit')).toBe(false)
+  })
 })

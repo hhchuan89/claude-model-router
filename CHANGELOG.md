@@ -29,7 +29,7 @@ All notable changes to this project are documented here. The format follows
 - A task notification (or any turn nobody typed) after a `/model` switch to Fable no longer continues the previous
   Opus or Sonnet route inside the cache window: the session model is read first, and a Fable session's turn stays on Fable.
 - A resumed Fable session, before its first request, shows the "no request has reached the router" warning alone;
-  the "your choice" row appears once a request has arrived. The two no longer show together.
+  the "your choice" row appears once a request has arrived (a started turn does not count). The two no longer show together.
 - The README's note on the Fable sessions that left no trace names a router paused at the time as an explanation
   that fits four of the five, without claiming it (pauses are not logged), and says the fifth is unexplained.
 
