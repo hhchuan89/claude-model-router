@@ -8274,16 +8274,26 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
     test('a correction to a smaller model on a large warm conversation also offers a checkpoint before the next message', async ($, on) => {
       const seen = world($, on, decide)
       ui($, on)
+      on('session.compact', async () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }], tokensBefore: 300_000, tokensAfter: 40_000 }))
+      on('agent.list', async () => ({ value: [] }))
       await $.prompt.submit({ text: 'choose the storage design' } as never)
       seen.usage.push(U(1000, 500, 299_000))
       await step($, 't1')
       await $.turn.complete(completion('t1'))
+      // The offer holds until the deadline compaction keeps: 3 minutes before the 1-hour cache ends.
+      const by = hhmm(seen.clock.now() + 57 * 60_000)
       // 300,000 tokens: Sonnet writes them at $4 per million; a checkpoint reads them on Opus at $0.20, answers 8k
       // at $20 and leaves Sonnet a 40k summary to write.
       const answer = await cmd($, 'wrong execute')
-      expect(answer).toContain('Switching re-reads the whole conversation at about $1.20 on Sonnet. Run /model-router checkpoint before your next message and it re-reads a summary instead: about $0.38 in all.')
-      const band = await openBand($)
-      expect(await band.find({ type: 'Text', text: /unpin to undo\. Switching re-reads the whole conversation at about \$1\.20 on Sonnet\. Run \/model-router checkpoint before your next message and it re-reads a summary instead: about \$0\.38 in all\.$/ })).toBeDefined()
+      expect(answer).toContain(`Switching re-reads the whole conversation at about $1.20 on Sonnet. Run /model-router checkpoint first (before ${by} and before your next message) and the switch re-reads a summary instead: about $0.38 in all.`)
+      let band = await openBand($)
+      expect(await band.find({ type: 'Text', text: /unpin to undo\. Switching re-reads the whole conversation at about \$1\.20 on Sonnet\. Run \/model-router checkpoint first \(before \d\d:\d\d and before your next message\) and the switch re-reads a summary instead: about \$0\.38 in all\.$/ })).toBeDefined()
+      await band.unmount()
+      // Once the checkpoint has run, the band must stop saying what the old conversation would cost and offering it again.
+      expect(await cmd($, 'checkpoint')).toBe('Creating checkpoint…')
+      await seen.clock.advance(0)
+      band = await openBand($)
+      expect(await band.find({ type: 'Text', text: /^Thanks — the rest of this session stays on Sonnet\. \/model-router unpin to undo\.$/ })).toBeDefined()
       await band.unmount()
     })
 
@@ -9934,13 +9944,16 @@ describe('a checkpoint before a pinned switch (1.3.1)', () => {
   const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
   const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
   const COST = 'Switching re-reads the whole conversation at about $1.20 on Sonnet.'
-  const OFFER = 'Run /model-router checkpoint before your next message and it re-reads a summary instead'
+  const OFFER = 'Run /model-router checkpoint first'
+  // The whole offer as it reads right after the conversation's last request: it holds until 57 minutes after it.
+  const offer = (seen: Seen, cost: string) => `${OFFER} (before ${hhmm(seen.clock.now() + 57 * MIN)} and before your next message) and the switch re-reads a summary instead: about ${cost} in all.`
 
-  // A session whose own model is `sessionModel`, with one finished main turn that left `context` tokens on `model`.
+  // A session whose own model is `session.model`, with one finished main turn that left `context` tokens on `model`.
   // `compacts`: the engine's side of a compaction, recording each one's trigger.
-  async function conversation($: any, on: any, context: number, { classifier = decide, sessionModel = OPUS, model = OPUS, compacts = undefined as string[] | undefined } = {}): Promise<Seen> {
+  async function conversation($: any, on: any, context: number, { classifier = decide, session = { model: OPUS }, model = OPUS, compacts = undefined as string[] | undefined } = {}): Promise<Seen> {
     const seen = world($, on, classifier)
-    on('session.model', async () => ({ value: sessionModel }))
+    const sessionModel = session.model
+    on('session.model', async () => ({ value: session.model }))
     if (compacts) {
       on('session.compact', async (_$: unknown, e: { trigger: string }) => {
         compacts.push(e.trigger)
@@ -9966,13 +9979,14 @@ describe('a checkpoint before a pinned switch (1.3.1)', () => {
   // WHY: a pin moves the conversation on the next message, which re-reads all of it on the new model. Before 1.3.1 a
   // pin said nothing about that (only a correction did), and neither said that a checkpoint first is far cheaper.
   test('pinning a large warm conversation to a smaller model says what the switch costs and offers a checkpoint first', async ($, on) => {
-    await conversation($, on, 300_000)
-    expect(await cmd($, 'pin sonnet')).toBe(`Pinned to Sonnet until /model-router unpin or the session ends. ${COST} ${OFFER}: about $0.38 in all.`)
+    const seen = await conversation($, on, 300_000)
+    expect(await cmd($, 'pin sonnet')).toBe(`Pinned to Sonnet until /model-router unpin or the session ends. ${COST} ${offer(seen, '$0.38')}`)
   })
 
   test('the Chinese offer', { options: { language: 'zh' } }, async ($, on) => {
-    await conversation($, on, 300_000)
-    expect(await cmd($, 'pin sonnet')).toContain('约 $1.20。 在发送下一条消息之前先运行 /model-router checkpoint，则只需重新读取摘要：合计约 $0.38。')
+    const seen = await conversation($, on, 300_000)
+    const by = hhmm(seen.clock.now() + 57 * MIN)
+    expect(await cmd($, 'pin sonnet')).toContain(`约 $1.20。 先运行 /model-router checkpoint（须在 ${by} 之前，且在发送下一条消息之前），切换时只需重新读取摘要：合计约 $0.38。`)
   })
 
   // WHY: a summary loses detail, so the checkpoint is named only when it costs at most half the direct switch.
@@ -9986,29 +10000,56 @@ describe('a checkpoint before a pinned switch (1.3.1)', () => {
     })
   }
 
-  // WHY: a checkpoint is cheap only as a cached read. Past the cache TTL (less the 3-minute margin compaction keeps)
-  // it would re-read the whole conversation at full price, so the offer would cost more than it saves.
-  test('a cache that is about to expire or has expired gets the cost without the offer', async ($, on) => {
-    const seen = await conversation($, on, 300_000)
-    await seen.clock.advance(58 * MIN)
+  // WHY: a checkpoint is cheap only as a cached read. Run after the cache ends it re-reads the whole conversation at
+  // full price and costs more than the switch, so the offer names its deadline (3 minutes before the 1-hour cache
+  // ends, as compaction keeps) and is made only while that is at least 5 minutes off: time to read it and act.
+  for (const [minutes, offered] of [[52, true], [53, false], [61, false]] as const) {
+    test(`${minutes} minutes after the last reply the cost is said and the checkpoint is ${offered ? '' : 'not '}offered`, async ($, on) => {
+      const seen = await conversation($, on, 300_000)
+      const withDeadline = offer(seen, '$0.38')
+      await seen.clock.advance(minutes * MIN)
+      const answer = await cmd($, 'pin sonnet')
+      expect(answer).toContain(COST)
+      expect(answer.includes(withDeadline)).toBe(offered)
+      expect(answer.includes(OFFER)).toBe(offered)
+    })
+  }
+
+  // WHY: the engine compacts on the session's own model. A conversation the router put on another model is not in
+  // that model's cache, and measured compactions of such conversations cost a full rewrite, not a cached read.
+  test("a conversation on another model than the session's gets the cost without the offer", async ($, on) => {
+    await conversation($, on, 300_000, { session: { model: SONNET } })
     const answer = await cmd($, 'pin sonnet')
     expect(answer).toContain(COST)
     expect(answer).not.toContain(OFFER)
   })
 
-  // WHY: the engine compacts on the session's own model. A conversation the router put on another model is not in
-  // that model's cache, and measured compactions of such conversations cost a full rewrite, not a cached read.
-  test("a conversation on another model than the session's gets the cost without the offer", async ($, on) => {
-    await conversation($, on, 300_000, { sessionModel: SONNET })
+  // WHY: after /model the engine compacts on the new model, which holds no cache of this conversation. The router's
+  // belief about the session's model is from the last message, so it must ask again before promising a cached read.
+  test('a /model switch since the last message is seen: the offer goes', async ($, on) => {
+    const session = { model: OPUS }
+    await conversation($, on, 300_000, { session })
+    session.model = SONNET
     const answer = await cmd($, 'pin sonnet')
     expect(answer).toContain(COST)
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // WHY: a pin does nothing while the router is paused, so the next message stays where it is and reads its cache;
+  // a checkpoint then would only cost, and lose detail.
+  test('a paused router gets the cost and the pause notice without the offer', async ($, on) => {
+    await conversation($, on, 300_000)
+    await cmd($, 'off')
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).toContain('The router is off now; the pin applies once it is on.')
     expect(answer).not.toContain(OFFER)
   })
 
   // WHY: no compaction of a Fable conversation has been measured as a cached read, so nothing is promised for one;
   // the arithmetic alone ($0.70 against $2.40) would have offered it.
   test('a Fable conversation pinned to Opus gets the cost without the offer', async ($, on) => {
-    await conversation($, on, 300_000, { sessionModel: FABLE, model: FABLE })
+    await conversation($, on, 300_000, { session: { model: FABLE }, model: FABLE })
     const answer = await cmd($, 'pin opus')
     expect(answer).toContain('Switching re-reads the whole conversation at about $2.40 on Opus.')
     expect(answer).not.toContain(OFFER)

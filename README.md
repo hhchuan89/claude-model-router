@@ -288,13 +288,17 @@ the message wins for its turn. Pinning needs `mainRouting`.
 effect on your next message, and that reply re-reads the whole conversation on the new model. When the conversation
 is 100k tokens or more and the model is smaller than the one it is on (or it is on Fable), the answer adds the cost,
 for example `Switching re-reads the whole conversation at about $1.20 on Sonnet.` When a checkpoint first would cost
-at most half of that, it also says `Run /model-router checkpoint before your next message and it re-reads a summary
-instead: about $0.38 in all.` That figure is one cached read of the conversation and an 8k-token summary on the model
-it is on, then a 40k-token summary written on the new model (the assumptions `checkpointHints` uses). The checkpoint
-is named only when it would be a cached read:
+at most half of that, it also says `Run /model-router checkpoint first (before 14:32 and before your next message)
+and the switch re-reads a summary instead: about $0.38 in all.` That figure is one cached read of the conversation and
+an 8k-token summary on the model it is on, then a 40k-token summary written on the new model (the assumptions
+`checkpointHints` uses); it covers the switch, not a later return to the first model. The time is when the cache
+stops being safe to compact from (3 minutes before it ends): a checkpoint run after it re-reads the whole
+conversation at full price and costs more than switching directly. The checkpoint is named only when it would be a
+cached read:
 
-- the cache is warm, with the 3-minute margin compaction keeps;
-- the conversation is on the session's own model (the one `/model` shows). The engine compacts on that model, so a
+- the cache has at least 5 minutes left before that time;
+- the router is on (a pin does nothing while it is paused);
+- the conversation is on the session's own model (the one `/model` shows, asked again when you pin). The engine compacts on that model, so a
   conversation the router put on another one is not in its cache. In real use a compaction cost either about $0.45 to
   $0.90 per million tokens compacted (a cached read) or $3 to $7.60 (a rewrite), inside the cache TTL in both cases;
   that the session's model explains the difference is the best reading of that data, not a proven one;
