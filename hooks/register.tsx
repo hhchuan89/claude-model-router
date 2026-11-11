@@ -2595,7 +2595,26 @@ export const register: Register = (on, options) => {
         const prev = routed(await read($, memberOf(route, { requestId: session.stateId })))
         const now = await $.clock.now()
         if (await stillHere($, session) !== 'same') return next(e)
-        if (prev && last && now - last.at <= CACHE_TTL_MS) {
+        // A /model switch to Fable since that route: the session's model is the person's own choice, and the old
+        // route is not theirs to continue. Left to inherit it, this turn would run on Opus or Sonnet.
+        let onFable = false
+        if (respectFable && prev && last && now - last.at <= CACHE_TTL_MS) {
+          try {
+            const id = await $.session.model()
+            if (await stillHere($, session) !== 'same') return next(e)
+            sessionModel = priceKey(id)
+            onFable = isFable(id)
+          } catch {
+            // Keep the last known model.
+          }
+          if (await stillHere($, session) !== 'same') return next(e)
+          if (onFable) {
+            const r: Route = { ...routeFor('decide', str.fableSession), sessionModel: true, how: 'fable-session', turnId: e.turnId }
+            await update($, memberOf(route, { requestId: session.stateId }), previous => here(session) ? r : previous)
+            await logEvent($, session, 'main', 'turn route', 'session model', r.reason)
+          }
+        }
+        if (!onFable && prev && last && now - last.at <= CACHE_TTL_MS) {
           inherited = true
           const r: Route = { ...prev, turnId: e.turnId, reason: str.inherited, how: 'inherited', steered: undefined }
           turnSteps = 0
@@ -3152,13 +3171,17 @@ export const register: Register = (on, options) => {
     const answers = ([['Haiku', 'lookup'], ['Sonnet', 'execute'], ['Opus', 'decide']] as [string, Tier][])
       .filter(([, tier]) => target !== undefined && tier !== target.tier && TIER_ROUTE[tier].model !== target.model)
 
+    // What the plugin observed (no main request yet) outranks the row that says the session is left on Fable: a resumed
+    // Fable session would otherwise show both, until its first message. A turn bound as a Fable session's own means
+    // the router is being handed this conversation, so that row stands for the moment before its first request.
+    const unseenFable = isUnseenFable(sessionModel, delivered, contextReading().tokens) && r?.how !== 'fable-session'
     return (
       <Box flexDirection="column" marginTop={1}>
         {cache !== '' && <Text color="warning" wrap="truncate-end">{cache}</Text>}
-        {isUnseenFable(sessionModel, delivered, contextReading().tokens) && <Text color="warning" wrap="truncate-end">{str.fableUnseen}</Text>}
+        {unseenFable && <Text color="warning" wrap="truncate-end">{str.fableUnseen}</Text>}
         <Box flexDirection="row" gap={1} alignItems="center">
           <Box flexGrow={1} flexShrink={1} width={0}>
-            <Text dimColor wrap="truncate-end">{bandRoute(lang, r, mainRouting, respectFable && sessionModel === 'fable')}</Text>
+            <Text dimColor wrap="truncate-end">{bandRoute(lang, r, mainRouting, respectFable && sessionModel === 'fable' && !unseenFable)}</Text>
           </Box>
           <Button key="band-details" label={expanded ? str.hideDetails : str.details} onPress={() => toggleDetails($, session)} />
           <Button key="router-disable" label={str.disable} onPress={() => setEnabled($, session, false)} />

@@ -9503,7 +9503,7 @@ describe('what the router has been handed, and Fable sessions it never sees (1.2
     expect(isUnseenFable(FABLE, { prompts: 3, turns: 3, steps: 0, spawns: 2 }, 60_000)).toBe(true)
     expect(isUnseenFable('claude-opus-5-5', nothingSeen(), 60_000)).toBe(false)
     expect(isUnseenFable(undefined, nothingSeen(), 60_000)).toBe(false)
-    // WHY (1.2.4): a new Fable session has no conversation the router could have missed; warning there cried wolf
+    // WHY (1.3.0): a new Fable session has no conversation the router could have missed; warning there cried wolf
     // on the normal path. An empty or unmeasured context is not evidence.
     expect(isUnseenFable(FABLE, nothingSeen(), 0)).toBe(false)
     expect(isUnseenFable(FABLE, nothingSeen(), undefined)).toBe(false)
@@ -9598,7 +9598,7 @@ describe('what the router has been handed, and Fable sessions it never sees (1.2
   })
 })
 
-describe("a Fable session is the person's own choice (1.2.4)", () => {
+describe("a Fable session is the person's own choice (1.3.0)", () => {
   const FABLE = 'claude-fable-5-2'
   const decide = '{"tier":"decide","reason":"design"}'
   const execute = '{"tier":"execute","reason":"build"}'
@@ -9639,7 +9639,7 @@ describe("a Fable session is the person's own choice (1.2.4)", () => {
   })
 
   // WHY: Fable plans and verifies; the settled work it hands out is what the cheaper models are for.
-  // A guard: this held before 1.2.4 too, and respecting the main thread must not loosen it.
+  // A guard: this held before 1.3.0 too, and respecting the main thread must not loosen it.
   test('its subagents are still routed to the cheaper models and never run on Fable', async ($, on) => {
     const seen = world($, on, execute)
     on('session.model', async () => ({ value: FABLE }))
@@ -9729,7 +9729,7 @@ describe("a Fable session is the person's own choice (1.2.4)", () => {
   })
 })
 
-describe('review fixes for the Fable session (1.2.4)', () => {
+describe('review fixes for the Fable session (1.3.0)', () => {
   const FABLE = 'claude-fable-5-2'
   const decide = '{"tier":"decide","reason":"design"}'
   const execute = '{"tier":"execute","reason":"build"}'
@@ -9821,5 +9821,57 @@ describe('review fixes for the Fable session (1.2.4)', () => {
     model = OPUS
     await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
     expect(await (await mountBand($)).find({ text: /stays on Fable/ })).toBeUndefined()
+  })
+
+  // WHY (review of 1.3.0): a turn nobody typed continues the previous route while its cache is warm. After /model fable
+  // with no message since, the previous route is an Opus one, so the notification ran on Opus, not on the model the
+  // person had just chosen. The earlier switch test missed it: its first step carried no usage, so there was no recorded
+  // main request for a warm cache to inherit from.
+  test('a notification after a /model switch to Fable, inside the cache window, is not given the old route', async ($, on) => {
+    const seen = world($, on, decide)
+    let model = OPUS
+    on('session.model', async () => ({ value: model }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    seen.usage.push(U(1000, 500, 200_000, 3000, OPUS))
+    await step($, 't1')
+    expect(seen.steps[0]!.model).toBe('opus[1m]')
+    model = FABLE
+    await $.turn.start(notification)
+    await step($, 'tn', FABLE)
+    expect(seen.steps.at(-1)!.model).toBe(FABLE)
+    expect(eventsOf(seen).some(ev => ev.event === 'turn inherit')).toBe(false)
+    expect(await statsOf($)).toContain('Fable requests moved to Opus: 0')
+    // Metered, and on the band, as a Fable turn.
+    expect(await (await mountBand($)).find({ text: /^⚙ Fable — your choice/ })).toBeDefined()
+  })
+
+  // The control for the test above: the same notification in a session still on Opus does continue the route.
+  test('a notification in a session still on Opus continues the previous route', async ($, on) => {
+    const seen = world($, on, decide)
+    on('session.model', async () => ({ value: OPUS }))
+    await $.prompt.submit({ text: 'design the cache' } as never)
+    seen.usage.push(U(1000, 500, 200_000, 3000, OPUS))
+    await step($, 't1')
+    await $.turn.start(notification)
+    await step($, 'tn')
+    expect(eventsOf(seen).some(ev => ev.event === 'turn inherit')).toBe(true)
+    expect(seen.steps.at(-1)!.model).toBe('opus[1m]')
+  })
+
+  // WHY (review of 1.3.0): a resumed Fable session has a conversation and no request seen yet, so the 1.2.3 warning and
+  // the "your choice" row appeared together and contradicted each other. What the plugin observed (no request) wins; the
+  // first request clears the warning and the row appears.
+  test('a resumed Fable session shows the warning or "your choice", never both', async ($, on) => {
+    world($, on, decide)
+    on('session.model', async () => ({ value: FABLE }))
+    await $.session.measure({ context: { window: 1e6, tokens: 60_000 }, rateLimits: [], changed: ['context'] } as never)
+    const before = await mountBand($)
+    expect(await before.find({ text: /no request of this conversation has reached the router/ })).toBeDefined()
+    expect(await before.find({ text: /your choice/ })).toBeUndefined()
+    await $.prompt.submit({ text: 'carry on' } as never)
+    await step($, 't1', FABLE)
+    const after = await mountBand($)
+    expect(await after.find({ text: /no request of this conversation has reached the router/ })).toBeUndefined()
+    expect(await after.find({ text: /^⚙ Fable — your choice/ })).toBeDefined()
   })
 })

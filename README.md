@@ -181,7 +181,7 @@ shortcuts.
    is rewritten for Fable; a subagent still never runs above its parent (its own cap stays Opus at medium, and main
    can raise it to Opus at high). Each block is counted once per turn on the main thread and once per subagent, not
    once per request.
-   **Before 1.2.4, observed 2026-11-10 (engines 2.1.317 to 2.1.321):** in five sessions, 163 main-thread requests ran
+   **Before 1.3.0, observed 2026-11-10 (engines 2.1.317 to 2.1.321):** in five sessions, 163 main-thread requests ran
    on Fable with no trace in the router's logs or meter, each after Fable was picked with `/model` inside the
    session. Four of those sessions show no router activity at all; in the fifth the router routed turns before and
    after the Fable ones. Sessions that started on Fable were routed as usual (their main thread ran on Opus). A

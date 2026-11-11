@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
-## [1.2.4] - 2026-11-10
+## [1.3.0] - 2026-11-10
 
 ### Added
 
@@ -26,6 +26,10 @@ All notable changes to this project are documented here. The format follows
 - The Fable warning from 1.2.3 now needs a conversation to exist (context measured above zero), so a new Fable
   session does not show it, and its text no longer says "not moved to Opus".
 - The decision reviewer (`reviewModel`) is never sent a turn that was left on the session's model.
+- A task notification (or any turn nobody typed) after a `/model` switch to Fable no longer continues the previous
+  Opus or Sonnet route inside the cache window: the session model is read first, and a Fable session's turn stays on Fable.
+- A resumed Fable session, before its first request, shows the "no request has reached the router" warning alone;
+  the "your choice" row appears once a request has arrived. The two no longer show together.
 - The README's note on the Fable sessions that left no trace names a router paused at the time as an explanation
   that fits four of the five, without claiming it (pauses are not logged), and says the fifth is unexplained.
 
