@@ -18,9 +18,9 @@ export function seenLine(label: string, s: Seen, sessionModel: string | undefine
   return `${label}: prompts ${s.prompts} · main turns ${s.turns} · main requests ${s.steps} · subagent starts ${s.spawns} · session model ${sessionModel || 'unknown'}`
 }
 
-// A Fable session none of whose main requests has reached the router: nothing in it is routed, moved off Fable or
-// counted. Keyed on what was observed (no main request seen), not on the model alone: once one request arrives the
-// router is working on this session and the notice goes.
-export function isUnseenFable(sessionModel: string | undefined, s: Seen): boolean {
-  return /fable/i.test(sessionModel ?? '') && s.steps === 0
+// A Fable session with a conversation in it (context measured above zero) none of whose main requests has reached
+// the router: nothing in it is routed or counted. Keyed on what was observed, not on the model alone: a new Fable
+// session has nothing to have missed, and once one request arrives the router is working on this session.
+export function isUnseenFable(sessionModel: string | undefined, s: Seen, context: number | undefined): boolean {
+  return /fable/i.test(sessionModel ?? '') && s.steps === 0 && (context ?? 0) > 0
 }

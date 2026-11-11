@@ -26,6 +26,8 @@ export type Route = {
 }
 
 export type TurnHow = 'classified' | 'forced' | 'pinned' | 'inherited' | 'kept-tier' | 'warm-skip' | 'session-model'
+  // A Fable session the router left on Fable (respectFableSession): the person's own choice, never classified.
+  | 'fable-session'
   // A main turn the route did not govern (a notification after the cache TTL, main routing off): a turn record only.
   | 'unrouted'
 
