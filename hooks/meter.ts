@@ -57,6 +57,17 @@ export function checkpointPays(context: number, model: keyof typeof PRICES): boo
   return saving > cost
 }
 
+// A pin moves a warm conversation of `context` tokens from `from` to `to`. Direct: `to` writes the whole context.
+// With a checkpoint first: `from` reads the context from its cache once and writes the summary's output, then `to`
+// writes only the summary. Same summary assumptions as the hint above; USD.
+export function switchCosts(context: number, from: keyof typeof PRICES, to: keyof typeof PRICES): { direct: number; viaCheckpoint: number } {
+  const f = priceOf(from, context)
+  return {
+    direct: (context * priceOf(to, context).write) / 1e6,
+    viaCheckpoint: (context * f.read + CHECKPOINT_OUTPUT * f.output + CHECKPOINT_SUMMARY * priceOf(to, CHECKPOINT_SUMMARY).write) / 1e6,
+  }
+}
+
 export type Usage = {
   input_tokens: number
   output_tokens: number

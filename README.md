@@ -284,12 +284,33 @@ A pinned turn behaves like a `#model` turn: no classifier call, no warm-cache ke
 count goes down when the turn starts, so a prompt another plugin holds back does not use a pin up, and a `#model` in
 the message wins for its turn. Pinning needs `mainRouting`.
 
+**A pin to a smaller model says what the switch costs, and when a checkpoint first is cheaper (1.3.1).** A pin takes
+effect on your next message, and that reply re-reads the whole conversation on the new model. When the conversation
+is 100k tokens or more and the model is smaller than the one it is on (or it is on Fable), the answer adds the cost,
+for example `Switching re-reads the whole conversation at about $1.20 on Sonnet.` When a checkpoint first would cost
+at most half of that, it also says `Run /model-router checkpoint before your next message and it re-reads a summary
+instead: about $0.38 in all.` That figure is one cached read of the conversation and an 8k-token summary on the model
+it is on, then a 40k-token summary written on the new model (the assumptions `checkpointHints` uses). The checkpoint
+is named only when it would be a cached read:
+
+- the cache is warm, with the 3-minute margin compaction keeps;
+- the conversation is on the session's own model (the one `/model` shows). The engine compacts on that model, so a
+  conversation the router put on another one is not in its cache. In real use a compaction cost either about $0.45 to
+  $0.90 per million tokens compacted (a cached read) or $3 to $7.60 (a rewrite), inside the cache TTL in both cases;
+  that the session's model explains the difference is the best reading of that data, not a proven one;
+- the conversation is not on Fable: no cheap compaction of a Fable conversation has been measured.
+
+Otherwise the cost is shown alone. It is text, never a block or an automatic compaction, and a summary keeps less
+than the conversation did. A move to a bigger model says nothing, as before, and a `#model` in a message cannot be
+offered a checkpoint: its turn has already started.
+
 The classifier is not always right. When it sorted a reply wrongly, say so: `/model-router wrong <tier>` (or the
 band's `Should have been:` buttons) pins the main conversation to that tier's model for the rest of the session, exactly
 like `/model-router pin <model>` (📌 in the band, until `/model-router unpin` or the session ends), and answers e.g.
 `Thanks — the rest of this session stays on Sonnet. /model-router unpin to undo.` When the model is smaller than the one
 the conversation is on and the conversation is 100k tokens or more, it adds what the next reply re-reads on it (for
-example `Switching re-reads the whole conversation at about $0.22 on Haiku.`); while the router is paused it says the pin
+example `Switching re-reads the whole conversation at about $0.22 on Haiku.`, with the checkpoint offer above where it
+applies); while the router is paused it says the pin
 applies once it is on. It also records the turn's masked
 prompt snippet with the tier it should have had. The model escalating itself to a bigger **model** than the classified
 tier's is recorded too (an effort-only raise does not count), but never pins. Only turns the classifier actually sorted

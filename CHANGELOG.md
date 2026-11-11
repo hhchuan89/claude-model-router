@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-11-11
+
+### Added
+
+- `/model-router pin <model>` now says what the switch costs, as a correction already did: when the conversation is
+  100k tokens or more and the pinned model is smaller than the one it is on (or it is on Fable), the answer adds
+  `Switching re-reads the whole conversation at about $1.20 on Sonnet.` Before, a pin said nothing.
+- A pin or a correction also names a checkpoint when that is much cheaper: `Run /model-router checkpoint before your
+  next message and it re-reads a summary instead: about $0.38 in all.` It is shown only when the estimate is at most
+  half the direct switch, the cache is warm (with the 3-minute margin), and the conversation is on the session's own
+  model and not on Fable; otherwise the cost is shown alone. Text only: nothing is compacted or blocked.
+
+### Notes
+
+- Why the conditions: measured over 27 session-days, a compaction cost either about $0.45 to $0.90 per million tokens
+  compacted (a cached read) or $3 to $7.60 (a rewrite), all inside the cache TTL. The dear ones fit sessions whose own
+  model was not the model the conversation ran on (the engine compacts on the session's model); this is inferred, not
+  proven, so the offer is limited to the case measured as cheap.
+- A new behaviour under a patch number, at the maintainer's request.
+
 ## [1.3.0] - 2026-11-10
 
 ### Added

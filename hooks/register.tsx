@@ -3,7 +3,7 @@ import type { ElementConstructor, EngineInterface, Register, SessionRateLimit, S
 
 import type { Effort, ModelKey, Route, SpendRole, SpendUsage, Tally, Tier, TurnHow, TurnRecord } from '../types'
 import type { LastRequest, Shape, Usage } from './meter'
-import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, RANK, ratesOf, saved, tokensOf } from './meter'
+import { add, CACHE_TTL_MS, CHECKPOINT_COOLDOWN_MS, CHECKPOINT_GROWTH, checkpointPays, EMPTY, fmtTokens, fmtUsd, isSwitchStep, isWarmOpus, keepWarm, merge, PRICES, priceKey, priceOf, promptOf, RANK, ratesOf, saved, switchCosts, tokensOf } from './meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from './output'
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from './learn'
 import type { Correction } from './learn'
@@ -164,6 +164,9 @@ let bandExpanded = false
 let thanks: { turnId: string; model: ModelKey; note: string } | undefined
 // A cache write this big after a gap past the TTL is the "resumed after an hour" rewrite the guard exists to shrink.
 const REWRITE_MIN_TOKENS = 100_000
+// A checkpoint before a pinned switch is suggested only when it costs at most 1/this of switching directly: a summary
+// loses detail, so a small saving is not worth saying.
+const CHECKPOINT_FIRST_FACTOR = 2
 // A cache read below this on a request with no earlier one in this process means the cache was cold.
 const COLD_READ_TOKENS = 1000
 // Idle compaction only makes sense inside the cache TTL, and with a margin: the summary request itself takes a while and
@@ -327,6 +330,7 @@ const STR = {
     wrongAsk: '上一条回复的模型不对？应该是：',
     thanks: (model: string) => `谢谢——本会话余下部分固定使用 ${model}。/model-router unpin 可撤销。`,
     switchCost: (cost: string, model: string) => ` 切换后，下一条回复会在 ${model} 上重新读取整个对话，约 ${cost}。`,
+    checkpointFirst: (cost: string) => ` 在发送下一条消息之前先运行 /model-router checkpoint，则只需重新读取摘要：合计约 ${cost}。`,
     footer: '/model-router 查看统计、设置和命令',
     raisedTo: (m: string) => `（升级到 ${m}）`,
     histTotal: (cost: string, base: string) => `近 7 天 ${cost} · 全程 Opus 则为 ${base}`,
@@ -477,6 +481,7 @@ const STR = {
     wrongAsk: 'Wrong model for the last reply? Should have been:',
     thanks: (model: string) => `Thanks — the rest of this session stays on ${model}. /model-router unpin to undo.`,
     switchCost: (cost: string, model: string) => ` Switching re-reads the whole conversation at about ${cost} on ${model}.`,
+    checkpointFirst: (cost: string) => ` Run /model-router checkpoint before your next message and it re-reads a summary instead: about ${cost} in all.`,
     footer: '/model-router for stats, settings and commands',
     raisedTo: (m: string) => `(raised to ${m})`,
     histTotal: (cost: string, base: string) => `Last 7 days ${cost} · all-Opus would be ${base}`,
@@ -1468,19 +1473,27 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   const model = TIER_ROUTE[right].model
   pin = { model }
-  const note = switchNote(lang, model)
+  const note = switchNote(lang, model, at)
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
   thanks = { turnId: rec.turnId, model, note }
   redraw($)
   return str.wrongDone(hhmm(rec.at), rec.tier, right, LABEL[model]) + note + ((await read($, enabled)) ? '' : str.pinRouterOff)
 }
 
-// A correction that pins a smaller model than the conversation is on makes the next reply re-read the whole conversation
-// on that model: from 100k tokens up, the confirmation says what that costs. It informs; it never blocks the pin.
-function switchNote(lang: Lang, to: ModelKey): string {
+// A pin or a correction to a smaller model than the conversation is on makes the next reply re-read the whole
+// conversation on that model: from 100k tokens up, the confirmation says what that costs. It informs; it never blocks
+// the pin. It also names a checkpoint before the next message when that would cost at most half as much. A checkpoint
+// is a cached read only while the cache is warm and sits on the model the engine compacts on, the session's own
+// (measured: compactions of a conversation routed to another model than the session's cost a full rewrite), so the
+// suggestion needs both. A Fable conversation gets none: no cheap compaction of one has been measured.
+function switchNote(lang: Lang, to: ModelKey, now: number): string {
   const { tokens, model: from } = contextReading()
   if (tokens === undefined || tokens < REWRITE_MIN_TOKENS || !(from === 'fable' || RANK[to] < RANK[from])) return ''
-  return STR[lang].switchCost(fmtUsd(tokens * priceOf(to, tokens).write / 1e6), LABEL[to])
+  const { direct, viaCheckpoint } = switchCosts(tokens, from, to)
+  const note = STR[lang].switchCost(fmtUsd(direct), LABEL[to])
+  const warm = lastMain !== null && now - lastMain.at <= CACHE_TTL_MS - SAFE_MARGIN_MS
+  if (!warm || from === 'fable' || from !== sessionModel || viaCheckpoint * CHECKPOINT_FIRST_FACTOR > direct) return note
+  return note + STR[lang].checkpointFirst(fmtUsd(viaCheckpoint))
 }
 
 async function pressWrong($: EngineInterface, session: Session, lang: Lang, right: Tier, turnId: string) {
@@ -1655,7 +1668,8 @@ async function pinCommand($: EngineInterface, lang: Lang, arg: string, mainRouti
   pin = left === undefined ? { model } : { model, left }
   thanks = undefined
   redraw($)
-  return str.pinSet(LABEL[model], left) + ((await read($, enabled)) ? '' : str.pinRouterOff)
+  const note = switchNote(lang, model, await $.clock.now())
+  return str.pinSet(LABEL[model], left) + note + ((await read($, enabled)) ? '' : str.pinRouterOff)
 }
 
 function pacingLine(lang: Lang, now: number): string {
