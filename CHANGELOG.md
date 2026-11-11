@@ -26,8 +26,8 @@ All notable changes to this project are documented here. The format follows
 - The Fable warning from 1.2.3 now needs a conversation to exist (context measured above zero), so a new Fable
   session does not show it, and its text no longer says "not moved to Opus".
 - The decision reviewer (`reviewModel`) is never sent a turn that was left on the session's model.
-- The README's note on the Fable sessions that left no trace names a router paused at the time as the explanation
-  that fits each of them, without claiming it: pauses are not logged.
+- The README's note on the Fable sessions that left no trace names a router paused at the time as an explanation
+  that fits four of the five, without claiming it (pauses are not logged), and says the fifth is unexplained.
 
 ## [1.2.3] - 2026-11-10
 

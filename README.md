@@ -185,9 +185,11 @@ shortcuts.
    on Fable with no trace in the router's logs or meter, each after Fable was picked with `/model` inside the
    session. Four of those sessions show no router activity at all; in the fifth the router routed turns before and
    after the Fable ones. Sessions that started on Fable were routed as usual (their main thread ran on Opus). A
-   router that was paused while the Fable turns ran fits each of them (paused, it passes every request through
+   router paused while the Fable turns ran fits the four silent sessions (paused, it passes every request through
    unrouted and uncounted, and Pause applies to every new session until `/model-router on`), but pauses are not
-   logged, so this cannot be confirmed afterwards. To make it checkable, the band warns when a Fable session holds a
+   logged, so this cannot be confirmed afterwards. It does not explain the fifth: there a Fable request went out
+   within a second of Sonnet requests, inside a turn the router had put on Sonnet, which a pause cannot do. That one
+   is unexplained. To make it checkable, the band warns when a Fable session holds a
    conversation none of whose requests has reached the router, and `/model-router status` prints `enabled` and what
    the router has been handed (`Seen this session: prompts · main turns · main requests · subagent starts`).
    Optionally, set `reviewModel` to a model id available on your account and, if that model exists there
