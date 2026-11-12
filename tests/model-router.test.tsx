@@ -3,7 +3,7 @@ import type { FsEntry, FsStat } from 'claude-code'
 import type { Tally } from '../types'
 import { Backoff, EventLogs, isWindowsPath, mergeLogs } from '../hooks/log'
 
-import { checkpointPays, CHECKPOINT_COOLDOWN_MS } from '../hooks/meter'
+import { checkpointPays, CHECKPOINT_COOLDOWN_MS, switchCosts } from '../hooks/meter'
 import { looksLikeCode, outputLimit, outputPath, outputSlice, reduceOutput } from '../hooks/output'
 import { add, baselineOf, LONG_PROMPT_TOKENS, priceOf, CACHE_TTL_MS, costOf, EMPTY, fmtTokens, fmtUsd, isSwitchStep, keepWarm, merge, PRICES, ratesOf, saved, WARM_CONTEXT_KEEP } from '../hooks/meter'
 import { addCorrection, MAX_CORRECTIONS, readCorrections, snippetOf } from '../hooks/learn'
@@ -8269,6 +8269,34 @@ describe('history, pin, corrections and weekly pacing (1.1.0)', () => {
       await band.unmount()
     })
 
+    // WHY (1.3.1): the correction's pin moves the conversation on the next message, and until then a checkpoint can
+    // still be read from the warm cache. Where that at least halves the switch, the answer and the band both say so.
+    test('a correction to a smaller model on a large warm conversation also offers a checkpoint before the next message', async ($, on) => {
+      const seen = world($, on, decide)
+      ui($, on)
+      on('session.compact', async () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }], tokensBefore: 300_000, tokensAfter: 40_000 }))
+      on('agent.list', async () => ({ value: [] }))
+      await $.prompt.submit({ text: 'choose the storage design' } as never)
+      seen.usage.push(U(1000, 500, 299_000))
+      await step($, 't1')
+      await $.turn.complete(completion('t1'))
+      // The offer holds until the deadline compaction keeps: 3 minutes before the 1-hour cache ends.
+      const by = hhmm(seen.clock.now() + 57 * 60_000)
+      // 300,000 tokens: Sonnet writes them at $4 per million; a checkpoint reads them on Opus at $0.20, answers 8k
+      // at $20 and leaves Sonnet a 40k summary to write.
+      const answer = await cmd($, 'wrong execute')
+      expect(answer).toContain(`Switching re-reads the whole conversation at about $1.20 on Sonnet. Run /model-router checkpoint first (before ${by} and before your next message) and the switch re-reads a summary instead: about $0.38 in all.`)
+      let band = await openBand($)
+      expect(await band.find({ type: 'Text', text: /unpin to undo\. Switching re-reads the whole conversation at about \$1\.20 on Sonnet\. Run \/model-router checkpoint first \(before \d\d:\d\d and before your next message\) and the switch re-reads a summary instead: about \$0\.38 in all\.$/ })).toBeDefined()
+      await band.unmount()
+      // Once the checkpoint has run, the band must stop saying what the old conversation would cost and offering it again.
+      expect(await cmd($, 'checkpoint')).toBe('Creating checkpoint…')
+      await seen.clock.advance(0)
+      band = await openBand($)
+      expect(await band.find({ type: 'Text', text: /^Thanks — the rest of this session stays on Sonnet\. \/model-router unpin to undo\.$/ })).toBeDefined()
+      await band.unmount()
+    })
+
     test('a correction to a bigger model, or on a small conversation, says nothing about switching', async ($, on) => {
       const seen = world($, on, [decide, LOOKUP])
       ui($, on)
@@ -9905,5 +9933,187 @@ describe('review fixes for the Fable session (1.3.0)', () => {
     await step($, 'tn', FABLE)
     expect(seen.steps.at(-1)!.model).toBe(FABLE)
     expect(eventsOf(seen).some(ev => ev.event === 'turn inherit')).toBe(false)
+  })
+})
+
+describe('a checkpoint before a pinned switch (1.3.1)', () => {
+  const MIN = 60_000
+  const FABLE = 'claude-fable-5-2'
+  const SONNET = 'claude-sonnet-5-5'
+  const execute = '{"tier":"execute","reason":"build"}'
+  const completion = (turnId: string) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId, text: 'ok', reason: 'completed' }) as never
+  const cmd = async ($: any, args: string): Promise<string> => ((await $.command.run({ command: 'model-router', args } as never)) as { text: string }).text
+  const COST = 'Switching re-reads the whole conversation at about $1.20 on Sonnet.'
+  const OFFER = 'Run /model-router checkpoint first'
+  // The whole offer as it reads right after the conversation's last request: it holds until 57 minutes after it.
+  const offer = (seen: Seen, cost: string) => `${OFFER} (before ${hhmm(seen.clock.now() + 57 * MIN)} and before your next message) and the switch re-reads a summary instead: about ${cost} in all.`
+
+  // A session whose own model is `session.model`, with one finished main turn that left `context` tokens on `model`.
+  // `compacts`: the engine's side of a compaction, recording each one's trigger.
+  async function conversation($: any, on: any, context: number, { classifier = decide, session = { model: OPUS } as { model: string; fails?: boolean }, model = OPUS, compacts = undefined as string[] | undefined } = {}): Promise<Seen> {
+    const seen = world($, on, classifier)
+    const sessionModel = session.model
+    on('session.model', async () => {
+      if (session.fails) throw new Error('unavailable')
+      return { value: session.model }
+    })
+    if (compacts) {
+      on('session.compact', async (_$: unknown, e: { trigger: string }) => {
+        compacts.push(e.trigger)
+        return { messages: [{ role: 'user', text: 'summary', toolUses: [] }], tokensBefore: context, tokensAfter: 40_000 }
+      })
+      on('agent.list', async () => ({ value: [] }))
+      on('ui.toast', async () => ({ value: undefined }))
+    }
+    await $.prompt.submit({ text: 'choose the storage design' } as never)
+    seen.usage.push(U(1000, 500, context - 1000, 0, model))
+    await step($, 't1', `${sessionModel}[1m]`)
+    await $.turn.complete(completion('t1'))
+    return seen
+  }
+
+  test('switchCosts: the new model writing everything, against one cached read, the summary and its write', () => {
+    // 300k on Opus to Sonnet. Direct: 300k x $4. Checkpoint: 300k x $0.20 + 8k x $20 + 40k x $4.
+    const c = switchCosts(300_000, 'opus', 'sonnet')
+    expect(near(c.direct, 1.2)).toBe(true)
+    expect(near(c.viaCheckpoint, 0.38)).toBe(true)
+  })
+
+  // WHY: a pin moves the conversation on the next message, which re-reads all of it on the new model. Before 1.3.1 a
+  // pin said nothing about that (only a correction did), and neither said that a checkpoint first is far cheaper.
+  test('pinning a large warm conversation to a smaller model says what the switch costs and offers a checkpoint first', async ($, on) => {
+    const seen = await conversation($, on, 300_000)
+    expect(await cmd($, 'pin sonnet')).toBe(`Pinned to Sonnet until /model-router unpin or the session ends. ${COST} ${offer(seen, '$0.38')}`)
+  })
+
+  test('the Chinese offer', { options: { language: 'zh' } }, async ($, on) => {
+    const seen = await conversation($, on, 300_000)
+    const by = hhmm(seen.clock.now() + 57 * MIN)
+    expect(await cmd($, 'pin sonnet')).toContain(`约 $1.20。 先运行 /model-router checkpoint（须在 ${by} 之前，且在发送下一条消息之前），切换时只需重新读取摘要：合计约 $0.38。`)
+  })
+
+  // WHY: a summary loses detail, so the checkpoint is named only when it costs at most half the direct switch.
+  // Opus to Sonnet that is 0.2C + 320,000 against 4C (millionths of a dollar): from C = 177,778 tokens.
+  for (const [context, offered] of [[177_000, false], [178_000, true]] as const) {
+    test(`Opus to Sonnet at ${context} tokens: the cost is said, the checkpoint is ${offered ? '' : 'not '}offered`, async ($, on) => {
+      await conversation($, on, context)
+      const answer = await cmd($, 'pin sonnet')
+      expect(answer).toContain('Switching re-reads the whole conversation')
+      expect(answer.includes(OFFER)).toBe(offered)
+    })
+  }
+
+  // WHY: a checkpoint is cheap only as a cached read. Run after the cache ends it re-reads the whole conversation at
+  // full price and costs more than the switch, so the offer names its deadline (3 minutes before the 1-hour cache
+  // ends, as compaction keeps) and is made only while that is at least 5 minutes off: time to read it and act.
+  for (const [minutes, offered] of [[52, true], [53, false], [61, false]] as const) {
+    test(`${minutes} minutes after the last reply the cost is said and the checkpoint is ${offered ? '' : 'not '}offered`, async ($, on) => {
+      const seen = await conversation($, on, 300_000)
+      const withDeadline = offer(seen, '$0.38')
+      await seen.clock.advance(minutes * MIN)
+      const answer = await cmd($, 'pin sonnet')
+      expect(answer).toContain(COST)
+      expect(answer.includes(withDeadline)).toBe(offered)
+      expect(answer.includes(OFFER)).toBe(offered)
+    })
+  }
+
+  // WHY: the engine compacts on the session's own model. A conversation the router put on another model is not in
+  // that model's cache, and measured compactions of such conversations cost a full rewrite, not a cached read.
+  test("a conversation on another model than the session's gets the cost without the offer", async ($, on) => {
+    await conversation($, on, 300_000, { session: { model: SONNET } })
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // WHY: after /model the engine compacts on the new model, which holds no cache of this conversation. The router's
+  // belief about the session's model is from the last message, so it must ask again before promising a cached read.
+  test('a /model switch since the last message is seen: the offer goes', async ($, on) => {
+    const session = { model: OPUS, fails: false }
+    await conversation($, on, 300_000, { session })
+    session.model = SONNET
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // WHY (review, 1.3.1): a cache belongs to one model id. A session on another Opus version is the same family, so a
+  // family comparison called it "the session's own model" and offered a checkpoint that would rewrite everything.
+  test('a session on another version of the same family gets the cost without the offer', async ($, on) => {
+    await conversation($, on, 300_000, { session: { model: 'claude-opus-4-8', fails: false } })
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // WHY (review, 1.3.1): when the engine cannot say which model the session is on now, the last known one may be
+  // stale (a /model switch since), so the offer is not made on it. The cost note still is.
+  test('a failed session-model lookup at pin time gives the cost without the offer', async ($, on) => {
+    const session = { model: OPUS, fails: false }
+    await conversation($, on, 300_000, { session })
+    session.fails = true
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // The control for the two above: the session's id read back without the "[1m]" its requests carry still matches.
+  test('the same model with and without a context-window suffix still gets the offer', async ($, on) => {
+    await conversation($, on, 300_000, { model: `${OPUS}[1m]` })
+    expect(await cmd($, 'pin sonnet')).toContain(OFFER)
+  })
+
+  // WHY: a pin does nothing while the router is paused, so the next message stays where it is and reads its cache;
+  // a checkpoint then would only cost, and lose detail.
+  test('a paused router gets the cost and the pause notice without the offer', async ($, on) => {
+    await conversation($, on, 300_000)
+    await cmd($, 'off')
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).toContain('The router is off now; the pin applies once it is on.')
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // WHY: no compaction of a Fable conversation has been measured as a cached read, so nothing is promised for one;
+  // the arithmetic alone ($0.70 against $2.40) would have offered it.
+  test('a Fable conversation pinned to Opus gets the cost without the offer', async ($, on) => {
+    await conversation($, on, 300_000, { session: { model: FABLE }, model: FABLE })
+    const answer = await cmd($, 'pin opus')
+    expect(answer).toContain('Switching re-reads the whole conversation at about $2.40 on Opus.')
+    expect(answer).not.toContain(OFFER)
+  })
+
+  test('a pin to a bigger model says nothing about switching', async ($, on) => {
+    await conversation($, on, 300_000, { classifier: execute, model: SONNET })
+    expect(await cmd($, 'pin opus')).toBe('Pinned to Opus until /model-router unpin or the session ends.')
+  })
+
+  test('a pin on a small conversation says nothing about switching', async ($, on) => {
+    await conversation($, on, 21_000)
+    expect(await cmd($, 'pin haiku')).toBe('Pinned to Haiku until /model-router unpin or the session ends.')
+  })
+
+  // WHY: the offer is honest only if following it works: the checkpoint runs while the pin waits, and the next message
+  // starts on the pinned model from the summary, with no warm cache left behind to abandon and no pinned turn used up.
+  test('pin, checkpoint, next message: the turn runs on the pinned model, abandons no cache and keeps the pin count', async ($, on) => {
+    const compacts: string[] = []
+    const seen = await conversation($, on, 300_000, { compacts })
+    expect(await cmd($, 'pin sonnet 2')).toContain(OFFER)
+    expect(await cmd($, 'checkpoint')).toBe('Creating checkpoint…')
+    await seen.clock.advance(0)
+    expect(compacts).toHaveLength(1)
+    await $.prompt.submit({ text: 'carry out the plan' } as never)
+    expect(seen.submits[1]!.context?.[0]).toContain('assigned to sonnet')
+    expect(seen.submits[1]!.context?.[0]).not.toContain('abandoned')
+    await step($, 't2')
+    expect(seen.steps.at(-1)!.model).toBe('sonnet[1m]')
+    await $.turn.complete(completion('t2'))
+    // The second of the two pinned turns is still there; the third is classified again (decide: Opus).
+    await $.prompt.submit({ text: 'and the next step' } as never)
+    expect(seen.submits[2]!.context?.[0]).toContain('assigned to sonnet')
+    await $.turn.complete(completion('t3'))
+    await $.prompt.submit({ text: 'choose the next design' } as never)
+    expect(seen.submits[3]!.context?.[0]).toContain('assigned to opus')
   })
 })
