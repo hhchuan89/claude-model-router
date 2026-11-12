@@ -127,6 +127,8 @@ let contextWindow: number | undefined
 // A summary keeps the observed request family after forgetContext clears its timestamp. The session model is
 // only a fallback: routing may have sent the request to a different family.
 let observedModel: keyof typeof PRICES | undefined
+// The full id that request ran on, for the checkpoint offer: a family alone cannot tell two Opus versions apart.
+let observedModelId: string | undefined
 let sessionModel: keyof typeof PRICES = 'opus'
 // Pin: the main conversation's model for the next `left` person turns (left absent: until unpin or the session ends).
 let pin: { model: ModelKey; left?: number } | null = null
@@ -896,6 +898,7 @@ function resetSession($: EngineInterface, cancel = true) {
   measuredContext = undefined
   contextWindow = undefined
   observedModel = undefined
+  observedModelId = undefined
   sessionModel = 'opus'
   pin = null
   snippets.clear()
@@ -933,12 +936,24 @@ function forgetContext() {
 }
 
 // The session's model as the engine has it now: a /model switch with no message since must not leave the old one believed.
-async function refreshSessionModel($: EngineInterface) {
+// Returns the full id, or undefined when the engine could not say: the family estimate keeps the last known model,
+// but nothing that needs the current one (the checkpoint offer) may rely on it.
+async function refreshSessionModel($: EngineInterface): Promise<string | undefined> {
   try {
-    sessionModel = priceKey(await $.session.model())
+    const id = await $.session.model()
+    sessionModel = priceKey(id)
+    return id
   } catch {
-    // Keep the last known model.
+    return undefined
   }
+}
+
+// The same model, not only the same family: a cache belongs to one model id. The engine reports the session's model
+// without a context-window suffix such as "[1m]" (checked 2026-11-12, engine 2.1.322: `opus`, `opus[1m]` and
+// `claude-opus-5-5` all read back as `claude-opus-5-5`), so the suffix is ignored on both sides.
+function sameModelId(a: string | undefined, b: string | undefined): boolean {
+  const bare = (id: string) => id.replace(/\[[^\]]+\]$/, '').toLowerCase()
+  return a !== undefined && b !== undefined && a !== '' && bare(a) === bare(b)
 }
 
 // Measurements are newer than lastMain; the next recorded request clears them. A local usage query can supply
@@ -1482,13 +1497,13 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
   if (text === undefined) return str.wrongNoText
   const at = await $.clock.now()
   const isOn = await read($, enabled)
-  await refreshSessionModel($)
+  const sessionId = await refreshSessionModel($)
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   if (!(await recordCorrection($, session, { at, text, routed: rec.tier, right, source: 'manual' }))) return str.wrongFailed
   if (await stillHere($, session) !== 'same') return str.checkpointCancelled
   const model = TIER_ROUTE[right].model
   pin = { model }
-  const note = switchNote(lang, model, at, isOn)
+  const note = switchNote(lang, model, at, isOn, sessionId)
   await bookkeeping($, () => update($, memberOf(turns, { requestId: session.stateId }), list => here(session) ? list.map(t => t.turnId === rec.turnId ? { ...t, corrected: right } : t) : list), undefined)
   thanks = { turnId: rec.turnId, model, note }
   redraw($)
@@ -1502,14 +1517,16 @@ async function correctTurn($: EngineInterface, session: Session, lang: Lang, rig
 // (measured: compactions of a conversation routed to another model than the session's cost a full rewrite), so the
 // suggestion needs both, and names the time it holds until: the deadline compaction itself keeps, which must still
 // be a few minutes off. A Fable conversation gets none: no cheap compaction of one has been measured. Nor does a
-// paused router, where the pin does not apply yet and a checkpoint would only cost.
-function switchNote(lang: Lang, to: ModelKey, now: number, routerOn: boolean): string {
+// paused router, where the pin does not apply yet and a checkpoint would only cost. "The session's own model" means
+// the same model id as the conversation's last request, not only the same family (another Opus version holds no cache
+// of it), and it must be the id the engine gives now: when it cannot say, nothing is offered.
+function switchNote(lang: Lang, to: ModelKey, now: number, routerOn: boolean, sessionId: string | undefined): string {
   const { tokens, model: from } = contextReading()
   if (tokens === undefined || tokens < REWRITE_MIN_TOKENS || !(from === 'fable' || RANK[to] < RANK[from])) return ''
   const { direct, viaCheckpoint } = switchCosts(tokens, from, to)
   const note = STR[lang].switchCost(fmtUsd(direct), LABEL[to])
   const deadline = lastMain === null ? 0 : lastMain.at + CACHE_TTL_MS - SAFE_MARGIN_MS
-  if (!routerOn || deadline - now < CHECKPOINT_FIRST_HEADROOM_MS || from === 'fable' || from !== sessionModel || viaCheckpoint * CHECKPOINT_FIRST_FACTOR > direct) return note
+  if (!routerOn || deadline - now < CHECKPOINT_FIRST_HEADROOM_MS || from === 'fable' || !sameModelId(observedModelId, sessionId) || viaCheckpoint * CHECKPOINT_FIRST_FACTOR > direct) return note
   return note + STR[lang].checkpointFirst(hhmm(deadline), fmtUsd(viaCheckpoint))
 }
 
@@ -1686,8 +1703,8 @@ async function pinCommand($: EngineInterface, lang: Lang, arg: string, mainRouti
   thanks = undefined
   redraw($)
   const isOn = await read($, enabled)
-  await refreshSessionModel($)
-  const note = switchNote(lang, model, await $.clock.now(), isOn)
+  const sessionId = await refreshSessionModel($)
+  const note = switchNote(lang, model, await $.clock.now(), isOn, sessionId)
   return str.pinSet(LABEL[model], left) + note + (isOn ? '' : str.pinRouterOff)
 }
 
@@ -2463,6 +2480,7 @@ export const register: Register = (on, options) => {
       lastMain = null
       last = null
       observedModel = undefined
+      observedModelId = undefined
     }
     const measuredAt = await $.clock.now()
     await ensurePrefs($, session)
@@ -2778,6 +2796,7 @@ export const register: Register = (on, options) => {
         mainRequestSequence += 1
         lastMain = { at: sentAt, context: tokensOf(u) - u.output_tokens }
         observedModel = key
+        observedModelId = u.model || model
         measuredContext = undefined
         refreshUi($, session, now)
         if (key !== 'fable') last = { model: key, at: sentAt, context: tokensOf(u) - u.output_tokens }

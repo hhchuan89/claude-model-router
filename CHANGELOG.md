@@ -13,9 +13,9 @@ All notable changes to this project are documented here. The format follows
 - A pin or a correction also names a checkpoint when that is much cheaper: `Run /model-router checkpoint first
   (before 14:32 and before your next message) and the switch re-reads a summary instead: about $0.38 in all.` It is
   shown only when the estimate is at most half the direct switch, the router is on, the cache has at least 5 minutes
-  left before the time named (3 minutes before it ends), and the conversation is on the session's own model (asked
-  again at that moment) and not on Fable; otherwise the cost is shown alone. Text only: nothing is compacted or
-  blocked.
+  left before the time named (3 minutes before it ends), and the conversation is on the session's own model (the same
+  model id, not only the same family, asked again at that moment; no offer when the engine cannot say) and not on
+  Fable; otherwise the cost is shown alone. Text only: nothing is compacted or blocked.
 
 ### Changed
 

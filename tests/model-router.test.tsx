@@ -9950,10 +9950,13 @@ describe('a checkpoint before a pinned switch (1.3.1)', () => {
 
   // A session whose own model is `session.model`, with one finished main turn that left `context` tokens on `model`.
   // `compacts`: the engine's side of a compaction, recording each one's trigger.
-  async function conversation($: any, on: any, context: number, { classifier = decide, session = { model: OPUS }, model = OPUS, compacts = undefined as string[] | undefined } = {}): Promise<Seen> {
+  async function conversation($: any, on: any, context: number, { classifier = decide, session = { model: OPUS } as { model: string; fails?: boolean }, model = OPUS, compacts = undefined as string[] | undefined } = {}): Promise<Seen> {
     const seen = world($, on, classifier)
     const sessionModel = session.model
-    on('session.model', async () => ({ value: session.model }))
+    on('session.model', async () => {
+      if (session.fails) throw new Error('unavailable')
+      return { value: session.model }
+    })
     if (compacts) {
       on('session.compact', async (_$: unknown, e: { trigger: string }) => {
         compacts.push(e.trigger)
@@ -10027,12 +10030,38 @@ describe('a checkpoint before a pinned switch (1.3.1)', () => {
   // WHY: after /model the engine compacts on the new model, which holds no cache of this conversation. The router's
   // belief about the session's model is from the last message, so it must ask again before promising a cached read.
   test('a /model switch since the last message is seen: the offer goes', async ($, on) => {
-    const session = { model: OPUS }
+    const session = { model: OPUS, fails: false }
     await conversation($, on, 300_000, { session })
     session.model = SONNET
     const answer = await cmd($, 'pin sonnet')
     expect(answer).toContain(COST)
     expect(answer).not.toContain(OFFER)
+  })
+
+  // WHY (review, 1.3.1): a cache belongs to one model id. A session on another Opus version is the same family, so a
+  // family comparison called it "the session's own model" and offered a checkpoint that would rewrite everything.
+  test('a session on another version of the same family gets the cost without the offer', async ($, on) => {
+    await conversation($, on, 300_000, { session: { model: 'claude-opus-4-8', fails: false } })
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // WHY (review, 1.3.1): when the engine cannot say which model the session is on now, the last known one may be
+  // stale (a /model switch since), so the offer is not made on it. The cost note still is.
+  test('a failed session-model lookup at pin time gives the cost without the offer', async ($, on) => {
+    const session = { model: OPUS, fails: false }
+    await conversation($, on, 300_000, { session })
+    session.fails = true
+    const answer = await cmd($, 'pin sonnet')
+    expect(answer).toContain(COST)
+    expect(answer).not.toContain(OFFER)
+  })
+
+  // The control for the two above: the session's id read back without the "[1m]" its requests carry still matches.
+  test('the same model with and without a context-window suffix still gets the offer', async ($, on) => {
+    await conversation($, on, 300_000, { model: `${OPUS}[1m]` })
+    expect(await cmd($, 'pin sonnet')).toContain(OFFER)
   })
 
   // WHY: a pin does nothing while the router is paused, so the next message stays where it is and reads its cache;

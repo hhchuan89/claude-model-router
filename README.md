@@ -298,7 +298,8 @@ cached read:
 
 - the cache has at least 5 minutes left before that time;
 - the router is on (a pin does nothing while it is paused);
-- the conversation is on the session's own model (the one `/model` shows, asked again when you pin). The engine compacts on that model, so a
+- the conversation is on the session's own model: the same model id as its last request, not only the same family
+  (the one `/model` shows, asked again when you pin; when the engine cannot say, nothing is offered). The engine compacts on that model, so a
   conversation the router put on another one is not in its cache. In real use a compaction cost either about $0.45 to
   $0.90 per million tokens compacted (a cached read) or $3 to $7.60 (a rewrite), inside the cache TTL in both cases;
   that the session's model explains the difference is the best reading of that data, not a proven one;
